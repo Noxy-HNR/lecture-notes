@@ -1,0 +1,19 @@
+faster-whisper>=1.0.0
+soundcard>=0.4.3
+numpy>=1.26
+anthropic>=0.40.0
+python-docx>=1.1.0
+soundfile>=0.12.1
+
+# GPU acceleration for Whisper transcription (faster-whisper/ctranslate2). Not
+# installed by default via this file since the right build is machine-specific -
+# see README "GPU acceleration" section. This machine has an RTX 5070 Ti, set up
+# with: nvidia-cublas-cu12, nvidia-cudnn-cu12 (CPU-only fallback works without them).
+
+# Optional: only needed for real speaker diarization (Q&A speaker labeling).
+# Heavy (~2GB incl. PyTorch) - the app works fine without these, diarization
+# just gets skipped. Install manually if you want it:
+#   pip install pyannote.audio torch --index-url https://download.pytorch.org/whl/cu128
+# (use the cu128 CUDA build for GPU acceleration - see README)
+# pyannote.audio>=3.1.0
+# torch>=2.2.0

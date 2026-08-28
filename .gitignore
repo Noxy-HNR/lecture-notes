@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Your actual lecture notes/recordings - personal data, not project source.
+# Remove these lines if you want your notes tracked in this repo too.
+notes/
+state/
+
+# OS cruft
+Thumbs.db
+.DS_Store

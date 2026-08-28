@@ -1,0 +1,54 @@
+{
+  "term": {
+    "name": "Fall 2026",
+    "start_date": "2026-08-20",
+    "end_date": "2026-12-11"
+  },
+  "classes": [
+    {
+      "code": "CHEM 1450",
+      "title": "College Chemistry I",
+      "sessions": [
+        {"day": "Monday",    "start": "09:00", "end": "09:50", "location": "LAN 102", "type": "Lecture"},
+        {"day": "Wednesday", "start": "09:00", "end": "09:50", "location": "LAN 102", "type": "Lecture"},
+        {"day": "Thursday",  "start": "14:40", "end": "17:20", "location": "LAN 206", "type": "Lab"},
+        {"day": "Friday",    "start": "09:00", "end": "09:50", "location": "LAN 102", "type": "Lecture"}
+      ]
+    },
+    {
+      "code": "WRTG 1310",
+      "title": "Intro to College Writing",
+      "sessions": [
+        {"day": "Monday",    "start": "11:00", "end": "11:50", "location": "WTH 201", "type": "Lecture"},
+        {"day": "Wednesday", "start": "11:00", "end": "11:50", "location": "WTH 201", "type": "Lecture"},
+        {"day": "Friday",    "start": "11:00", "end": "11:50", "location": "WTH 201", "type": "Lecture"}
+      ]
+    },
+    {
+      "code": "PSYC 1300",
+      "title": "Introduction to Psychology",
+      "sessions": [
+        {"day": "Monday",    "start": "13:00", "end": "13:50", "location": "SSA 115", "type": "Lecture"},
+        {"day": "Wednesday", "start": "13:00", "end": "13:50", "location": "SSA 115", "type": "Lecture"},
+        {"day": "Friday",    "start": "13:00", "end": "13:50", "location": "SSA 115", "type": "Lecture"}
+      ]
+    },
+    {
+      "code": "HLTH 1320",
+      "title": "Essentials of Health & Wellness",
+      "sessions": [
+        {"day": "Monday",    "start": "14:00", "end": "14:50", "location": "DHSC 325", "type": "Lecture"},
+        {"day": "Wednesday", "start": "14:00", "end": "14:50", "location": "DHSC 325", "type": "Lecture"}
+      ]
+    },
+    {
+      "code": "BIOL 1440",
+      "title": "Principles of Biology I",
+      "sessions": [
+        {"day": "Tuesday",  "start": "08:00", "end": "10:40", "location": "CCCS 211", "type": "Lab"},
+        {"day": "Tuesday",  "start": "12:15", "end": "13:30", "location": "LSC 168",  "type": "Lecture"},
+        {"day": "Thursday", "start": "12:15", "end": "13:30", "location": "LSC 168",  "type": "Lecture"}
+      ]
+    }
+  ]
+}
