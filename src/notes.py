@@ -14,6 +14,7 @@ from pathlib import Path
 
 import docx_export
 import local_formatter
+import npu_formatter
 import vocab as vocab_module
 
 NOTES_DIR = Path(__file__).resolve().parent.parent / "notes"
@@ -34,6 +35,10 @@ def _find_claude_cli() -> str | None:
     if _FALLBACK_CLI_PATH.exists():
         return str(_FALLBACK_CLI_PATH)
     return None
+
+
+def cli_available() -> bool:
+    return _find_claude_cli() is not None
 
 
 def notes_path(class_code: str) -> Path:
@@ -180,9 +185,18 @@ def _proofread(class_title: str, class_code: str, transcript: str) -> str:
     return cleaned or transcript
 
 
+FORMATTING_MODES = ("auto", "local", "heuristic")
+# auto:      CLI -> API -> NPU -> heuristic (default - best available each step)
+# local:     NPU -> heuristic only (no network calls - CLI/API never contacted)
+# heuristic: heuristic only (no LLM anywhere - fastest, fully deterministic)
+
+
 def format_and_save(class_code: str, class_title: str, transcript: str,
-                     session_date: str | None = None) -> Path:
-    """Formats `transcript` into notes and appends them to notes/<CODE>.md. Returns the file path."""
+                     session_date: str | None = None, mode: str = "auto") -> Path:
+    """Formats `transcript` into notes and appends them to notes/<CODE>.md. Returns the file path.
+    `mode` controls which formatting tiers are allowed - see FORMATTING_MODES above."""
+    if mode not in FORMATTING_MODES:
+        raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
     if not session_date:
         now = datetime.now()
         session_date = f"{now.strftime('%A, %B')} {now.day}, {now.strftime('%Y')}"
@@ -193,16 +207,28 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
     existing = _read_existing(class_code)
     prior_tail = existing[-TAIL_CONTEXT_CHARS:] if existing else ""
 
-    proofread_transcript = _proofread(class_title, class_code, transcript)
-    prompt = _build_notes_prompt(class_title, class_code, session_date, proofread_transcript, prior_tail)
+    section = None
+    method = None
 
-    section = _try_claude_cli_format(prompt)
-    method = "cli"
+    if mode == "auto":
+        proofread_transcript = _proofread(class_title, class_code, transcript)
+        prompt = _build_notes_prompt(class_title, class_code, session_date, proofread_transcript, prior_tail)
+        section = _try_claude_cli_format(prompt)
+        method = "cli"
+        if section is None:
+            section = _try_claude_api_format(prompt)
+            method = "api"
+
+    if section is None and mode in ("auto", "local"):
+        section = npu_formatter.format_transcript(class_title, session_date, transcript)
+        if section is not None:
+            # The NPU model is much smaller than Claude and inconsistently catches
+            # mis-transcribed vocabulary - run the same fuzzy glossary fix-up the
+            # heuristic formatter uses, as a safety net.
+            section = local_formatter.correct_with_glossary(section, class_code)
+        method = "npu"
+
     if section is None:
-        section = _try_claude_api_format(prompt)
-        method = "api"
-    if section is None:
-        # Neither CLI nor API is available - proofreading was skipped too, use the raw transcript.
         section = _local_format(class_title, session_date, transcript, class_code)
         method = "local"
 
@@ -221,3 +247,84 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
         pass
 
     return path, method
+
+
+def _build_condense_prompt(class_title: str, class_code: str, session_markdown: str) -> str:
+    return f"""You are reviewing the notes generated during ONE lecture recording session for
+{class_title} ({class_code}) and cleaning them up before they're finalized. During the session,
+notes may have been saved multiple times (autosaves), which can result in:
+- multiple separate date headings for what is really the same lecture
+- duplicate or near-duplicate bullet points repeated across those saves
+- formatting inconsistencies (inconsistent heading levels, stray bullets, broken markdown)
+- leftover raw/unformatted transcript fragments that never got cleaned up
+- inline "[FLAG: possible transcription error - please verify]" or "⚠️ verify" markers
+
+Your job: merge everything below into ONE clean, well-organized section for this lecture.
+
+Requirements:
+- Produce exactly ONE "## <date>" heading (reuse the date already present, don't invent one)
+- Merge duplicate/overlapping points into a single clean bullet - don't just concatenate them
+- Fix any broken markdown (unclosed bold/italic, inconsistent bullet indentation/nesting,
+  stray or misapplied headings)
+- If you find text that still looks like an unformatted raw transcript fragment (run-on
+  sentences, filler words, no bullet structure), reformat it into proper notes rather than
+  leaving it as-is
+- Preserve any "⚠️ verify" / "[FLAG: ...]" markers on the specific point they were attached
+  to - don't drop them, but you may reword the surrounding sentence for clarity
+- Keep an existing "### Q&A" section as its own section if present, cleaned up the same way
+- Don't invent content that wasn't in the original notes below
+- Output ONLY the final markdown for this section, no preamble or explanation
+
+Notes to clean up:
+---
+{session_markdown}
+---
+"""
+
+
+def condense_session(class_code: str, class_title: str, before_length: int) -> tuple[bool, str | None]:
+    """Re-reviews everything written to this class's notes since `before_length`
+    (the file's length when this recording session started) via the Claude CLI/API,
+    collapsing duplicate/multi-autosave sections into one clean section. Returns
+    (True, None) on success, or (False, reason) if there was nothing to do or
+    neither the CLI nor the API is available right now."""
+    path = notes_path(class_code)
+    if not path.exists():
+        return False, "no notes file yet"
+
+    content = path.read_text(encoding="utf-8")
+
+    # The top-level "# Class Title (CODE)" heading is written once by the very first
+    # save ever made for this class and isn't part of any single lecture's content -
+    # always keep it out of what gets handed to the condense pass, even when this is
+    # that first-ever session (before_length == 0, so it would otherwise fall inside
+    # the "session" range and the condense pass would have no reason to keep it).
+    title_end = 0
+    if content.startswith("# "):
+        split_at = content.find("\n\n")
+        if split_at != -1:
+            title_end = split_at + 2
+    preserve_length = max(before_length, title_end)
+
+    if preserve_length >= len(content):
+        return False, "nothing new to condense"
+
+    header_part = content[:preserve_length]
+    session_part = content[preserve_length:]
+    if not session_part.strip():
+        return False, "nothing new to condense"
+
+    prompt = _build_condense_prompt(class_title, class_code, session_part)
+    condensed = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    if not condensed:
+        return False, "Claude CLI/API unavailable"
+
+    new_content = header_part.rstrip("\n") + "\n\n" + condensed.strip() + "\n"
+    path.write_text(new_content, encoding="utf-8")
+
+    try:
+        docx_export.rebuild(class_code, class_title, new_content)
+    except Exception:
+        pass  # .docx is a mirror of the .md; never let it block the condensed save
+
+    return True, None

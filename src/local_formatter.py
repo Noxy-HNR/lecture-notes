@@ -48,7 +48,7 @@ _SPEAKER_LINE_RE = re.compile(r"^\[(Speaker \d+)\]\s*(.*)$")
 # Glossary correction
 # ---------------------------------------------------------------------------
 
-def _correct_with_glossary(text: str, class_code: str | None) -> str:
+def correct_with_glossary(text: str, class_code: str | None) -> str:
     """Fuzzy-matches individual words against the class's vocab.json glossary
     and fixes near-misses (e.g. Whisper hearing "amigdala" for "amygdala")."""
     if not class_code:
@@ -263,7 +263,7 @@ def _render_qa_block(items) -> list[str]:
 
 def format_transcript(class_title: str, session_date: str, transcript: str,
                        class_code: str | None = None) -> str:
-    transcript = _correct_with_glossary(transcript, class_code)
+    transcript = correct_with_glossary(transcript, class_code)
     speaker_entries = _parse_speaker_entries(transcript)
 
     header = [f"## {session_date}", "", "*(auto-formatted locally — Claude CLI/API unavailable)*", ""]

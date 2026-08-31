@@ -4,6 +4,7 @@ numpy>=1.26
 anthropic>=0.40.0
 python-docx>=1.1.0
 soundfile>=0.12.1
+colorama>=0.4.6
 
 # GPU acceleration for Whisper transcription (faster-whisper/ctranslate2). Not
 # installed by default via this file since the right build is machine-specific -
@@ -17,3 +18,10 @@ soundfile>=0.12.1
 # (use the cu128 CUDA build for GPU acceleration - see README)
 # pyannote.audio>=3.1.0
 # torch>=2.2.0
+
+# Optional: NPU-accelerated local note formatting (middle fallback tier between
+# Claude CLI/API and the pure heuristic formatter). Needs an Intel NPU. Install:
+#   pip install openvino openvino-tokenizers openvino-genai
+# then download the model once (see README "NPU-accelerated local formatting").
+# openvino>=2026.0
+# openvino-genai>=2026.0

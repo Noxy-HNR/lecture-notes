@@ -7,16 +7,26 @@ transcript into clean notes appended to that class's ongoing notes file.
 Note formatting is tried in this order, each falling back to the next if unavailable:
 1. **Claude Code CLI** (`claude -p`) — uses your logged-in Pro/Max subscription, no per-token billing
 2. **Claude API** (`ANTHROPIC_API_KEY`) — only used if the CLI isn't installed/logged in
-3. **Local formatter** — heuristic topic/bullet formatting + glossary correction, used if both of the above are unavailable (offline, etc.)
+3. **NPU local model** (Qwen2.5-1.5B on the Intel NPU via OpenVINO) — real LLM formatting, fully offline, used if neither the CLI nor API is available
+4. **Heuristic local formatter** — regex-based topic/bullet formatting + glossary correction, last resort if the NPU model isn't set up either
 
-Also, whenever the CLI/API is used:
-- A **proofreading pass** runs first — fixes spelling/grammar/mis-heard technical terms
-  without changing what was actually said, and flags (never silently "corrects") any
-  statement that looks like a transcription artifact producing something factually odd.
+Also:
+- Whenever the CLI/API is used, a **proofreading pass** runs first — fixes
+  spelling/grammar/mis-heard technical terms without changing what was actually
+  said, and flags (never silently "corrects") any statement that looks like a
+  transcription artifact producing something factually odd.
+- **When you stop recording (Ctrl+C)**, if the CLI is available it re-reviews
+  everything saved during that session (across any autosaves) in one pass —
+  merging duplicate/repeated sections from multiple autosaves into one clean
+  section, fixing formatting bugs, and cleaning up anything that still looks
+  like unformatted raw transcript.
 - Output is written as both **Markdown** (`notes/<CODE>.md`) and **Word** (`notes/<CODE>.docx`),
   kept in sync, appended lecture by lecture.
 - If speaker diarization is set up (see below), **Q&A exchanges get their own section**,
   separated from the main lecture content.
+- The live console view is color-coded: cyan timestamps, white transcript text,
+  green for successful saves, yellow/red for fallback or error states, magenta
+  for autosave markers.
 
 ## One-time setup
 
@@ -87,19 +97,30 @@ set, the app runs exactly as before — no speaker labels, nothing breaks.
 - It then asks whether to record from your **microphone** (in-person lecture)
   or **system audio** (online lecture, e.g. Zoom/Teams playing through your
   speakers).
-- Talk/listen normally. Live transcript prints to the console as it goes.
+- It also asks which **note formatting mode** to use this session:
+  1. **Auto** (default) — Claude CLI/API when available, falls back to the NPU
+     model then the heuristic formatter
+  2. **Local only** — NPU model + heuristic only, *no network calls at all*
+     (CLI/API are never contacted this session) — useful for privacy, exam
+     review, or working fully offline
+  3. **Heuristic only** — no LLM anywhere, fastest and fully deterministic
+- Talk/listen normally. Live transcript prints to the console as it goes
+  (color-coded — see above).
 - Press **Ctrl+C** to stop — notes are formatted and appended to
   `notes/<CLASS_CODE>.md`. Long sessions also autosave every 5 minutes so
   nothing is lost if the app closes unexpectedly.
 
-Useful flags:
+Useful flags (each skips its corresponding prompt):
 
 ```bash
-python src/main.py --class "BIOL 1440"   # skip auto-detection, force a class
-python src/main.py --source mic          # skip the audio-source prompt
-python src/main.py --source system       # capture system audio (loopback)
-python src/main.py --chunk 5             # transcribe in 5s chunks for more frequent output (default 8)
-python src/main.py --list                # show all classes from schedule.json
+python src/main.py --class "BIOL 1440"     # skip auto-detection, force a class
+python src/main.py --source mic            # skip the audio-source prompt
+python src/main.py --source system         # capture system audio (loopback)
+python src/main.py --formatting auto       # skip the formatting-mode prompt
+python src/main.py --formatting local      # local only - no CLI/API calls this session
+python src/main.py --formatting heuristic  # heuristic only - no LLM anywhere
+python src/main.py --chunk 8               # transcribe in 8s chunks for more frequent output (default 15)
+python src/main.py --list                  # show all classes from schedule.json
 ```
 
 ## Where things live
@@ -173,6 +194,40 @@ If you ever reinstall from `requirements.txt` on a machine without a
 CUDA-capable GPU, skip those two commands - the app still runs fine on CPU,
 just slower. Check what Whisper picked with the "Whisper running on: ..."
 line printed at startup (`cuda/float16` = GPU, `cpu/int8` = CPU).
+
+## NPU-accelerated local formatting
+
+This machine has an Intel NPU (**Intel(R) AI Boost**), already set up as the
+third formatting tier (`src/npu_formatter.py`) — kicks in automatically when
+neither the Claude CLI nor API is available, before falling back further to
+the pure heuristic formatter. It runs a small local LLM (Qwen2.5-1.5B-Instruct,
+INT4-quantized) via OpenVINO GenAI, so even fully offline you get real
+LLM-quality note formatting instead of just regex bullet-splitting - confirmed
+working: ~5s to format a lecture chunk, running entirely on the NPU (not
+competing with the GPU that's busy transcribing).
+
+What's installed for this:
+```bash
+./venv/Scripts/python.exe -m pip install openvino openvino-tokenizers openvino-genai
+```
+Model (downloaded once, ~900MB, cached in `state/npu_model/`):
+```python
+from huggingface_hub import snapshot_download
+snapshot_download("OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov", local_dir="state/npu_model")
+```
+
+Notes:
+- First load per run compiles the model for the NPU (~50s); generation itself
+  is fast (~5s per chunk) after that.
+- It's noticeably less capable than Claude (1.5B params vs. a frontier model) -
+  expect occasional rough formatting or a missed correction. The same
+  `vocab.json` glossary fix-up the heuristic formatter uses is also applied to
+  its output as a safety net.
+- If the packages aren't installed or the model isn't downloaded, this tier is
+  silently skipped and the app falls straight to the heuristic formatter -
+  nothing else breaks.
+- Machines without an Intel NPU (`Get-PnpDevice | Where FriendlyName -match
+  "AI Boost"` to check) should skip this entirely.
 
 ## Notes on system audio
 

@@ -66,3 +66,14 @@ def append_section(class_code: str, class_title: str, section_markdown: str):
     _append_markdown(doc, section_markdown)
     doc.save(str(path))
     return path
+
+
+def rebuild(class_code: str, class_title: str, full_markdown: str):
+    """Rebuilds notes/<CODE>.docx from scratch to match `full_markdown` exactly. Used
+    after condensing a session's notes, since incremental append can't handle edits
+    or removals to already-written content - only a full rebuild can."""
+    doc = Document()
+    _append_markdown(doc, full_markdown)
+    path = docx_path(class_code)
+    doc.save(str(path))
+    return path

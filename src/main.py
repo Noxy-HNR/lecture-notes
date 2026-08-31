@@ -36,6 +36,7 @@ import docx_export
 import diarize
 import vocab as vocab_module
 import soundfile as sf
+import console_colors as c
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
@@ -60,11 +61,11 @@ def choose_class(args):
             "starting_soon": "starting soon",
             "just_ended": "just ended",
         }[detected["status"]]
-        print(f"Detected class from your schedule: {detected['code']} - {detected['title']} "
-              f"({detected['location']}, {status_msg})")
+        print(c.success(f"Detected class from your schedule: {detected['code']} - {detected['title']} "
+                         f"({detected['location']}, {status_msg})"))
         return detected
 
-    print("No class found in your schedule for right now.")
+    print(c.warning("No class found in your schedule for right now."))
     print("Known classes:")
     codes = sched.list_all_classes()
     for i, (code, title) in enumerate(codes, 1):
@@ -76,7 +77,7 @@ def choose_class(args):
         code, title = codes[int(choice) - 1]
         return {"code": code, "title": title, "status": "manual"}
     except (ValueError, IndexError):
-        print("Invalid choice.")
+        print(c.error("Invalid choice."))
         sys.exit(1)
 
 
@@ -88,6 +89,17 @@ def choose_source(args):
     print("  2. System audio / loopback (online lecture, e.g. Zoom)")
     choice = input("Choose [1]: ").strip() or "1"
     return "mic" if choice == "1" else "system"
+
+
+def choose_formatting_mode(args):
+    if args.formatting in notes.FORMATTING_MODES:
+        return args.formatting
+    print("Note formatting:")
+    print("  1. Auto - Claude CLI/API when available, falls back to NPU then heuristic (default)")
+    print("  2. Local only - NPU model + heuristic only, no network calls at all (CLI/API skipped)")
+    print("  3. Heuristic only - no LLM anywhere, fastest and fully deterministic")
+    choice = input("Choose [1]: ").strip() or "1"
+    return {"1": "auto", "2": "local", "3": "heuristic"}.get(choice, "auto")
 
 
 class RollingTranscriber:
@@ -218,6 +230,8 @@ def run():
     parser.add_argument("--class", dest="klass", help="Override class code, e.g. 'BIOL 1440'")
     parser.add_argument("--source", choices=["mic", "system"], help="Audio source, skips the prompt")
     parser.add_argument("--chunk", type=float, default=15.0, help="Seconds per transcription chunk")
+    parser.add_argument("--formatting", choices=notes.FORMATTING_MODES,
+                         help="Note formatting mode, skips the prompt (auto/local/heuristic)")
     parser.add_argument("--list", action="store_true", help="List classes from schedule.json and exit")
     args = parser.parse_args()
 
@@ -228,24 +242,35 @@ def run():
 
     cls = choose_class(args)
     source = choose_source(args)
+    formatting_mode = choose_formatting_mode(args)
     initial_prompt = vocab_module.initial_prompt_for_class(cls["code"])
 
-    print(f"\nLoading local Whisper model (first run downloads it, may take a minute)...")
+    print(c.info("\nLoading local Whisper model (first run downloads it, may take a minute)..."))
     transcribe.get_model()  # warm up / trigger download before recording starts
-    print(f"Whisper running on: {transcribe.device_info()}")
+    print(c.info(f"Whisper running on: {transcribe.device_info()}"))
 
     if diarize.available():
-        print("Speaker diarization: enabled (HUGGINGFACE_TOKEN set)")
+        print(c.info("Speaker diarization: enabled (HUGGINGFACE_TOKEN set)"))
     else:
-        print("Speaker diarization: off (set HUGGINGFACE_TOKEN to enable Q&A speaker labeling)")
+        print(c.dim("Speaker diarization: off (set HUGGINGFACE_TOKEN to enable Q&A speaker labeling)"))
 
-    print(f"Recording from {'microphone' if source == 'mic' else 'system audio'} for "
-          f"{cls['code']} - {cls['title']}. Press Ctrl+C to stop and save notes.\n")
+    mode_descriptions = {
+        "auto": "auto (Claude CLI/API -> NPU -> heuristic)",
+        "local": "local only (NPU -> heuristic, no network calls)",
+        "heuristic": "heuristic only (no LLM anywhere)",
+    }
+    print(c.info(f"Note formatting: {mode_descriptions[formatting_mode]}"))
+
+    print(c.heading(f"\nRecording from {'microphone' if source == 'mic' else 'system audio'} for "
+                     f"{cls['code']} - {cls['title']}. Press Ctrl+C to stop and save notes.\n"))
 
     recorder = audio.get_recorder(source)
     now = datetime.now()
     session_date = f"{now.strftime('%A, %B')} {now.day}, {now.strftime('%Y')}"
     last_autosave = time.time()
+
+    existing_notes_path = notes.notes_path(cls["code"])
+    session_start_offset = len(existing_notes_path.read_text(encoding="utf-8")) if existing_notes_path.exists() else 0
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     raw_log_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}_raw.txt"
@@ -262,37 +287,55 @@ def run():
 
                 for seg in whisper_segments:
                     stamp = time.strftime("%H:%M:%S")
-                    print(f"[{stamp}] {seg['text']}")
+                    print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
                     with open(raw_log_path, "a", encoding="utf-8") as f:
                         f.write(f"[{stamp}] {seg['text']}\n")
 
                 if time.time() - last_autosave > AUTOSAVE_EVERY_SECONDS and session.pending_segments:
-                    _save(cls, session, session_date, note="(autosave)")
+                    _save(cls, session, session_date, formatting_mode, note="(autosave)")
                     last_autosave = time.time()
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print(c.autosave("\nStopping..."))
     finally:
         if session.pending_segments:
-            _save(cls, session, session_date)
+            _save(cls, session, session_date, formatting_mode)
         session.close()
         elapsed_min = session.elapsed() / 60
-        print(f"\nDone. Recorded ~{elapsed_min:.1f} minutes.")
-        print(f"Notes (markdown): {notes.notes_path(cls['code'])}")
-        print(f"Notes (Word): {docx_export.docx_path(cls['code'])}")
-        print(f"Raw transcript backup: {raw_log_path}")
-        print(f"Audio backup: {wav_path}")
+        print(c.success(f"\nDone. Recorded ~{elapsed_min:.1f} minutes."))
+
+        if formatting_mode != "auto":
+            print(c.dim(f"Skipped condense pass: formatting mode is '{formatting_mode}' (no CLI/API calls)."))
+        elif notes.cli_available():
+            print(c.info("Reviewing this session's notes with Claude CLI (condensing, dedup, formatting cleanup)..."))
+            ok, reason = notes.condense_session(cls["code"], cls["title"], session_start_offset)
+            if ok:
+                print(c.success("Notes condensed and cleaned up."))
+            else:
+                print(c.warning(f"Skipped condense pass: {reason}"))
+        else:
+            print(c.dim("Skipped condense pass: Claude CLI not available."))
+
+        print(c.info(f"Notes (markdown): {notes.notes_path(cls['code'])}"))
+        print(c.info(f"Notes (Word): {docx_export.docx_path(cls['code'])}"))
+        print(c.dim(f"Raw transcript backup: {raw_log_path}"))
+        print(c.dim(f"Audio backup: {wav_path}"))
 
 
-def _save(cls, session: Session, session_date, note=""):
+def _save(cls, session: Session, session_date, mode, note=""):
     full_text = session.pop_pending_text()
-    path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date)
-    tag = {
-        "cli": " [formatted with Claude Code CLI]",
-        "api": " [formatted with Claude API]",
-        "local": " [local formatting - Claude CLI/API unavailable]",
-        "none": "",
+    path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date, mode=mode)
+    chose_this_mode = mode != "auto"
+    tag, colorize = {
+        "cli": (" [formatted with Claude Code CLI]", c.success),
+        "api": (" [formatted with Claude API]", c.success),
+        "npu": (" [formatted locally on NPU]" if chose_this_mode
+                else " [formatted locally on NPU - Claude CLI/API unavailable]", c.warning),
+        "local": (" [heuristic local formatting]" if chose_this_mode
+                  else " [heuristic local formatting - Claude CLI/API/NPU unavailable]", c.warning),
+        "none": ("", c.dim),
     }[method]
-    print(f"Saved notes to {path}{tag} {note}")
+    note_colored = c.autosave(note) if note else ""
+    print(colorize(f"Saved notes to {path}{tag}") + (f" {note_colored}" if note_colored else ""))
 
 
 if __name__ == "__main__":
