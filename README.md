@@ -200,34 +200,53 @@ line printed at startup (`cuda/float16` = GPU, `cpu/int8` = CPU).
 This machine has an Intel NPU (**Intel(R) AI Boost**), already set up as the
 third formatting tier (`src/npu_formatter.py`) — kicks in automatically when
 neither the Claude CLI nor API is available, before falling back further to
-the pure heuristic formatter. It runs a small local LLM (Qwen2.5-1.5B-Instruct,
-INT4-quantized) via OpenVINO GenAI, so even fully offline you get real
-LLM-quality note formatting instead of just regex bullet-splitting - confirmed
-working: ~5s to format a lecture chunk, running entirely on the NPU (not
-competing with the GPU that's busy transcribing).
+the pure heuristic formatter. It runs a small local LLM via OpenVINO GenAI, so
+even fully offline you get real LLM-quality note formatting instead of just
+regex bullet-splitting.
+
+**Model: Phi-3.5-mini-instruct** (3.8B, group-quantized specifically for NPU
+deployment - the `-gq-ov` variant). Two others were tried first:
+- `Qwen2.5-1.5B-Instruct-int4-ov` — works fine (~49s load / ~5s generation)
+  but noticeably weaker formatting quality. Still on disk at `state/npu_model/`
+  as a lighter/faster fallback if you ever want to switch back.
+- `Phi-4-mini-instruct-int4-ov` — **do not use.** Reproducibly crashed the NPU
+  driver (`ZE_RESULT_ERROR_DEVICE_LOST`) on every generation attempt across
+  multiple clean retries, despite loading "successfully" first. Deleted.
 
 What's installed for this:
 ```bash
 ./venv/Scripts/python.exe -m pip install openvino openvino-tokenizers openvino-genai
 ```
-Model (downloaded once, ~900MB, cached in `state/npu_model/`):
+Model (downloaded once, ~2GB, cached in `state/npu_model_phi35mini_gq/`):
 ```python
 from huggingface_hub import snapshot_download
-snapshot_download("OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov", local_dir="state/npu_model")
+snapshot_download("OpenVINO/Phi-3.5-mini-instruct-int4-gq-ov", local_dir="state/npu_model_phi35mini_gq")
 ```
 
 Notes:
-- First load per run compiles the model for the NPU (~50s); generation itself
-  is fast (~5s per chunk) after that.
-- It's noticeably less capable than Claude (1.5B params vs. a frontier model) -
-  expect occasional rough formatting or a missed correction. The same
+- **First-ever compile of a given model is slow** (~3 minutes for this one) -
+  the NPU driver caches the compiled artifact on disk after that, so every
+  later load (even in a fresh process) is fast again (~10-15s load, a few
+  seconds to generate). This cache persists across app restarts.
+- Generation itself takes ~30s per lecture chunk (vs. ~5s for the smaller
+  1.5B model) - still very usable for this tier's role as an occasional
+  offline fallback, not real-time.
+- It's noticeably less capable than Claude (3.8B params vs. a frontier model)
+  and doesn't always follow "don't add commentary" instructions perfectly -
+  `npu_formatter.py` strips known meta-commentary patterns (e.g. it sometimes
+  appends a note about what it "corrected") as a safety net. The same
   `vocab.json` glossary fix-up the heuristic formatter uses is also applied to
-  its output as a safety net.
+  its output.
 - If the packages aren't installed or the model isn't downloaded, this tier is
   silently skipped and the app falls straight to the heuristic formatter -
   nothing else breaks.
 - Machines without an Intel NPU (`Get-PnpDevice | Where FriendlyName -match
   "AI Boost"` to check) should skip this entirely.
+- **RAM matters more than you'd think** for NPU model choice - this machine
+  has 15.4GB total RAM. Models much above ~4B params risk running out of room
+  once Whisper, the app, and everything else is also running; check free RAM
+  (`(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory`) before trying
+  something bigger.
 
 ## Notes on system audio
 
