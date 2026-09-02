@@ -14,11 +14,23 @@ Setup (one-time):
 """
 import logging
 import os
+import warnings
 
 # Harmless: torch's FLOP counter warns that it can't profile Triton kernels since
 # Triton isn't installed (a Linux-focused GPU-kernel compiler, not something this
 # app uses). Silence it so it doesn't clutter the console every time torch loads.
 logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
+
+# Both harmless and confirmed cosmetic (seen consistently on real successful diarization
+# runs, never correlated with a bad result): pyannote disables TF32 for reproducibility
+# (a deliberate tradeoff, not a problem) and torch's std() warns about a degenerate
+# reduction on a single-frame embedding window internally in pyannote's pooling layer.
+try:
+    from pyannote.audio.utils.reproducibility import ReproducibilityWarning
+    warnings.filterwarnings("ignore", category=ReproducibilityWarning)
+except ImportError:
+    pass  # pyannote not installed - nothing to suppress
+warnings.filterwarnings("ignore", message=r"std\(\): degrees of freedom is <= 0")
 
 _pipeline = None
 _load_failed = False
