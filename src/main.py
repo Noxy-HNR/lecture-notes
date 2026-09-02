@@ -267,6 +267,8 @@ class Session:
 
 
 MIN_FREE_DISK_GB = 2.0
+PREFLIGHT_AUDIO_SAMPLE_SECONDS = 3.0  # long enough that a natural pause between words
+                                       # doesn't get mistaken for a dead/muted mic
 
 
 def run_preflight_checks(source: str) -> bool:
@@ -280,11 +282,23 @@ def run_preflight_checks(source: str) -> bool:
     try:
         test_recorder = audio.get_recorder(source)
         with test_recorder:
-            test_clip = audio.record_chunk(test_recorder, 0.5)
+            test_clip = audio.record_chunk(test_recorder, PREFLIGHT_AUDIO_SAMPLE_SECONDS)
         peak = float(np.max(np.abs(test_clip))) if test_clip.size else 0.0
         source_label = "microphone" if source == "mic" else "system audio"
-        if audio.is_silent(test_clip):
-            print(c.warning(f"  Audio device opened, but picked up only silence (peak {peak:.4f}) - "
+        # Check sub-windows individually rather than the RMS of the whole sample - a
+        # single silent instant during a longer sample would otherwise dilute a real,
+        # brief utterance below the threshold even though speech was genuinely present.
+        # (A too-short single sample was a real false-positive bug: on 0.5s, roughly a
+        # coin flip whether it landed on a natural pause between words, even during
+        # active conversation - see git history if this needs adjusting again.)
+        window_frames = int(0.5 * audio.SAMPLE_RATE)
+        any_sound = any(
+            not audio.is_silent(test_clip[i:i + window_frames])
+            for i in range(0, len(test_clip), window_frames)
+        )
+        if not any_sound:
+            print(c.warning(f"  Audio device opened, but picked up only silence over "
+                             f"{PREFLIGHT_AUDIO_SAMPLE_SECONDS:.0f}s (peak {peak:.4f}) - "
                              f"check your {source_label} is unmuted/active before you start talking."))
         else:
             print(c.success(f"  Audio device OK ({source_label}, peak level {peak:.3f})"))
