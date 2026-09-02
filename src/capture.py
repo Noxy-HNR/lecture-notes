@@ -51,12 +51,19 @@ class CaptureThread:
         self._stop_event.set()
         self._thread.join(timeout=timeout)
 
-    def collect_chunk(self, target_seconds: float, poll_seconds: float = 0.5) -> np.ndarray | None:
+    def collect_chunk(self, target_seconds: float, poll_seconds: float = 0.5,
+                       interrupt_event: "threading.Event | None" = None) -> np.ndarray | None:
         """Blocks (checking `self._stop_event` periodically so it stays interruptible)
         until `target_seconds` worth of audio has been pulled from the queue, or stop
         was requested - in which case whatever partial audio is already queued (if any)
         is returned instead, so the tail end of a session isn't silently discarded.
         Returns None only if there's truly nothing available.
+
+        `interrupt_event`, if given, ends collection early (returning whatever's
+        accumulated so far, however little) without stopping capture itself - used for
+        a manual "save now" request, so it doesn't have to wait for a full chunk to
+        finish collecting before the save can happen. Caller is responsible for
+        clearing the event afterward; this method only reads it.
 
         If a KeyboardInterrupt fires while this is blocked waiting for the next block,
         it propagates normally (the caller's Ctrl+C handling still works) - but whatever
@@ -65,6 +72,8 @@ class CaptureThread:
         target_frames = int(target_seconds * audio.SAMPLE_RATE)
         total_frames = sum(len(b) for b in self._accumulating)
         while total_frames < target_frames:
+            if interrupt_event is not None and interrupt_event.is_set():
+                break
             try:
                 block = self.audio_queue.get(timeout=poll_seconds)
             except queue.Empty:

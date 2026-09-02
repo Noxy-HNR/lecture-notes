@@ -140,6 +140,12 @@ to fix, not something to ignore.
   3. **Heuristic only** — no LLM anywhere, fastest and fully deterministic
 - Talk/listen normally. Live transcript prints to the console as it goes
   (color-coded — see above).
+- Press **`s`** anytime (no Enter needed) to **save immediately** instead of
+  waiting for the next autosave — useful right before a class ends, or if
+  you just want to be sure something important is captured. This also resets
+  the 5-minute autosave timer, so it doesn't immediately trigger another save
+  right after. Doesn't wait for a full chunk to finish collecting first — it
+  saves whatever's been transcribed so far within about half a second.
 - Press **Ctrl+C** to stop — you'll see a detailed, timestamped play-by-play
   of the shutdown sequence (stopping capture, transcribing any final buffered
   audio, diarizing if enabled, saving, condensing) rather than a silent pause,

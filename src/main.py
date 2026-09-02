@@ -29,6 +29,7 @@ import argparse
 import re
 import shutil
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -48,10 +49,16 @@ import soundfile as sf
 import console_colors as c
 import keep_awake
 
+try:
+    import msvcrt  # Windows-only stdlib module for non-blocking console keypress detection
+except ImportError:
+    msvcrt = None
+
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
 
 AUTOSAVE_EVERY_SECONDS = 5 * 60  # flush partial notes periodically, not just at the end
+SAVE_NOW_KEY = b"s"
 
 
 def choose_class(args):
@@ -170,6 +177,37 @@ class RollingTranscriber:
         self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
 
         return kept
+
+
+class SaveNowListener:
+    """Background thread that watches for a keypress (Windows console only, via
+    msvcrt - no Enter needed, a raw keystroke is enough) to request an immediate
+    manual save. Deliberately does nothing but set an event: the actual save always
+    happens on the main loop, same as autosave, so there's no risk of the listener
+    thread and the main loop both touching Session/notes state at the same time.
+    A no-op (start() does nothing) if msvcrt isn't available (non-Windows)."""
+
+    def __init__(self, key: bytes = SAVE_NOW_KEY):
+        self.key = key.lower()
+        self.requested = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="save-now-listener", daemon=True)
+
+    def start(self):
+        if msvcrt is None:
+            return
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch.lower() == self.key:
+                    self.requested.set()
+            time.sleep(0.1)
 
 
 class Session:
@@ -641,7 +679,10 @@ def run():
     print(c.info(f"Note formatting: {mode_descriptions[formatting_mode]}"))
 
     print(c.heading(f"\nRecording from {'microphone' if source == 'mic' else 'system audio'} for "
-                     f"{cls['code']} - {cls['title']}. Press Ctrl+C to stop and save notes.\n"))
+                     f"{cls['code']} - {cls['title']}."))
+    save_now_hint = (f" Press '{SAVE_NOW_KEY.decode()}' anytime to save immediately "
+                      f"(also resets the autosave timer)." if msvcrt is not None else "")
+    print(c.heading(f"Press Ctrl+C to stop and save notes.{save_now_hint}\n"))
 
     now = datetime.now()
     session_date = f"{now.strftime('%A, %B')} {now.day}, {now.strftime('%Y')}"
@@ -670,16 +711,37 @@ def run():
     capture = capture_module.CaptureThread(source)
     capture.start()
 
+    save_listener = SaveNowListener()
+    save_listener.start()
+
     try:
         while True:
-            chunk_audio = capture.collect_chunk(args.chunk)
+            chunk_audio = capture.collect_chunk(args.chunk, interrupt_event=save_listener.requested)
             for err in capture.poll_errors():
                 print(c.error(f"Audio device error (auto-recovering, capture continues): {err}"))
+
+            whisper_segments = []
+            if chunk_audio is not None:
+                whisper_segments = transcriber.process(chunk_audio)
+                session.write_chunk(chunk_audio, whisper_segments)
+                for seg in whisper_segments:
+                    stamp = time.strftime("%H:%M:%S")
+                    print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
+                    with open(raw_log_path, "a", encoding="utf-8") as f:
+                        f.write(f"[{stamp}] {seg['text']}\n")
+
+            if save_listener.requested.is_set():
+                save_listener.requested.clear()
+                if session.pending_segments:
+                    print(c.autosave(f"\n'{SAVE_NOW_KEY.decode()}' pressed - saving now..."))
+                    _save(cls, session, session_date, formatting_mode, note="(manual save)")
+                else:
+                    print(c.dim(f"\n'{SAVE_NOW_KEY.decode()}' pressed, but nothing new to save yet."))
+                last_autosave = time.time()  # reset either way - that's what was asked for
+                continue
+
             if chunk_audio is None:
                 continue  # nothing captured yet (e.g. very start) - keep waiting
-
-            whisper_segments = transcriber.process(chunk_audio)
-            session.write_chunk(chunk_audio, whisper_segments)
 
             silent_seconds = transcriber.consecutive_silent_chunks * args.chunk
             if silent_seconds >= SILENCE_WARNING_SECONDS and not silence_warned:
@@ -689,12 +751,6 @@ def run():
                 silence_warned = True
             elif transcriber.consecutive_silent_chunks == 0:
                 silence_warned = False
-
-            for seg in whisper_segments:
-                stamp = time.strftime("%H:%M:%S")
-                print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
-                with open(raw_log_path, "a", encoding="utf-8") as f:
-                    f.write(f"[{stamp}] {seg['text']}\n")
 
             if time.time() - last_autosave > AUTOSAVE_EVERY_SECONDS and session.pending_segments:
                 _save(cls, session, session_date, formatting_mode, note="(autosave)")
@@ -708,6 +764,7 @@ def run():
             print(c.heading(f"[{time.time() - shutdown_start:5.1f}s] ") + c.info(msg))
 
         keep_awake.allow_sleep()
+        save_listener.stop()
 
         _step("Stopping audio capture...")
         capture.stop()
