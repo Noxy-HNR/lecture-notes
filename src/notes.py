@@ -222,6 +222,77 @@ def _detect_corrections(original: str, corrected: str) -> set[str]:
     return candidates
 
 
+def _build_combined_prompt(class_title: str, class_code: str, session_date: str,
+                            transcript: str, prior_tail: str) -> str:
+    """Same end result as running _build_proofread_prompt then _build_notes_prompt as
+    two separate CLI/API calls, but as ONE call/prompt instead. Used for the expensive
+    full-session-diarization save at Ctrl+C (a large, latency-sensitive transcript,
+    where two sequential round-trips over the whole thing was the dominant cost -
+    measured ~200s vs. a much smaller per-chunk save where the extra round-trip barely
+    matters). Trades away the separate proofread-only output that vocab-learning
+    diffs against - that's fine here since it's a one-shot, whereas the smaller
+    per-chunk path (which keeps the two-call version) already gets plenty of chances
+    to learn vocabulary over the course of a session."""
+    terms = vocab_module.terms_for_class(class_code)
+    glossary_line = ("Known vocabulary for this class (fix mis-transcriptions toward these "
+                      f"when it's clearly the intended word): {', '.join(terms)}\n\n") if terms else ""
+    return f"""You are turning a raw speech-to-text lecture transcript into clean study notes.
+Class: {class_title} ({class_code})
+Date: {session_date}
+
+{glossary_line}First, silently account for transcription noise as you read the transcript below -
+fix obvious spelling/mis-hearings (e.g. a mangled technical/Latin term that clearly should
+be a real word given context) and grammar in your head, without changing meaning - but do
+NOT output a corrected transcript; go straight to writing the final notes as described below.
+If a specific claim in the transcript seems factually off in a way that looks like it's
+caused by a transcription error (a garbled term producing something that contradicts basic
+facts about the subject), keep your best-guess correction in the notes but append "⚠️
+*verify*" right after that point - only for likely transcription artifacts, not because a
+claim is merely debatable.
+
+Here is the END of the notes file from previous lectures, for context and continuity
+(do not repeat this material, just use it to stay consistent and to note connections
+when today's material clearly builds on it):
+---
+{prior_tail if prior_tail else "(no previous notes yet for this class)"}
+---
+
+Here is today's transcript. It may contain "[Speaker N]" tags if multiple speakers were
+detected (diarization) - if present, treat the speaker who talks the most as the instructor,
+and any back-and-forth with other speakers as Q&A: pull those into their own "### Q&A"
+section formatted as "**Q (Student):** ..." / "**A (Instructor):** ...", separate from the
+main lecture content, rather than interleaving them into the regular notes. If no speaker
+tags are present, treat it as one continuous lecture.
+---
+{transcript}
+---
+
+Write clean, well-organized markdown notes for TODAY's lecture only. These are STUDY
+NOTES a student reviews later to learn the material - not a recap/summary of the class
+session itself. Requirements:
+- Start with a level-2 heading: "## {session_date}"
+- State the actual content directly and factually: "**Amygdala**: part of the limbic
+  system, handles fear responses" - NOT "The professor discussed the amygdala and its
+  role in fear responses" or "We covered how the amygdala relates to emotion." Avoid
+  any "recap" framing ("today we learned...", "the lecture covered...", "discussion
+  of..."). If the instructor themselves recaps or summarizes something mid-lecture,
+  still extract and state the underlying facts directly - don't write a summary of a
+  summary.
+- Use bullet points and sub-bullets for concepts, bold key terms
+- Don't invent content that wasn't said, and don't drop content just because it's long -
+  this may be a full lecture's worth of material, cover all of it
+- Group related points under short level-3 headings for each topic covered
+- Where a technical term or concept is mentioned but not fully explained in the transcript,
+  you may add a brief one-line background definition from general knowledge of the subject
+  to make the notes more self-contained and useful for studying - but clearly mark any such
+  addition as supplementary, e.g. "*(background: ...)*", so it's never confused with
+  something the instructor actually said. Only add these where they'd genuinely help
+  comprehension of an under-explained term, not for every term that appears.
+- If something clearly connects to previous material, add a brief note like "*(builds on ...)*"
+- Do not include a preamble or explanation, output only the markdown notes section
+"""
+
+
 def _proofread(class_title: str, class_code: str, transcript: str) -> str:
     """Runs the transcript through a proofread/flag pass via CLI or API. Returns the
     original transcript unchanged if neither is available (local-only mode). Also
@@ -244,9 +315,14 @@ FORMATTING_MODES = ("auto", "local", "heuristic")
 
 
 def format_and_save(class_code: str, class_title: str, transcript: str,
-                     session_date: str | None = None, mode: str = "auto") -> Path:
+                     session_date: str | None = None, mode: str = "auto",
+                     combine_proofread: bool = False) -> Path:
     """Formats `transcript` into notes and appends them to notes/<CODE>.md. Returns the file path.
-    `mode` controls which formatting tiers are allowed - see FORMATTING_MODES above."""
+    `mode` controls which formatting tiers are allowed - see FORMATTING_MODES above.
+    `combine_proofread`: do proofreading + notes-formatting as one CLI/API call instead
+    of two sequential ones (see _build_combined_prompt) - worth it for a large,
+    latency-sensitive transcript (e.g. the full-session-diarization save at Ctrl+C),
+    not worth the lost vocab-learning signal for the normal small per-chunk saves."""
     if mode not in FORMATTING_MODES:
         raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
     if not session_date:
@@ -263,8 +339,11 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
     method = None
 
     if mode == "auto":
-        proofread_transcript = _proofread(class_title, class_code, transcript)
-        prompt = _build_notes_prompt(class_title, class_code, session_date, proofread_transcript, prior_tail)
+        if combine_proofread:
+            prompt = _build_combined_prompt(class_title, class_code, session_date, transcript, prior_tail)
+        else:
+            proofread_transcript = _proofread(class_title, class_code, transcript)
+            prompt = _build_notes_prompt(class_title, class_code, session_date, proofread_transcript, prior_tail)
         section = _try_claude_cli_format(prompt)
         method = "cli"
         if section is None:

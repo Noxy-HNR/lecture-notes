@@ -616,7 +616,8 @@ def try_full_session_diarization(cls, session: Session, session_date, session_st
     notes_path.write_text(existing[:session_start_offset], encoding="utf-8")
 
     save_start = time.time()
-    path, method = notes.format_and_save(cls["code"], cls["title"], labeled_text, session_date, mode=formatting_mode)
+    path, method = notes.format_and_save(cls["code"], cls["title"], labeled_text, session_date,
+                                          mode=formatting_mode, combine_proofread=True)
     print(c.success(f"  Full session formatted and saved as one clean section "
                      f"(method: {method}, {time.time() - save_start:.1f}s)."))
     return True

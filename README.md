@@ -203,13 +203,31 @@ reuses the transcript already produced live (no re-transcription needed,
 unlike `--resume`) and just runs diarization fresh against the full WAV.
 
 **The tradeoff**: this reformats the entire lecture transcript through the
-CLI/API in one call at shutdown, instead of just the small tail chunk - on a
-long lecture that's a real wait (validated: ~90s diarizing + ~200s formatting
-for a 14-minute segment; a 45+ minute lecture will take longer). The detailed,
-timestamped shutdown messages exist specifically so this doesn't look hung.
-Falls back automatically to the normal tail-only save (fast, no diarization)
-if diarization isn't set up, fails, or nothing was ever transcribed that
-session.
+CLI/API at shutdown instead of just the small tail chunk, so on a long
+lecture that's a real wait. The detailed, timestamped shutdown messages exist
+specifically so this doesn't look hung. Falls back automatically to the
+normal tail-only save (fast, no diarization) if diarization isn't set up,
+fails, or nothing was ever transcribed that session.
+
+**Optimized**: this path uses `combine_proofread=True` - proofreading and
+notes-formatting run as ONE CLI/API call instead of two sequential ones (the
+normal per-chunk save still uses two, since that's where vocab-learning's
+before/after diff comes from, and the extra round-trip barely matters on a
+small chunk anyway). Measured **60% faster** on a real transcript (19.0s →
+7.5s, two calls vs. one) with no quality loss.
+
+Diarization itself was also checked for GPU under-utilization by testing
+pyannote's `embedding_batch_size`/`segmentation_batch_size` above their
+default of 32. First pass: `64` was noise-level faster (23.1s vs. 22.5s) and
+`128` measured 17x slower (386.5s) - but the machine then crashed
+(`CLOCK_WATCHDOG_TIMEOUT`, a hardware/driver-level BSOD, not an app bug) while
+running that same test with the laptop poorly ventilated (in a bag). A
+retest with proper airflow, deliberately skipping `128`, found `32` and `64`
+statistically indistinguishable (~51-59s both, same audio) - noisier than
+the first pass in absolute terms, but no batch-size effect either way. Net
+conclusion: **batch size isn't a real lever here** - left at the library
+default (32). The `128` result specifically should not be trusted as a clean
+measurement given what happened during that run; it wasn't safe to retest.
 
 ## Pruning old backups
 
