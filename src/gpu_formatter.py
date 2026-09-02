@@ -43,6 +43,16 @@ PORT = 8090  # distinct from the user's existing llama-server on port 10000
 BASE_URL = f"http://127.0.0.1:{PORT}"
 STARTUP_TIMEOUT_SECONDS = 30
 
+# Was 4096 - way too small for this tier's real job. It's the fallback for a whole
+# SESSION's transcript (via try_full_session_diarization in main.py) when Claude
+# CLI/API aren't available, not just a single ~15s chunk. Confirmed live: a real
+# 37-minute lecture (~7,350 tokens) silently failed to fit and fell all the way
+# through to the much lower-quality heuristic formatter instead of this tier - not
+# a crash, just silent degradation, which is worse because nothing looked broken.
+# 32768 comfortably covers a 3+ hour lecture (Qwen2.5-3B supports up to 32k context).
+CONTEXT_SIZE = 32768
+REQUEST_TIMEOUT_SECONDS = 180  # was 60 - too tight once output scales with input (below)
+
 _server_process = None
 
 
@@ -71,7 +81,7 @@ def _ensure_server_running() -> bool:
         try:
             _server_process = subprocess.Popen(
                 [str(LLAMA_SERVER_EXE), "-m", str(MODEL_PATH), "--port", str(PORT),
-                 "-ngl", "999", "-c", "4096", "--log-disable"],
+                 "-ngl", "999", "-c", str(CONTEXT_SIZE), "--log-disable"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             atexit.register(stop_server)
@@ -115,7 +125,7 @@ def _chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
             result = json.loads(resp.read())
         text = result["choices"][0]["message"]["content"].strip()
         return text or None
@@ -139,11 +149,21 @@ Notes:
 - Produces energy through **cellular respiration**"""
 
 
+def _scaled_max_tokens(transcript: str, floor: int = 400, ceiling: int = 4000) -> int:
+    """Notes output needs to scale with input length - a fixed small cap (this used
+    to be a flat 400) truncates output for anything longer than a short chunk, most
+    obviously a whole-session transcript. Rough heuristic: notes run shorter than the
+    source transcript, so half the estimated input token count is a reasonable upper
+    bound, clamped to a sane range either way."""
+    estimated_input_tokens = len(transcript.split()) * 1.3
+    return int(min(ceiling, max(floor, estimated_input_tokens * 0.5)))
+
+
 def format_transcript(class_title: str, session_date: str, transcript: str) -> str | None:
     """Returns clean markdown notes for this transcript, or None if the local LLM
     server isn't available/fails - caller falls back to the heuristic formatter."""
     user_prompt = f"Class: {class_title}\n\nTranscript:\n{transcript}"
-    text = _chat(_FORMAT_SYSTEM_PROMPT, user_prompt, max_tokens=400)
+    text = _chat(_FORMAT_SYSTEM_PROMPT, user_prompt, max_tokens=_scaled_max_tokens(transcript))
     if not text:
         return None
     if not text.lstrip().startswith("#"):
@@ -172,5 +192,8 @@ Rules:
 def condense_transcript(session_markdown: str) -> str | None:
     """Re-reviews notes from one lecture session (possibly containing duplicate/
     overlapping sections from multiple autosaves) and merges them into one clean
-    section. Returns None if the local LLM server isn't available/fails."""
-    return _chat(_CONDENSE_SYSTEM_PROMPT, session_markdown, max_tokens=1200)
+    section. Returns None if the local LLM server isn't available/fails. Currently
+    unused (notes.py's condense_session is CLI/API-only - see its docstring for why),
+    kept in sync with the same context/token-scaling fix as format_transcript in case
+    that decision is ever revisited."""
+    return _chat(_CONDENSE_SYSTEM_PROMPT, session_markdown, max_tokens=_scaled_max_tokens(session_markdown, ceiling=3000))

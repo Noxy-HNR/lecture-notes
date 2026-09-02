@@ -26,6 +26,7 @@ Stop recording any time with Ctrl+C. Notes are saved (with a safety autosave
 every few minutes) even if you stop abruptly.
 """
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -510,6 +511,35 @@ def prune_backups(older_than_days: int, confirm: bool):
     print(c.success(f"\nDeleted {deleted}/{len(candidates)} file(s), freed {total_bytes / 1e9:.2f}GB."))
 
 
+def run_study_guide(code: str):
+    """Generates a consolidated, cross-lecture study guide for one class from all of its
+    notes so far. CLI/API only - see notes.generate_study_guide for why the local model
+    isn't used here."""
+    cls = sched.get_class_by_code(code)
+    if cls is None:
+        print(c.error(f"No class with code '{code}' found in schedule.json."))
+        print(c.info("Known classes:"))
+        for known_code, title in sched.list_all_classes():
+            print(f"  {known_code} - {title}")
+        sys.exit(1)
+
+    if not notes.cli_available() and not os.environ.get("ANTHROPIC_API_KEY"):
+        print(c.error("Study guide generation needs the Claude CLI (logged in) or "
+                       "ANTHROPIC_API_KEY - neither is available right now."))
+        sys.exit(1)
+
+    print(c.heading(f"Building study guide for {cls['code']} - {cls['title']} "
+                     f"from all notes so far..."))
+    start = time.time()
+    ok, reason, path = notes.generate_study_guide(cls["code"], cls["title"])
+    if not ok:
+        print(c.error(f"Could not generate study guide: {reason}"))
+        sys.exit(1)
+
+    print(c.success(f"Study guide saved to {path} ({time.time() - start:.1f}s)."))
+    print(c.info(f"Study guide (Word): {docx_export.study_guide_docx_path(cls['code'])}"))
+
+
 def run_resume(target: str, args):
     """Recovers a crashed/interrupted session from its state/ backups: re-transcribes
     the audio backup if present (enabling diarization, since resuming only happens
@@ -642,9 +672,17 @@ def try_full_session_diarization(cls, session: Session, session_date, session_st
 
     notes_path = notes.notes_path(cls["code"])
     existing = notes_path.read_text(encoding="utf-8") if notes_path.exists() else ""
-    # Discard this session's own earlier plain-text autosave sections - we're replacing
-    # them with one clean, fully speaker-labeled version of the complete lecture.
-    notes_path.write_text(existing[:session_start_offset], encoding="utf-8")
+    # Discard everything already written for TODAY's date - not just session_start_offset
+    # (this session's own start). If the app was run more than once today for this class
+    # (recording paused and resumed in a fresh process), session_start_offset from a later
+    # run wouldn't know about an earlier run's "## <date>" section for the same day,
+    # leaving two separate headers side by side with nothing to merge them (this path
+    # skips the condense pass entirely, so that duplication would never get cleaned up).
+    # Finding the date heading fresh sweeps in everything for today regardless of how
+    # many separate runs wrote it, and safely falls back to session_start_offset's
+    # equivalent (append after everything) if today's date hasn't appeared yet.
+    truncate_at = _find_date_section_boundary(existing, session_date)
+    notes_path.write_text(existing[:truncate_at], encoding="utf-8")
 
     save_start = time.time()
     path, method = notes.format_and_save(cls["code"], cls["title"], labeled_text, session_date,
@@ -673,6 +711,11 @@ def run():
                          help="Age threshold in days for --prune-backups (default 30)")
     parser.add_argument("--confirm", action="store_true",
                          help="Actually perform the deletion for --prune-backups (otherwise dry-run only)")
+    parser.add_argument("--study-guide", metavar="CODE",
+                         help="Generate a consolidated, topic-organized study guide from all of a "
+                              "class's notes so far (e.g. 'PSYC 1300') and exit. Requires Claude "
+                              "CLI or API - needs real synthesis across lectures, the local model "
+                              "isn't reliable enough for this.")
     args = parser.parse_args()
 
     if args.list:
@@ -690,6 +733,10 @@ def run():
 
     if args.resume:
         run_resume(args.resume, args)
+        return
+
+    if args.study_guide:
+        run_study_guide(args.study_guide)
         return
 
     cls = choose_class(args)
@@ -843,7 +890,16 @@ def run():
             _step("Reviewing this session's notes with Claude CLI (condensing duplicate autosave "
                   "sections, cleaning up formatting)...")
             condense_start = time.time()
-            ok, reason = notes.condense_session(cls["code"], cls["title"], session_start_offset, mode=formatting_mode)
+            # Use the boundary of TODAY's date heading, not just this session's own
+            # start - if the app was run more than once today for this class (e.g.
+            # recording paused and resumed in a fresh process), an earlier run's
+            # session_start_offset wouldn't know about a still-earlier run's section
+            # for the same date, leaving duplicate "## <date>" headers that never get
+            # merged. Finding the date heading fresh at condense time sweeps in
+            # everything for today regardless of how many separate runs wrote it.
+            current_notes_content = notes.notes_path(cls["code"]).read_text(encoding="utf-8")
+            condense_boundary = _find_date_section_boundary(current_notes_content, session_date)
+            ok, reason = notes.condense_session(cls["code"], cls["title"], condense_boundary, mode=formatting_mode)
             if ok:
                 print(c.success(f"  Notes condensed and cleaned up ({time.time() - condense_start:.1f}s)."))
             else:

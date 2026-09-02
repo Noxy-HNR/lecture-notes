@@ -180,6 +180,13 @@ def _extract_heading(sentence: str) -> str | None:
     words = tail.split()
     if not words:
         return None
+    # Guards against a real, observed bug: naive sentence-splitting on "." treats an
+    # abbreviation/initial (e.g. a mis-transcribed name like "A.") as its own sentence,
+    # so a transition cue right before one ("...we'll talk about A.") extracts just that
+    # single letter as the "heading" - a single short word is essentially never a real
+    # topic heading, so require either 2+ words or one reasonably long word.
+    if len(words) < 2 and len(words[0]) < 4:
+        return None
     heading = " ".join(words[:8])
     return heading[:1].upper() + heading[1:]
 

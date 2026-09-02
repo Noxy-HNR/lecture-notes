@@ -419,6 +419,87 @@ Notes to clean up:
 """
 
 
+def study_guide_path(class_code: str) -> Path:
+    safe = class_code.replace(" ", "_")
+    return NOTES_DIR / f"{safe}_study_guide.md"
+
+
+def _build_study_guide_prompt(class_title: str, class_code: str, all_notes: str) -> str:
+    return f"""You are building a consolidated exam-prep study guide for {class_title} ({class_code})
+from that class's full set of per-lecture notes below, spanning the whole semester so far.
+
+This is NOT a lecture-by-lecture recap - a student should be able to read only this
+document and have everything they need to review for an exam, without needing to
+revisit the individual lecture notes it was built from.
+
+Requirements:
+- Organize by TOPIC/THEME across the whole semester, not by date or lecture session -
+  merge related material from different lectures under the same heading (e.g. if
+  "memory" came up across three separate lectures, it should appear once, combined)
+- Use level-2 headings ("## <topic>") for major topics, with bullet points and
+  sub-bullets underneath; bold key terms
+- State facts directly, the way a study guide would ("**Amygdala**: part of the limbic
+  system, handles fear responses"), not as a recap of what was taught or when
+- Where the same concept was covered more than once across lectures (recapped, revisited,
+  or built upon), merge those into one clean, complete treatment rather than repeating it -
+  if a later lecture added nuance or corrected/extended an earlier point, reflect the most
+  complete/current understanding
+- Preserve any "⚠️ verify" / "[FLAG: ...]" transcription-uncertainty markers that are
+  attached to specific points, so the student knows to double check those - don't
+  invent new ones
+- Keep Q&A content only where it adds information not already covered in the main
+  material - fold a genuinely informative Q&A point into the relevant topic section
+  rather than keeping a separate Q&A section
+- Do not invent content that isn't present in the notes below
+- Do not include a preamble, explanation, or meta-commentary about the notes themselves -
+  output ONLY the final study guide markdown, starting with a level-1 heading:
+  "# {class_title} - Study Guide"
+
+Full notes to consolidate:
+---
+{all_notes}
+---
+"""
+
+
+def generate_study_guide(class_code: str, class_title: str,
+                          mode: str = "auto") -> tuple[bool, str | None, Path | None]:
+    """Reads all of a class's accumulated per-lecture notes and asks Claude to produce
+    one consolidated, topic-organized review document (notes/<CODE>_study_guide.md),
+    good for exam prep - distinct from condense_session, which only cleans up ONE
+    session's notes without cross-lecture synthesis. CLI/API only, same reasoning as
+    condense_session: this is an even harder multi-section merge task than condensing,
+    and the local GPU model's unreliability on that smaller task makes it a bad fit
+    here too. Returns (True, None, path) on success, or (False, reason, None)."""
+    if mode not in FORMATTING_MODES:
+        raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
+    if mode != "auto":
+        return False, f"no LLM available in '{mode}' mode", None
+
+    path = notes_path(class_code)
+    if not path.exists():
+        return False, "no notes yet for this class", None
+
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return False, "no notes yet for this class", None
+
+    prompt = _build_study_guide_prompt(class_title, class_code, content)
+    guide = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    if not guide:
+        return False, "Claude CLI/API unavailable", None
+
+    out_path = study_guide_path(class_code)
+    out_path.write_text(guide.strip() + "\n", encoding="utf-8")
+
+    try:
+        docx_export.save_study_guide(class_code, class_title, guide.strip())
+    except Exception:
+        pass  # .docx is a mirror of the .md; never let it block saving the study guide
+
+    return True, None, out_path
+
+
 def condense_session(class_code: str, class_title: str, before_length: int,
                       mode: str = "auto") -> tuple[bool, str | None]:
     """Re-reviews everything written to this class's notes since `before_length`

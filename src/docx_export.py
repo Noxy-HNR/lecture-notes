@@ -68,6 +68,22 @@ def append_section(class_code: str, class_title: str, section_markdown: str):
     return path
 
 
+def study_guide_docx_path(class_code: str) -> Path:
+    safe = class_code.replace(" ", "_")
+    return NOTES_DIR / f"{safe}_study_guide.docx"
+
+
+def save_study_guide(class_code: str, class_title: str, guide_markdown: str):
+    """Writes a class's consolidated study guide as its own .docx, separate from the
+    per-lecture notes.docx - always a full rewrite, there's no incremental append case
+    for this (a study guide is regenerated from scratch each time, not built up)."""
+    doc = Document()
+    _append_markdown(doc, guide_markdown)
+    path = study_guide_docx_path(class_code)
+    doc.save(str(path))
+    return path
+
+
 def rebuild(class_code: str, class_title: str, full_markdown: str):
     """Rebuilds notes/<CODE>.docx from scratch to match `full_markdown` exactly. Used
     after condensing a session's notes, since incremental append can't handle edits
