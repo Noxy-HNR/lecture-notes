@@ -31,6 +31,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -309,14 +310,10 @@ PREFLIGHT_AUDIO_SAMPLE_SECONDS = 3.0  # long enough that a natural pause between
                                        # doesn't get mistaken for a dead/muted mic
 
 
-def run_preflight_checks(source: str) -> bool:
-    """Quick sanity checks before committing to a recording session, so a broken mic
-    or a dead GPU shows up now - not silently mid-lecture, which is how most of this
-    app's real bugs actually surfaced. Warnings don't block starting; only a genuinely
-    unusable audio device or a Whisper model that fails to load does (returns False)."""
-    print(c.heading("Running preflight checks..."))
-    ok = True
-
+def _check_audio_device(source: str) -> tuple[bool, str]:
+    """Returns (blocks_startup, message). Runs concurrently with the other preflight
+    checks - safe because it only touches the audio subsystem (WASAPI), no shared
+    state with the GPU/Whisper or filesystem checks."""
     try:
         test_recorder = audio.get_recorder(source)
         with test_recorder:
@@ -335,31 +332,65 @@ def run_preflight_checks(source: str) -> bool:
             for i in range(0, len(test_clip), window_frames)
         )
         if not any_sound:
-            print(c.warning(f"  Audio device opened, but picked up only silence over "
-                             f"{PREFLIGHT_AUDIO_SAMPLE_SECONDS:.0f}s (peak {peak:.4f}) - "
-                             f"check your {source_label} is unmuted/active before you start talking."))
-        else:
-            print(c.success(f"  Audio device OK ({source_label}, peak level {peak:.3f})"))
+            return False, c.warning(f"  Audio device opened, but picked up only silence over "
+                                     f"{PREFLIGHT_AUDIO_SAMPLE_SECONDS:.0f}s (peak {peak:.4f}) - "
+                                     f"check your {source_label} is unmuted/active before you start talking.")
+        return False, c.success(f"  Audio device OK ({source_label}, peak level {peak:.3f})")
     except Exception as e:
-        print(c.error(f"  Audio device FAILED to open: {e}"))
-        ok = False
+        return True, c.error(f"  Audio device FAILED to open: {e}")
 
+
+def _check_disk_space() -> str | None:
     try:
         usage = shutil.disk_usage(STATE_DIR)
         free_gb = usage.free / 1e9
         if free_gb < MIN_FREE_DISK_GB:
-            print(c.warning(f"  Low disk space: {free_gb:.1f}GB free - audio/notes backups need room."))
-        else:
-            print(c.success(f"  Disk space OK ({free_gb:.1f}GB free)"))
+            return c.warning(f"  Low disk space: {free_gb:.1f}GB free - audio/notes backups need room.")
+        return c.success(f"  Disk space OK ({free_gb:.1f}GB free)")
     except Exception:
-        pass  # non-critical, skip silently if the check itself fails
+        return None  # non-critical, skip silently if the check itself fails
 
+
+def _check_whisper_model() -> tuple[bool, str]:
     try:
         transcribe.get_model()
-        print(c.success(f"  Whisper model OK ({transcribe.device_info()})"))
+        return False, c.success(f"  Whisper model OK ({transcribe.device_info()})")
     except Exception as e:
-        print(c.error(f"  Whisper model FAILED to load: {e}"))
-        ok = False
+        return True, c.error(f"  Whisper model FAILED to load: {e}")
+
+
+def run_preflight_checks(source: str) -> bool:
+    """Quick sanity checks before committing to a recording session, so a broken mic
+    or a dead GPU shows up now - not silently mid-lecture, which is how most of this
+    app's real bugs actually surfaced. Warnings don't block starting; only a genuinely
+    unusable audio device or a Whisper model that fails to load does (returns False).
+
+    The three checks run concurrently (audio device, disk space, Whisper model load)
+    since they touch entirely independent subsystems (WASAPI, filesystem, GPU) with no
+    shared state - safe to parallelize. Whisper's load time dominates (several seconds,
+    especially cold), so overlapping the ~3s audio sample against it is a real, free
+    time saving rather than just running things concurrently for its own sake. Results
+    are printed in a fixed order after all three finish, not in completion order, so
+    the output stays consistent run to run."""
+    print(c.heading("Running preflight checks..."))
+    ok = True
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        audio_future = executor.submit(_check_audio_device, source)
+        disk_future = executor.submit(_check_disk_space)
+        whisper_future = executor.submit(_check_whisper_model)
+
+        blocks, msg = audio_future.result()
+        print(msg)
+        ok = ok and not blocks
+
+        disk_msg = disk_future.result()
+        if disk_msg is not None:
+            print(disk_msg)
+
+        blocks, msg = whisper_future.result()
+        print(msg)
+        ok = ok and not blocks
 
     if diarize.available():
         print(c.info("  Speaker diarization: enabled (HUGGINGFACE_TOKEN set)"))
