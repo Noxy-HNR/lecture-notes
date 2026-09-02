@@ -175,7 +175,9 @@ class RollingTranscriber:
 class Session:
     """Tracks the running WAV recording + transcript segments for one lecture. Autosaves
     just flush plain transcript text (no diarization - see pop_pending_text for why);
-    only the final save at the end of the session hands off audio/text to diarization."""
+    the final save at session end can instead re-diarize the WHOLE session (see
+    run()'s shutdown sequence) using all_segments, which - unlike pending_segments -
+    is never cleared, so it always has the complete session's transcript available."""
 
     def __init__(self, wav_path):
         self.wav_path = wav_path
@@ -184,22 +186,28 @@ class Session:
         self.total_frames = 0
         self.last_save_frame = 0
         self.last_save_elapsed = 0.0
-        self.pending_segments = []  # [{"start","end","text"}] absolute session-elapsed seconds
+        self.pending_segments = []  # [{"start","end","text"}] since the last save - cleared on save
+        self.all_segments = []      # every segment for the whole session - never cleared
         self.session_start = time.time()
 
     def elapsed(self):
         return time.time() - self.session_start
+
+    def flush(self):
+        self._sf.flush()
 
     def write_chunk(self, chunk_audio, whisper_segments):
         chunk_offset = self.total_frames / audio.SAMPLE_RATE
         self._sf.write(chunk_audio)
         self.total_frames += len(chunk_audio)
         for seg in whisper_segments:
-            self.pending_segments.append({
+            entry = {
                 "start": chunk_offset + seg["start"],
                 "end": chunk_offset + seg["end"],
                 "text": seg["text"],
-            })
+            }
+            self.pending_segments.append(entry)
+            self.all_segments.append(entry)
 
     def pop_pending_text(self, run_diarization: bool = False) -> str:
         """Returns speaker-labeled (if diarization succeeds and run_diarization=True) or
@@ -347,16 +355,76 @@ def _find_date_section_boundary(content: str, session_date: str) -> int:
     return len(content)
 
 
+def _relative_time(dt: datetime) -> str:
+    seconds = (datetime.now() - dt).total_seconds()
+    if seconds < 3600:
+        return f"{max(1, int(seconds // 60))} min ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f} hr ago"
+    days = int(seconds // 86400)
+    return f"{days} day{'s' if days != 1 else ''} ago"
+
+
 def list_session_backups():
-    backups = sorted(STATE_DIR.glob("*_raw.txt"))
+    backups = sorted(STATE_DIR.glob("*_raw.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not backups:
         print("No session backups found in state/.")
         return
-    print("Session backups available to resume:")
+    print(c.heading("Session backups available to resume (most recent first):\n"))
     for raw_path in backups:
         wav_path = raw_path.parent / raw_path.name.replace("_raw.txt", ".wav")
-        audio_note = f" (+ audio: {wav_path.name})" if wav_path.exists() else " (no audio backup)"
-        print(f"  {raw_path.name}{audio_note}")
+        try:
+            _, _, class_code, _ = _resume_backup_paths(raw_path)
+        except ValueError:
+            class_code = raw_path.stem
+
+        m = re.search(r"(\d{8}_\d{6})", raw_path.name)
+        when = _relative_time(datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")) if m else "?"
+
+        if wav_path.exists():
+            size_mb = wav_path.stat().st_size / 1e6
+            duration_min = wav_path.stat().st_size / 4 / audio.SAMPLE_RATE / 60  # mono float32
+            audio_note = c.success(f"~{duration_min:.0f} min audio, {size_mb:.0f}MB")
+        else:
+            audio_note = c.warning("no audio backup (raw transcript only)")
+
+        print(f"  {class_code:<16} {when:<12} {audio_note}")
+        print(c.dim(f"    --resume \"{wav_path if wav_path.exists() else raw_path}\""))
+
+
+def prune_backups(older_than_days: int, confirm: bool):
+    """Deletes state/ backups (.wav and _raw.txt) older than `older_than_days`. Dry-run
+    by default - only actually deletes when `confirm` is True, since these are the only
+    recovery path (--resume) for a crashed session, so deleting them isn't reversible."""
+    cutoff = time.time() - older_than_days * 86400
+    candidates = sorted(
+        p for pattern in ("*.wav", "*_raw.txt") for p in STATE_DIR.glob(pattern)
+        if p.stat().st_mtime < cutoff
+    )
+    if not candidates:
+        print(c.info(f"No backups older than {older_than_days} day(s) found - nothing to prune."))
+        return
+
+    total_bytes = sum(p.stat().st_size for p in candidates)
+    verb = "Deleting" if confirm else "Would delete"
+    print(c.heading(f"{verb} {len(candidates)} backup file(s) older than {older_than_days} "
+                     f"day(s), {total_bytes / 1e9:.2f}GB total:\n"))
+    for p in candidates:
+        print(f"  {p.name} ({p.stat().st_size / 1e6:.1f}MB)")
+
+    if not confirm:
+        print(c.warning(f"\nDry run only - nothing deleted. Re-run with --prune-backups "
+                         f"--confirm to actually delete these {len(candidates)} file(s)."))
+        return
+
+    deleted = 0
+    for p in candidates:
+        try:
+            p.unlink()
+            deleted += 1
+        except Exception as e:
+            print(c.error(f"  Failed to delete {p.name}: {e}"))
+    print(c.success(f"\nDeleted {deleted}/{len(candidates)} file(s), freed {total_bytes / 1e9:.2f}GB."))
 
 
 def run_resume(target: str, args):
@@ -457,6 +525,51 @@ def run_resume(target: str, args):
     print(c.info(f"Notes (Word): {docx_export.docx_path(class_code)}"))
 
 
+def try_full_session_diarization(cls, session: Session, session_date, session_start_offset, formatting_mode) -> bool:
+    """At session end, if diarization is available, re-diarizes the WHOLE session's
+    audio (not just whatever's pending since the last autosave) using session.all_segments
+    - which, unlike pending_segments, holds the complete session transcript - so Q&A
+    sections come out across the entire lecture instead of just the last few minutes.
+    Replaces this session's whole contribution to the notes file with one clean,
+    fully speaker-labeled section (discarding the plain-text autosave sections that
+    already exist for it - there's nothing to condense-merge anymore since this writes
+    the complete, correct version in one shot).
+
+    Returns True if this path was used (caller should skip the normal tail-save +
+    condense flow entirely); False if diarization isn't available/failed, in which
+    case the caller should fall back to the standard flow."""
+    if not diarize.available() or not session.all_segments:
+        return False
+
+    print(c.info("Running speaker diarization on the FULL session audio (not just the "
+                  "final segment) so Q&A sections cover the whole lecture - this can "
+                  "take a while on a long recording..."))
+    diar_start = time.time()
+    session.flush()
+    diar_segments = diarize.diarize(session.wav_path)
+    if not diar_segments:
+        print(c.warning("  Full-session diarization returned nothing - falling back to a normal save."))
+        return False
+
+    labeled = diarize.assign_speakers(session.all_segments, diar_segments)
+    labeled_text = diarize.to_labeled_transcript(labeled)
+    if not labeled_text.strip():
+        return False
+    print(c.dim(f"  Diarization complete ({time.time() - diar_start:.1f}s)."))
+
+    notes_path = notes.notes_path(cls["code"])
+    existing = notes_path.read_text(encoding="utf-8") if notes_path.exists() else ""
+    # Discard this session's own earlier plain-text autosave sections - we're replacing
+    # them with one clean, fully speaker-labeled version of the complete lecture.
+    notes_path.write_text(existing[:session_start_offset], encoding="utf-8")
+
+    save_start = time.time()
+    path, method = notes.format_and_save(cls["code"], cls["title"], labeled_text, session_date, mode=formatting_mode)
+    print(c.success(f"  Full session formatted and saved as one clean section "
+                     f"(method: {method}, {time.time() - save_start:.1f}s)."))
+    return True
+
+
 def run():
     parser = argparse.ArgumentParser(description="Auto-transcribe your current lecture into notes.")
     parser.add_argument("--class", dest="klass", help="Override class code, e.g. 'BIOL 1440'")
@@ -470,6 +583,12 @@ def run():
     parser.add_argument("--resume", metavar="PATH",
                          help="Recover a crashed/interrupted session from its state/ backup "
                               "(.wav or _raw.txt path) instead of recording")
+    parser.add_argument("--prune-backups", action="store_true",
+                         help="Delete old state/ backups (dry-run unless --confirm is also given)")
+    parser.add_argument("--older-than", type=int, default=30, metavar="DAYS",
+                         help="Age threshold in days for --prune-backups (default 30)")
+    parser.add_argument("--confirm", action="store_true",
+                         help="Actually perform the deletion for --prune-backups (otherwise dry-run only)")
     args = parser.parse_args()
 
     if args.list:
@@ -479,6 +598,10 @@ def run():
 
     if args.list_sessions:
         list_session_backups()
+        return
+
+    if args.prune_backups:
+        prune_backups(args.older_than, args.confirm)
         return
 
     if args.resume:
@@ -589,24 +712,29 @@ def run():
                     f.write(f"[{stamp}] {seg['text']}\n")
             print(c.dim(f"  {len(whisper_segments)} segment(s) transcribed from the tail."))
 
-        if session.pending_segments:
-            n_pending = len(session.pending_segments)
-            if diarize.available():
-                _step(f"Running speaker diarization on the final segment ({n_pending} transcribed "
-                      f"chunk(s) pending) - this is the slow part, can take a while on a long segment...")
-            else:
+        used_full_diarization = False
+        if diarize.available() and session.all_segments:
+            used_full_diarization = try_full_session_diarization(
+                cls, session, session_date, session_start_offset, formatting_mode)
+
+        if not used_full_diarization:
+            if session.pending_segments:
+                n_pending = len(session.pending_segments)
                 _step(f"Formatting and saving the final segment ({n_pending} transcribed chunk(s))...")
-            save_start = time.time()
-            _save(cls, session, session_date, formatting_mode, is_final=True)
-            print(c.dim(f"  final save completed in {time.time() - save_start:.1f}s."))
-        else:
-            _step("Nothing pending to save (already flushed by the last autosave).")
+                save_start = time.time()
+                _save(cls, session, session_date, formatting_mode, is_final=False)
+                print(c.dim(f"  final save completed in {time.time() - save_start:.1f}s."))
+            else:
+                _step("Nothing pending to save (already flushed by the last autosave).")
         session.close()
 
         elapsed_min = session.elapsed() / 60
         print(c.success(f"\nRecording done - captured ~{elapsed_min:.1f} minutes of lecture."))
 
-        if formatting_mode != "auto":
+        if used_full_diarization:
+            print(c.dim("Skipped condense pass: full-session diarization already wrote one clean "
+                         "section covering the whole lecture - nothing left to merge."))
+        elif formatting_mode != "auto":
             print(c.dim(f"Skipped condense pass: formatting mode is '{formatting_mode}' (no CLI/API calls)."))
         elif notes.cli_available():
             _step("Reviewing this session's notes with Claude CLI (condensing duplicate autosave "

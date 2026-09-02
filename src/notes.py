@@ -6,7 +6,9 @@ Formatting is tried in this order:
   2. Claude API (`ANTHROPIC_API_KEY`) - only used if the CLI isn't available/logged in.
   3. Local, dependency-free formatter - used if we're offline or both of the above fail.
 """
+import difflib
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime
@@ -192,17 +194,52 @@ def _local_format(class_title: str, session_date: str, transcript: str, class_co
     return local_formatter.format_transcript(class_title, session_date, transcript, class_code)
 
 
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z\-]+")
+
+
+def _detect_corrections(original: str, corrected: str) -> set[str]:
+    """Word-level diff between the raw and proofread transcript, returning the set of
+    "corrected-to" words where the change looks like a mis-transcription fix (the old
+    and new words are similar enough to plausibly be the same word) rather than a
+    genuine reword/edit - candidates to persist into vocab.json so the heuristic/local
+    formatters catch the same term next time without needing the CLI/API. Deliberately
+    conservative (single-word replacements only, similarity-gated, min length 5) to
+    avoid learning junk from ordinary proofreading edits."""
+    orig_words = _WORD_RE.findall(original)
+    corr_words = _WORD_RE.findall(corrected)
+    matcher = difflib.SequenceMatcher(a=[w.lower() for w in orig_words], b=[w.lower() for w in corr_words])
+
+    candidates = set()
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "replace" or i2 - i1 != 1 or j2 - j1 != 1:
+            continue
+        old_word, new_word = orig_words[i1], corr_words[j1]
+        if len(new_word) < 5:
+            continue
+        similarity = difflib.SequenceMatcher(a=old_word.lower(), b=new_word.lower()).ratio()
+        if 0.6 <= similarity < 1.0:
+            candidates.add(new_word)
+    return candidates
+
+
 def _proofread(class_title: str, class_code: str, transcript: str) -> str:
     """Runs the transcript through a proofread/flag pass via CLI or API. Returns the
-    original transcript unchanged if neither is available (local-only mode)."""
+    original transcript unchanged if neither is available (local-only mode). Also
+    detects likely vocabulary corrections and persists them to vocab.json (best-effort,
+    never lets a failure here affect the actual proofreading result)."""
     prompt = _build_proofread_prompt(class_title, class_code, transcript)
     cleaned = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    if cleaned:
+        try:
+            vocab_module.save_learned_terms(class_code, _detect_corrections(transcript, cleaned))
+        except Exception:
+            pass
     return cleaned or transcript
 
 
 FORMATTING_MODES = ("auto", "local", "heuristic")
-# auto:      CLI -> API -> NPU -> heuristic (default - best available each step)
-# local:     NPU -> heuristic only (no network calls - CLI/API never contacted)
+# auto:      CLI -> API -> GPU model -> heuristic (default - best available each step)
+# local:     GPU model -> heuristic only (no network calls - CLI/API never contacted)
 # heuristic: heuristic only (no LLM anywhere - fastest, fully deterministic)
 
 

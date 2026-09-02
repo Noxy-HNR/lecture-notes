@@ -27,3 +27,20 @@ def initial_prompt_for_class(class_code: str) -> str | None:
     if not terms:
         return None
     return "Vocabulary that may appear in this lecture: " + ", ".join(terms) + "."
+
+
+def save_learned_terms(class_code: str, terms: set[str]) -> None:
+    """Persists newly-learned terms into vocab.json under `class_code`, skipping any
+    that are already present (case-insensitively) for that class or globally. Used to
+    auto-grow the glossary from corrections the CLI/API proofreading pass makes, so the
+    heuristic/local formatters catch the same terms next call without needing an LLM."""
+    if not terms:
+        return
+    data = load_vocab()
+    existing_lower = {t.lower() for t in data.get("_global", [])} | {t.lower() for t in data.get(class_code, [])}
+    new_terms = sorted(t for t in terms if t.lower() not in existing_lower)
+    if not new_terms:
+        return
+    data.setdefault(class_code, [])
+    data[class_code].extend(new_terms)
+    VOCAB_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

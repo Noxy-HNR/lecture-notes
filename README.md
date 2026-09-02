@@ -159,6 +159,9 @@ python src/main.py --formatting local      # local only - no CLI/API calls this 
 python src/main.py --formatting heuristic  # heuristic only - no LLM anywhere
 python src/main.py --chunk 8               # transcribe in 8s chunks for more frequent output (default 15)
 python src/main.py --list                  # show all classes from schedule.json
+python src/main.py --list-sessions         # list recoverable session backups (see below)
+python src/main.py --resume PATH           # recover a crashed session (see below)
+python src/main.py --prune-backups         # clean up old state/ backups (see below)
 ```
 
 ## Recovering a crashed/interrupted session
@@ -183,13 +186,54 @@ notes file for that same date - previous lecture dates in the file are left
 untouched. Falls back to the raw transcript log alone (no diarization
 possible) if only that backup survived.
 
+## Full-session diarization at Ctrl+C
+
+If diarization is set up, stopping a live recording re-diarizes the **entire**
+session's audio (not just whatever's pending since the last autosave) and
+replaces this session's whole contribution to the notes file with one clean,
+fully speaker-labeled section — so Q&A exchanges get pulled out across the
+*whole* lecture, not just the last few minutes before you stopped. This
+reuses the transcript already produced live (no re-transcription needed,
+unlike `--resume`) and just runs diarization fresh against the full WAV.
+
+**The tradeoff**: this reformats the entire lecture transcript through the
+CLI/API in one call at shutdown, instead of just the small tail chunk - on a
+long lecture that's a real wait (validated: ~90s diarizing + ~200s formatting
+for a 14-minute segment; a 45+ minute lecture will take longer). The detailed,
+timestamped shutdown messages exist specifically so this doesn't look hung.
+Falls back automatically to the normal tail-only save (fast, no diarization)
+if diarization isn't set up, fails, or nothing was ever transcribed that
+session.
+
+## Pruning old backups
+
+`state/*.wav` files are large (tens to ~170MB+ for a long lecture) and
+accumulate with no expiry — they're only there so `--resume` can recover a
+crashed session, so once you're confident a lecture's notes are solid, the
+backup can go.
+
+```bash
+python src/main.py --prune-backups                    # dry run, default 30+ days old
+python src/main.py --prune-backups --older-than 14     # dry run, custom threshold
+python src/main.py --prune-backups --older-than 14 --confirm   # actually delete
+```
+
+Dry-run by default — lists exactly what would be deleted and the total space
+freed; nothing is actually removed until you add `--confirm`.
+
 ## Where things live
 
 - `schedule.json` — your class schedule (edit this each semester; see format
   in the file — day, start/end time in 24h, location, type).
 - `vocab.json` — per-class vocabulary hints (Latin/technical terms) used both
   to bias Whisper's recognition and to fuzzy-correct mis-transcriptions during
-  proofreading/local formatting. Add your own terms per class code.
+  proofreading/local formatting. Add your own terms per class code - or let it
+  grow on its own: whenever the CLI/API proofreading pass fixes a mis-heard
+  term (e.g. "amigdala" → "amygdala"), that correction is automatically
+  detected and saved into `vocab.json` for that class, so the heuristic/local
+  formatters catch the same term next time without needing an LLM at all.
+  Deliberately conservative about what it learns (word-level, similarity-gated)
+  to avoid picking up ordinary rewording as if it were a vocabulary term.
 - `notes/<CLASS_CODE>.md` / `.docx` — the running notes file per class, kept
   in sync. New lectures are appended as dated sections, so each class builds
   one continuous notes doc across the semester.
