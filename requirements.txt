@@ -19,9 +19,9 @@ colorama>=0.4.6
 # pyannote.audio>=3.1.0
 # torch>=2.2.0
 
-# Optional: NPU-accelerated local note formatting (middle fallback tier between
-# Claude CLI/API and the pure heuristic formatter). Needs an Intel NPU. Install:
-#   pip install openvino openvino-tokenizers openvino-genai
-# then download the model once (see README "NPU-accelerated local formatting").
-# openvino>=2026.0
-# openvino-genai>=2026.0
+# Optional: GPU-accelerated local note formatting (middle fallback tier between
+# Claude CLI/API and the pure heuristic formatter, src/gpu_formatter.py). Reuses
+# an already-installed llama.cpp build (llama-server.exe, CUDA-enabled) as a
+# separate process on its own port - see README "Local GPU note formatting".
+# No pip packages needed for this one - just the llama.cpp binary + a GGUF model
+# downloaded into this project's own state/llama_model/.

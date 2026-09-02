@@ -7,10 +7,17 @@ transcript into clean notes appended to that class's ongoing notes file.
 Note formatting is tried in this order, each falling back to the next if unavailable:
 1. **Claude Code CLI** (`claude -p`) — uses your logged-in Pro/Max subscription, no per-token billing
 2. **Claude API** (`ANTHROPIC_API_KEY`) — only used if the CLI isn't installed/logged in
-3. **NPU local model** (Qwen2.5-1.5B on the Intel NPU via OpenVINO) — real LLM formatting, fully offline, used if neither the CLI nor API is available
-4. **Heuristic local formatter** — regex-based topic/bullet formatting + glossary correction, last resort if the NPU model isn't set up either
+3. **Local GPU model** (Qwen2.5-3B via llama.cpp, on the discrete GPU) — real LLM formatting, fully offline, used if neither the CLI nor API is available
+4. **Heuristic local formatter** — regex-based topic/bullet formatting + glossary correction, last resort if the local model isn't set up either
 
 Also:
+- Notes are written as **direct study content, not a recap of the lecture** —
+  e.g. "**Amygdala**: part of the limbic system, handles fear responses," not
+  "The professor discussed the amygdala and its role in fear." Where a term is
+  mentioned but not fully explained, the CLI/API tier may add a brief
+  **background definition** from general subject knowledge to make notes more
+  self-contained - always clearly marked `*(background: ...)*` so it's never
+  confused with something the instructor actually said.
 - Whenever the CLI/API is used, a **proofreading pass** runs first — fixes
   spelling/grammar/mis-heard technical terms without changing what was actually
   said, and flags (never silently "corrects") any statement that looks like a
@@ -19,7 +26,8 @@ Also:
   everything saved during that session (across any autosaves) in one pass —
   merging duplicate/repeated sections from multiple autosaves into one clean
   section, fixing formatting bugs, and cleaning up anything that still looks
-  like unformatted raw transcript.
+  like unformatted raw transcript. This pass is CLI/API-only by design (see
+  "Local GPU note formatting" below for why the local model isn't used here).
 - Output is written as both **Markdown** (`notes/<CODE>.md`) and **Word** (`notes/<CODE>.docx`),
   kept in sync, appended lecture by lecture.
 - If speaker diarization is set up (see below), **Q&A exchanges get their own section**,
@@ -71,17 +79,37 @@ section:
 ./venv/Scripts/python.exe -m pip install torch pyannote.audio
 ```
 
+**Also needs the *shared-library* build of FFmpeg** (pyannote.audio 4.x uses
+`torchcodec` internally for audio decoding, which loads FFmpeg's DLLs directly -
+a static/CLI-only FFmpeg build does NOT work, even though `ffmpeg` still runs
+fine from the terminal with one installed):
+```powershell
+winget install --id Gyan.FFmpeg.Shared -e
+```
+(If you have the plain `Gyan.FFmpeg` static build installed, uninstall it first
+so `ffmpeg`/PATH aren't ambiguous: `winget uninstall --id Gyan.FFmpeg -e`.)
+
 Then:
 1. Create a free account at [huggingface.co](https://huggingface.co)
-2. Accept the terms on [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-3. Create an access token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+2. Accept the terms on all three gated models the pipeline depends on:
+   [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1),
+   [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0), and
+   [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+   (the third one isn't obvious from pyannote's own docs - it only surfaces as a
+   `GatedRepoError` the first time the pipeline tries to load, since it's an internal
+   dependency of the top-level pipeline)
+3. Create an access token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens),
+   logged into the **same account** that accepted the terms above
 4. `setx HUGGINGFACE_TOKEN "hf_..."` (restart your terminal after)
 
 This is a heavy install (~2GB, mostly PyTorch) and diarization adds noticeable
 CPU time per save (runs once each time notes are saved, on just the newly
 recorded audio since the last save). If it's not installed or the token isn't
-set, the app runs exactly as before — no speaker labels, nothing breaks.
+set, the app runs exactly as before — no speaker labels, nothing breaks. If it
+IS set up but something's wrong (wrong FFmpeg build, terms not accepted, a
+pyannote.audio API change), `[diarize]`-prefixed errors print to the console
+instead of silently doing nothing - if you see one, that's the actual problem
+to fix, not something to ignore.
 
 ## Running it
 
@@ -89,6 +117,12 @@ set, the app runs exactly as before — no speaker labels, nothing breaks.
 ./venv/Scripts/python.exe src/main.py
 ```
 
+- Before anything else, it runs **preflight checks**: opens your audio device
+  and confirms it's actually picking up sound (not silent/muted), checks disk
+  space, and confirms the Whisper model loads - so a broken mic or a dead GPU
+  shows up now, not silently mid-lecture. A genuinely broken audio device or
+  Whisper model stops the app here rather than starting a doomed session;
+  other issues are just warnings and don't block starting.
 - It checks `schedule.json` against the current day/time and tells you which
   class it thinks you're in (with a 10-minute grace window before/after, so
   starting the app slightly early or late still picks the right class).
@@ -98,17 +132,21 @@ set, the app runs exactly as before — no speaker labels, nothing breaks.
   or **system audio** (online lecture, e.g. Zoom/Teams playing through your
   speakers).
 - It also asks which **note formatting mode** to use this session:
-  1. **Auto** (default) — Claude CLI/API when available, falls back to the NPU
-     model then the heuristic formatter
-  2. **Local only** — NPU model + heuristic only, *no network calls at all*
-     (CLI/API are never contacted this session) — useful for privacy, exam
-     review, or working fully offline
+  1. **Auto** (default) — Claude CLI/API when available, falls back to the
+     local GPU model then the heuristic formatter
+  2. **Local only** — local GPU model + heuristic only, *no network calls at
+     all* (CLI/API are never contacted this session) — useful for privacy,
+     exam review, or working fully offline
   3. **Heuristic only** — no LLM anywhere, fastest and fully deterministic
 - Talk/listen normally. Live transcript prints to the console as it goes
   (color-coded — see above).
-- Press **Ctrl+C** to stop — notes are formatted and appended to
-  `notes/<CLASS_CODE>.md`. Long sessions also autosave every 5 minutes so
-  nothing is lost if the app closes unexpectedly.
+- Press **Ctrl+C** to stop — you'll see a detailed, timestamped play-by-play
+  of the shutdown sequence (stopping capture, transcribing any final buffered
+  audio, diarizing if enabled, saving, condensing) rather than a silent pause,
+  since some of these steps can take a while on a long/complex final segment.
+  Notes are formatted and appended to `notes/<CLASS_CODE>.md`. Long sessions
+  also autosave every 5 minutes so nothing is lost if the app closes
+  unexpectedly.
 
 Useful flags (each skips its corresponding prompt):
 
@@ -122,6 +160,28 @@ python src/main.py --formatting heuristic  # heuristic only - no LLM anywhere
 python src/main.py --chunk 8               # transcribe in 8s chunks for more frequent output (default 15)
 python src/main.py --list                  # show all classes from schedule.json
 ```
+
+## Recovering a crashed/interrupted session
+
+If the app dies unexpectedly (not a clean Ctrl+C - a crash, a power loss),
+the final formatting/condense step never runs, but nothing is actually lost:
+the raw transcript and full audio are written incrementally throughout the
+session (`state/*_raw.txt` and `state/*.wav`), not just at the end.
+
+```bash
+python src/main.py --list-sessions              # see what's recoverable
+python src/main.py --resume "state/PSYC_1300_20260902_091439.wav"
+```
+
+Point `--resume` at either the `.wav` or `_raw.txt` backup (it finds the
+matching pair automatically). If the audio backup exists, it's **re-transcribed
+from scratch** (not just replayed from the raw log) so diarization can run on
+it too - safe to do now since recording has already stopped, unlike during a
+live session. It's then formatted, saved, and condensed exactly like a normal
+final save, including merging against any earlier autosaves already in the
+notes file for that same date - previous lecture dates in the file are left
+untouched. Falls back to the raw transcript log alone (no diarization
+possible) if only that backup survived.
 
 ## Where things live
 
@@ -195,58 +255,122 @@ CUDA-capable GPU, skip those two commands - the app still runs fine on CPU,
 just slower. Check what Whisper picked with the "Whisper running on: ..."
 line printed at startup (`cuda/float16` = GPU, `cpu/int8` = CPU).
 
-## NPU-accelerated local formatting
+## Local GPU note formatting
 
-This machine has an Intel NPU (**Intel(R) AI Boost**), already set up as the
-third formatting tier (`src/npu_formatter.py`) — kicks in automatically when
-neither the Claude CLI nor API is available, before falling back further to
-the pure heuristic formatter. It runs a small local LLM via OpenVINO GenAI, so
-even fully offline you get real LLM-quality note formatting instead of just
-regex bullet-splitting.
+Set up as the third formatting tier (`src/gpu_formatter.py`) — kicks in
+automatically when neither the Claude CLI nor API is available, before
+falling back further to the pure heuristic formatter. Runs a local LLM
+(**Qwen2.5-3B-Instruct**, GGUF Q8_0) via **llama.cpp's `llama-server`**, fully
+offline, actually reaching the discrete GPU (RTX 5070 Ti).
 
-**Model: Phi-3.5-mini-instruct** (3.8B, group-quantized specifically for NPU
-deployment - the `-gq-ov` variant). Two others were tried first:
-- `Qwen2.5-1.5B-Instruct-int4-ov` — works fine (~49s load / ~5s generation)
-  but noticeably weaker formatting quality. Still on disk at `state/npu_model/`
-  as a lighter/faster fallback if you ever want to switch back.
-- `Phi-4-mini-instruct-int4-ov` — **do not use.** Reproducibly crashed the NPU
-  driver (`ZE_RESULT_ERROR_DEVICE_LOST`) on every generation attempt across
-  multiple clean retries, despite loading "successfully" first. Deleted.
+This reuses the already-installed llama.cpp build at
+`C:/AI/Tools/llama-native/bin/llama-server.exe` **read-only, as a completely
+separate process on its own port (8090)** — it does not touch, reconfigure,
+or share anything with any other personal llama.cpp/model setup on this
+machine. The model file lives in this project's own `state/llama_model/`,
+never in a shared models folder. The app starts its own server automatically
+on first use each run and shuts it down on exit (via `atexit`), so it doesn't
+sit in the background holding ~3.6GB of VRAM between lecture sessions.
 
-What's installed for this:
-```bash
-./venv/Scripts/python.exe -m pip install openvino openvino-tokenizers openvino-genai
-```
-Model (downloaded once, ~2GB, cached in `state/npu_model_phi35mini_gq/`):
+Setup (one-time, ~3.6GB download into this project only):
 ```python
-from huggingface_hub import snapshot_download
-snapshot_download("OpenVINO/Phi-3.5-mini-instruct-int4-gq-ov", local_dir="state/npu_model_phi35mini_gq")
+from huggingface_hub import hf_hub_download
+hf_hub_download("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-instruct-q8_0.gguf",
+                 local_dir="state/llama_model")
 ```
+(If the Hugging Face download fails with a Xet/CDN error, retry with
+`HF_HUB_DISABLE_XET=1` set - a more reliable plain-HTTP fallback.)
+
+**Why this backend, not OpenVINO/NPU:** an NPU-based tier (Phi-3.5-mini via
+OpenVINO GenAI) was built and evaluated first. It was rolled back after two
+real reliability failures on the actual pipeline (not hand-picked test
+prompts): default (greedy) decoding produced degenerate repetition - 9
+near-duplicate paraphrased bullets for one simple two-sentence transcript -
+and adding a `repetition_penalty` to fix that instead caused incoherent
+rambling that invented content never in the transcript. A "GPU" comparison
+via OpenVINO was also tried, but OpenVINO's GPU plugin only targets Intel
+graphics (oneAPI/Level Zero) - it silently ran on the integrated GPU, never
+the RTX 5070 Ti, and was no faster than the NPU. Switching to llama.cpp (which
+does reach NVIDIA GPUs via CUDA) fixed all three problems at once: **~90-110
+tok/s** vs. NPU's effective ~1-2 tok/s, no repetition (llama.cpp's sampling
+defaults + explicit `repeat_penalty`/`temperature` tuning), and no
+hallucination in per-chunk formatting testing.
+
+**Why the Ctrl+C condense pass doesn't use this tier:** per-chunk formatting
+tested reliably, but the harder multi-section merge/dedup task didn't -
+across repeated test runs, it would inconsistently drop one genuinely
+distinct bullet (which one varied by generation parameters) while satisfying
+the notes' other instructions. That's a real content-loss risk that matters
+more for condensing (which rewrites/replaces existing notes) than for
+per-chunk formatting (which only appends), so `condense_session()` stays
+CLI/API-only - see the comment in `src/notes.py` for the full reasoning.
 
 Notes:
-- **First-ever compile of a given model is slow** (~3 minutes for this one) -
-  the NPU driver caches the compiled artifact on disk after that, so every
-  later load (even in a fresh process) is fast again (~10-15s load, a few
-  seconds to generate). This cache persists across app restarts.
-- Generation itself takes ~30s per lecture chunk (vs. ~5s for the smaller
-  1.5B model) - still very usable for this tier's role as an occasional
-  offline fallback, not real-time.
-- It's noticeably less capable than Claude (3.8B params vs. a frontier model)
-  and doesn't always follow "don't add commentary" instructions perfectly -
-  `npu_formatter.py` strips known meta-commentary patterns (e.g. it sometimes
-  appends a note about what it "corrected") as a safety net. The same
-  `vocab.json` glossary fix-up the heuristic formatter uses is also applied to
-  its output.
-- If the packages aren't installed or the model isn't downloaded, this tier is
+- Cold start (server spawn + model load) takes a few seconds; the app reuses
+  the same server process for the rest of that run.
+- Still noticeably less capable than Claude (3B params vs. a frontier model) -
+  it inconsistently catches mis-transcribed vocabulary, so the same
+  `vocab.json` glossary fix-up the heuristic formatter uses is applied to its
+  output too.
+- If the llama.cpp binary or the model file isn't found, this tier is
   silently skipped and the app falls straight to the heuristic formatter -
   nothing else breaks.
-- Machines without an Intel NPU (`Get-PnpDevice | Where FriendlyName -match
-  "AI Boost"` to check) should skip this entirely.
-- **RAM matters more than you'd think** for NPU model choice - this machine
-  has 15.4GB total RAM. Models much above ~4B params risk running out of room
-  once Whisper, the app, and everything else is also running; check free RAM
-  (`(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory`) before trying
-  something bigger.
+- VRAM check: `nvidia-smi --query-gpu=memory.used --format=csv` should show
+  ~0MiB before a run and ~3.6GB while `llama-server.exe` is running for this
+  app; it should return to ~0MiB after the app exits.
+
+## Running unattended (minimized / long sessions)
+
+Several things address transcription silently stopping or losing audio when
+the app is left running in the background for a while - two of these were
+found and fixed from real, live failures during an actual lecture, not just
+theoretical hardening:
+
+- **Threaded audio capture** (`src/capture.py`) - the biggest one. Audio
+  capture runs on its own dedicated background thread, continuously draining
+  the microphone/system-audio buffer into an in-memory queue, completely
+  decoupled from transcription and saving. This replaced an earlier
+  single-threaded design where any slow step in the main loop (a stuck API
+  call, and especially the diarization pass, which used to run every autosave)
+  blocked the next audio read for however long that step took - and WASAPI's
+  hardware capture buffer is small enough (a fraction of a second) that this
+  silently **dropped** audio rather than just delaying it. Confirmed live: a
+  slow diarization pass caused a real ~2 minute gap of lost lecture audio.
+  With capture on its own thread, however long processing takes, it only adds
+  latency to when segments show up in the live view - audio itself can no
+  longer be silently lost this way.
+- **Diarization only runs once, at the very end** (on Ctrl+C), never during
+  autosaves. It was originally run on every autosave to keep Q&A labels
+  reasonably fresh, but pyannote isn't a real-time/incremental process anyway
+  (it needs a complete clip to compute speaker segments), so there was no
+  actual live benefit being traded away by moving it to the end - only
+  autosaves being pointlessly slow. This was the direct cause of the ~2 minute
+  gap mentioned above, and is fixed independently of (in addition to) the
+  threaded-capture change.
+- **Sleep prevention** (`src/keep_awake.py`): blocks *system* sleep for the
+  duration of a recording session (released automatically on Ctrl+C or exit) -
+  without this, an idle timeout can suspend the whole process, not just dim
+  the screen. Deliberately does NOT force the display to stay on - that would
+  waste real battery for a 50+ minute lecture for no benefit, since the app
+  doesn't need the screen on to keep recording in the background.
+- **Silence detection** (`audio.is_silent`, used in `RollingTranscriber`): if
+  a chunk is at/near total silence, it's skipped before ever reaching Whisper.
+  Feeding Whisper silence is a known way to get it to hallucinate repeated
+  punctuation/filler (`...`, `you`) instead of just emitting nothing - if
+  you've seen streams of dots in the output, this is why. If silence continues
+  for 2+ minutes, you'll get a one-time console warning suggesting you check
+  whether your mic is muted/disconnected (or, on system audio, whether
+  anything's actually playing) - the app keeps running either way, but this
+  flags a real audio-source problem instead of silently producing garbage.
+- **Repetition collapse** (`transcribe._collapse_repeated_segments`): on
+  ambiguous/overlapping audio (several people answering quietly at once,
+  seen live in an actual lecture), Whisper can get stuck emitting the same
+  short segment over and over as separate consecutive segments - caught and
+  capped, since Whisper's own anti-hallucination heuristics only look within
+  one segment's text and don't catch repetition spread across many.
+- The capture thread also **auto-recovers from audio-device errors** (a
+  dropout after a resume, a USB mic hiccup): it logs the error (surfaced in
+  the console) and reopens the recorder instead of capture dying silently.
 
 ## Notes on system audio
 

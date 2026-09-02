@@ -46,3 +46,18 @@ def record_chunk(recorder, seconds: float) -> np.ndarray:
     if data.ndim > 1:
         data = data.mean(axis=1)
     return data.astype(np.float32)
+
+
+SILENCE_RMS_THRESHOLD = 0.002  # below this, treat the chunk as silence, don't transcribe it
+
+
+def is_silent(chunk_audio: np.ndarray, threshold: float = SILENCE_RMS_THRESHOLD) -> bool:
+    """True if `chunk_audio` is at/near total silence (RMS amplitude below threshold).
+    Whisper hallucinates repeated punctuation/filler ("...", "you", "thank you") when
+    fed silence - this catches a muted mic, a suspended/disconnected audio device, or
+    dead air on the "system audio" source before it ever reaches the model, rather than
+    relying on VAD alone (which doesn't always fully suppress a whole silent chunk)."""
+    if chunk_audio.size == 0:
+        return True
+    rms = float(np.sqrt(np.mean(np.square(chunk_audio, dtype=np.float64))))
+    return rms < threshold

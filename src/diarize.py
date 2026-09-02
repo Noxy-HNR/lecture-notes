@@ -36,7 +36,7 @@ def _get_pipeline():
         from pyannote.audio import Pipeline
         token = os.environ["HUGGINGFACE_TOKEN"]
         _pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", use_auth_token=token
+            "pyannote/speaker-diarization-3.1", token=token
         )
         try:
             import torch
@@ -44,7 +44,12 @@ def _get_pipeline():
                 _pipeline.to(torch.device("cuda"))
         except Exception:
             pass  # CUDA not available/working -> stays on CPU, still functional
-    except Exception:
+    except Exception as e:
+        # This used to fail silently every single time (a pyannote.audio version bump
+        # renamed from_pretrained's use_auth_token -> token, and the bare except here
+        # swallowed the resulting TypeError) - print it so a real setup problem is
+        # visible instead of diarization just quietly never doing anything.
+        print(f"[diarize] failed to load speaker diarization model: {type(e).__name__}: {e}")
         _load_failed = True
         _pipeline = None
     return _pipeline
@@ -60,11 +65,16 @@ def diarize(wav_path) -> list[dict] | None:
         return None
     try:
         result = pipeline(str(wav_path))
+        # pyannote.audio 4.x wraps the classic Annotation (with .itertracks()) in a
+        # DiarizeOutput object under .speaker_diarization; older versions returned the
+        # Annotation directly - support both rather than hard-depend on one API shape.
+        annotation = getattr(result, "speaker_diarization", result)
         return [
             {"start": turn.start, "end": turn.end, "speaker": speaker}
-            for turn, _, speaker in result.itertracks(yield_label=True)
+            for turn, _, speaker in annotation.itertracks(yield_label=True)
         ]
-    except Exception:
+    except Exception as e:
+        print(f"[diarize] diarization failed for this clip: {type(e).__name__}: {e}")
         return None
 
 

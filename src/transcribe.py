@@ -38,6 +38,33 @@ def transcribe_chunk(audio, sample_rate=16000, initial_prompt: str | None = None
     return " ".join(seg["text"] for seg in segments).strip()
 
 
+MAX_CONSECUTIVE_REPEATS = 3  # collapse runs of identical segments longer than this
+
+
+def _collapse_repeated_segments(segments: list[dict]) -> list[dict]:
+    """On ambiguous/overlapping audio (e.g. several people answering quietly at once),
+    Whisper can get stuck emitting the same short segment over and over as separate
+    consecutive segments (seen live: fifteen consecutive "1." segments, one per VAD
+    sub-segment). Whisper's own anti-hallucination heuristics (compression_ratio_threshold,
+    log_prob_threshold) don't catch this because each individual short segment looks
+    perfectly valid on its own - the repetition is only visible across segments. Cuts
+    off a run after MAX_CONSECUTIVE_REPEATS, which still allows a few people genuinely
+    giving the same short answer in a row without losing that."""
+    if not segments:
+        return segments
+    result = []
+    run_text, run_count = None, 0
+    for seg in segments:
+        normalized = seg["text"].strip().lower()
+        if normalized == run_text:
+            run_count += 1
+        else:
+            run_text, run_count = normalized, 1
+        if run_count <= MAX_CONSECUTIVE_REPEATS:
+            result.append(seg)
+    return result
+
+
 def transcribe_chunk_segments(audio, sample_rate=16000, initial_prompt: str | None = None) -> list[dict]:
     """Returns a list of {"text", "start", "end"} dicts, start/end in seconds relative
     to the start of `audio` (not the session) - the caller offsets them if needed."""
@@ -49,9 +76,11 @@ def transcribe_chunk_segments(audio, sample_rate=16000, initial_prompt: str | No
         condition_on_previous_text=False,
         initial_prompt=initial_prompt,
         beam_size=BEAM_SIZE,
+        repetition_penalty=1.1,   # mild nudge against the decoder looping on short phrases
     )
-    return [
+    cleaned = [
         {"text": seg.text.strip(), "start": seg.start, "end": seg.end}
         for seg in segments
         if seg.text.strip()
     ]
+    return _collapse_repeated_segments(cleaned)

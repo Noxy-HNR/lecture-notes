@@ -13,8 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 import docx_export
+import gpu_formatter
 import local_formatter
-import npu_formatter
 import vocab as vocab_module
 
 NOTES_DIR = Path(__file__).resolve().parent.parent / "notes"
@@ -114,11 +114,26 @@ a trailing "⚠️ *verify*" note) rather than silently dropping them; don't inv
 {transcript}
 ---
 
-Write clean, well-organized markdown notes for TODAY's lecture only. Requirements:
+Write clean, well-organized markdown notes for TODAY's lecture only. These are STUDY
+NOTES a student reviews later to learn the material - not a recap/summary of the class
+session itself. Requirements:
 - Start with a level-2 heading: "## {session_date}"
+- State the actual content directly and factually: "**Amygdala**: part of the limbic
+  system, handles fear responses" - NOT "The professor discussed the amygdala and its
+  role in fear responses" or "We covered how the amygdala relates to emotion." Avoid
+  any "recap" framing ("today we learned...", "the lecture covered...", "discussion
+  of..."). If the instructor themselves recaps or summarizes something mid-lecture,
+  still extract and state the underlying facts directly - don't write a summary of a
+  summary.
 - Use bullet points and sub-bullets for concepts, bold key terms
 - Fix obvious speech-to-text errors and filler words, but don't invent content that wasn't said
 - Group related points under short level-3 headings if the lecture covered multiple topics
+- Where a technical term or concept is mentioned but not fully explained in the transcript,
+  you may add a brief one-line background definition from general knowledge of the subject
+  to make the notes more self-contained and useful for studying - but clearly mark any such
+  addition as supplementary, e.g. "*(background: ...)*", so it's never confused with
+  something the instructor actually said. Only add these where they'd genuinely help
+  comprehension of an under-explained term, not for every term that appears.
 - If something clearly connects to previous material, add a brief note like "*(builds on ...)*"
 - Do not include a preamble or explanation, output only the markdown notes section
 """
@@ -219,14 +234,20 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
             section = _try_claude_api_format(prompt)
             method = "api"
 
+    # An NPU tier (Phi-3.5-mini via OpenVINO) was tried here first and rolled back: on
+    # the real pipeline it produced degenerate repetition with default decoding, and
+    # hallucinated/incoherent rambling once repetition_penalty was added to fix that.
+    # This GPU tier (Qwen2.5-3B via llama.cpp/CUDA, actually reaching the discrete GPU
+    # unlike OpenVINO's Intel-only "GPU" device) has been reliable in testing for this
+    # per-chunk task specifically - see gpu_formatter.py for the full story.
     if section is None and mode in ("auto", "local"):
-        section = npu_formatter.format_transcript(class_title, session_date, transcript)
+        section = gpu_formatter.format_transcript(class_title, session_date, transcript)
         if section is not None:
-            # The NPU model is much smaller than Claude and inconsistently catches
-            # mis-transcribed vocabulary - run the same fuzzy glossary fix-up the
-            # heuristic formatter uses, as a safety net.
+            # Smaller model than Claude, inconsistently catches mis-transcribed
+            # vocabulary - run the same fuzzy glossary fix-up the heuristic formatter
+            # uses, as a safety net.
             section = local_formatter.correct_with_glossary(section, class_code)
-        method = "npu"
+        method = "gpu"
 
     if section is None:
         section = _local_format(class_title, session_date, transcript, class_code)
@@ -282,12 +303,25 @@ Notes to clean up:
 """
 
 
-def condense_session(class_code: str, class_title: str, before_length: int) -> tuple[bool, str | None]:
+def condense_session(class_code: str, class_title: str, before_length: int,
+                      mode: str = "auto") -> tuple[bool, str | None]:
     """Re-reviews everything written to this class's notes since `before_length`
-    (the file's length when this recording session started) via the Claude CLI/API,
-    collapsing duplicate/multi-autosave sections into one clean section. Returns
-    (True, None) on success, or (False, reason) if there was nothing to do or
-    neither the CLI nor the API is available right now."""
+    (the file's length when this recording session started), collapsing duplicate/
+    multi-autosave sections into one clean section. Only runs in "auto" mode (CLI/API)
+    - deliberately does NOT fall back to the local GPU model (gpu_formatter) the way
+    format_and_save does. Testing showed the GPU model handles single-chunk formatting
+    reliably but not this harder multi-section merge/dedup task: across repeated runs
+    it would inconsistently drop one genuinely distinct bullet (which one varied by
+    generation params) while satisfying the other instructions - a real content-loss
+    risk that matters more here since condensing rewrites/replaces existing notes,
+    unlike format_and_save which only appends. So "local"/"heuristic" modes are always
+    a no-op for condensing for now. Returns (True, None) on success, or (False, reason)
+    if there was nothing to do or the CLI/API aren't available right now."""
+    if mode not in FORMATTING_MODES:
+        raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
+    if mode != "auto":
+        return False, f"no LLM available in '{mode}' mode"
+
     path = notes_path(class_code)
     if not path.exists():
         return False, "no notes file yet"
