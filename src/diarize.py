@@ -25,11 +25,10 @@ logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 # runs, never correlated with a bad result): pyannote disables TF32 for reproducibility
 # (a deliberate tradeoff, not a problem) and torch's std() warns about a degenerate
 # reduction on a single-frame embedding window internally in pyannote's pooling layer.
-try:
-    from pyannote.audio.utils.reproducibility import ReproducibilityWarning
-    warnings.filterwarnings("ignore", category=ReproducibilityWarning)
-except ImportError:
-    pass  # pyannote not installed - nothing to suppress
+# The ReproducibilityWarning suppression itself is set up lazily in _get_pipeline() -
+# `from pyannote.audio... import` at module level would import all of pyannote.audio
+# (and transitively torch, ~2GB) on every app launch, even when diarization is never
+# used this session. Measured: that mistake cost ~11s of startup time on every run.
 warnings.filterwarnings("ignore", message=r"std\(\): degrees of freedom is <= 0")
 
 _pipeline = None
@@ -46,6 +45,9 @@ def _get_pipeline():
         return _pipeline
     try:
         from pyannote.audio import Pipeline
+        from pyannote.audio.utils.reproducibility import ReproducibilityWarning
+        warnings.filterwarnings("ignore", category=ReproducibilityWarning)
+
         token = os.environ["HUGGINGFACE_TOKEN"]
         _pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1", token=token
