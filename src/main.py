@@ -100,6 +100,33 @@ def choose_class(args):
         sys.exit(1)
 
 
+def choose_action(args) -> str:
+    """Top-level startup menu, shown whenever no flag already decided what to do (--list,
+    --resume, --study-guide, etc. all return before this runs). Lets "generate a study
+    guide" be picked interactively instead of only being reachable via --study-guide."""
+    print(c.heading("What would you like to do?"))
+    print("  1. Record a lecture (default)")
+    print("  2. Generate a study guide from a class's notes so far")
+    choice = input("Choose [1]: ").strip() or "1"
+    return "study_guide" if choice == "2" else "record"
+
+
+def choose_study_guide_class(args) -> str:
+    if args.klass:
+        return args.klass
+    codes = sched.list_all_classes()
+    print("Which class?")
+    for i, (code, title) in enumerate(codes, 1):
+        print(f"  {i}. {code} - {title}")
+    choice = input("Choose a number: ").strip()
+    try:
+        code, _ = codes[int(choice) - 1]
+        return code
+    except (ValueError, IndexError):
+        print(c.error("Invalid choice."))
+        sys.exit(1)
+
+
 def choose_source(args):
     if args.source in ("mic", "system"):
         return args.source
@@ -737,6 +764,10 @@ def run():
 
     if args.study_guide:
         run_study_guide(args.study_guide)
+        return
+
+    if choose_action(args) == "study_guide":
+        run_study_guide(choose_study_guide_class(args))
         return
 
     cls = choose_class(args)
