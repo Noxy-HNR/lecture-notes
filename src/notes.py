@@ -29,6 +29,18 @@ CLI_TIMEOUT_SECONDS = 180
 # Native installer (irm https://claude.ai/install.ps1 | iex) puts it here; also check PATH.
 _FALLBACK_CLI_PATH = Path.home() / ".local" / "bin" / "claude.exe"
 
+# Real, observed bug: without this, `claude -p` sometimes decides to act as a full agentic
+# coding session instead of a plain text-completion call - exploring the project with
+# Read/Glob to figure out "the right file" and attempting to Write directly to it, rather
+# than returning the notes as its response text (which is all _try_claude_cli_format
+# actually asked for - the whole prompt is self-contained, no exploration is ever needed).
+# Headless (-p) mode can't interactively grant that Write permission, so it prints an
+# "I need your approval to write to <file>" explanation as its answer instead of the
+# notes - which then gets saved verbatim as if it were real content. Denying every tool
+# forces a plain text response every time, which is the only thing this call ever wanted.
+_CLI_NO_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch",
+                 "NotebookEdit", "Task", "TodoWrite", "Agent", "ExitPlanMode")
+
 
 def _find_claude_cli() -> str | None:
     on_path = shutil.which("claude")
@@ -148,7 +160,7 @@ def _try_claude_cli_format(prompt: str) -> str | None:
         return None
     try:
         result = subprocess.run(
-            [cli, "-p", "--model", CLAUDE_MODEL],
+            [cli, "-p", "--model", CLAUDE_MODEL, "--disallowedTools", " ".join(_CLI_NO_TOOLS)],
             input=prompt,
             capture_output=True,
             text=True,

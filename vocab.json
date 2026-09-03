@@ -91,7 +91,16 @@
     "ribosome",
     "vesicle",
     "lysosome",
-    "vacuole"
+    "vacuole",
+    "hydrophobic",
+    "solutes",
+    "carrying",
+    "detergents",
+    "hydration",
+    "hydrophilic",
+    "micelle",
+    "micelles",
+    "hydronium"
   ],
   "CHEM 1450": [
     "stoichiometry",
