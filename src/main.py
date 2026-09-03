@@ -27,6 +27,7 @@ every few minutes) even if you stop abruptly.
 """
 import argparse
 import os
+import random
 import re
 import shutil
 import sys
@@ -55,6 +56,15 @@ try:
     import msvcrt  # Windows-only stdlib module for non-blocking console keypress detection
 except ImportError:
     msvcrt = None
+
+# Windows consoles default to a legacy codepage (e.g. cp1252), not UTF-8. Notes/flashcard
+# text is LLM-generated and routinely contains characters outside that range (en dashes,
+# arrows, "≈", degree signs, etc.) - printing one crashes with UnicodeEncodeError. Confirmed
+# live: a flashcard explanation containing "≈" killed a quiz mid-session. Reconfigure stdout/
+# stderr to UTF-8 unconditionally so any such content just prints correctly.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
@@ -102,16 +112,17 @@ def choose_class(args):
 
 def choose_action(args) -> str:
     """Top-level startup menu, shown whenever no flag already decided what to do (--list,
-    --resume, --study-guide, etc. all return before this runs). Lets "generate a study
-    guide" be picked interactively instead of only being reachable via --study-guide."""
+    --resume, --study-guide, --flashcards, etc. all return before this runs). Lets "generate
+    a study guide"/"quiz me" be picked interactively instead of only being reachable via flags."""
     print(c.heading("What would you like to do?"))
     print("  1. Record a lecture (default)")
     print("  2. Generate a study guide from a class's notes so far")
+    print("  3. Quiz yourself with flashcards")
     choice = input("Choose [1]: ").strip() or "1"
-    return "study_guide" if choice == "2" else "record"
+    return {"2": "study_guide", "3": "flashcards"}.get(choice, "record")
 
 
-def choose_study_guide_class(args) -> str:
+def choose_notes_class(args) -> str:
     if args.klass:
         return args.klass
     codes = sched.list_all_classes()
@@ -538,10 +549,10 @@ def prune_backups(older_than_days: int, confirm: bool):
     print(c.success(f"\nDeleted {deleted}/{len(candidates)} file(s), freed {total_bytes / 1e9:.2f}GB."))
 
 
-def run_study_guide(code: str):
-    """Generates a consolidated, cross-lecture study guide for one class from all of its
-    notes so far. CLI/API only - see notes.generate_study_guide for why the local model
-    isn't used here."""
+def _resolve_class_for_llm_feature(code: str, feature: str) -> dict:
+    """Shared setup for --study-guide/--flashcards: resolve the class code and confirm
+    Claude CLI/API is available (both features need real cross-lecture synthesis - see
+    notes.generate_study_guide/generate_flashcards for why the local model isn't used)."""
     cls = sched.get_class_by_code(code)
     if cls is None:
         print(c.error(f"No class with code '{code}' found in schedule.json."))
@@ -551,9 +562,17 @@ def run_study_guide(code: str):
         sys.exit(1)
 
     if not notes.cli_available() and not os.environ.get("ANTHROPIC_API_KEY"):
-        print(c.error("Study guide generation needs the Claude CLI (logged in) or "
+        print(c.error(f"{feature} needs the Claude CLI (logged in) or "
                        "ANTHROPIC_API_KEY - neither is available right now."))
         sys.exit(1)
+    return cls
+
+
+def run_study_guide(code: str):
+    """Generates a consolidated, cross-lecture study guide for one class from all of its
+    notes so far. CLI/API only - see notes.generate_study_guide for why the local model
+    isn't used here."""
+    cls = _resolve_class_for_llm_feature(code, "Study guide generation")
 
     print(c.heading(f"Building study guide for {cls['code']} - {cls['title']} "
                      f"from all notes so far..."))
@@ -565,6 +584,69 @@ def run_study_guide(code: str):
 
     print(c.success(f"Study guide saved to {path} ({time.time() - start:.1f}s)."))
     print(c.info(f"Study guide (Word): {docx_export.study_guide_docx_path(cls['code'])}"))
+
+
+def run_flashcards(code: str):
+    """Generates a multiple-choice quiz from a class's notes so far, then runs it
+    interactively in the terminal: one question at a time, immediate right/wrong feedback
+    with a short explanation, and a final score. CLI/API only - see
+    notes.generate_flashcards for why the local model isn't used here. Nothing is saved to
+    disk - this is a one-off study session, not a persisted artifact like the notes/study
+    guide."""
+    cls = _resolve_class_for_llm_feature(code, "Flashcard generation")
+
+    print(c.heading(f"Building a {notes.FLASHCARD_COUNT}-question quiz for {cls['code']} - "
+                     f"{cls['title']} from all notes so far..."))
+    start = time.time()
+    ok, reason, questions = notes.generate_flashcards(cls["code"], cls["title"])
+    if not ok:
+        print(c.error(f"Could not generate flashcards: {reason}"))
+        sys.exit(1)
+    print(c.success(f"Quiz ready ({len(questions)} questions, {time.time() - start:.1f}s).\n"))
+
+    random.shuffle(questions)
+    score = 0
+    answered = 0
+    letters = ["A", "B", "C", "D"]
+
+    for i, q in enumerate(questions, 1):
+        # Shuffle each question's option order independently, rather than trusting the LLM
+        # to vary the correct answer's position on its own (models tend toward a favorite
+        # slot, e.g. always "B") - keeps the quiz from becoming guessable by pattern.
+        order = list(range(4))
+        random.shuffle(order)
+        shuffled_options = [q["options"][j] for j in order]
+        correct_letter = letters[order.index(q["correct_index"])]
+
+        print(c.heading(f"Q{i}/{len(questions)}: ") + q["question"])
+        for letter, option in zip(letters, shuffled_options):
+            print(f"  {letter}. {option}")
+
+        answer = input("Your answer (A/B/C/D, or 'q' to quit): ").strip().upper()
+        if answer == "Q":
+            break
+        while answer not in letters:
+            answer = input("Please enter A, B, C, D, or 'q' to quit: ").strip().upper()
+            if answer == "Q":
+                break
+        if answer == "Q":
+            break
+
+        answered += 1
+        if answer == correct_letter:
+            score += 1
+            print(c.success(f"Correct! {q['explanation']}\n"))
+        else:
+            print(c.error(f"Incorrect - the answer was {correct_letter}. {q['explanation']}\n"))
+
+    if answered == 0:
+        print(c.dim("No questions answered - quiz ended."))
+        return
+
+    pct = 100 * score / answered
+    print(c.heading("=" * 40))
+    print(c.heading(f"Quiz complete! Score: {score}/{answered} ({pct:.0f}%)"))
+    print(c.heading("=" * 40))
 
 
 def run_resume(target: str, args):
@@ -743,6 +825,10 @@ def run():
                               "class's notes so far (e.g. 'PSYC 1300') and exit. Requires Claude "
                               "CLI or API - needs real synthesis across lectures, the local model "
                               "isn't reliable enough for this.")
+    parser.add_argument("--flashcards", metavar="CODE",
+                         help="Quiz yourself with an interactive multiple-choice flashcard session "
+                              "generated from all of a class's notes so far, and exit. Same CLI/API "
+                              "requirement as --study-guide.")
     args = parser.parse_args()
 
     if args.list:
@@ -766,8 +852,16 @@ def run():
         run_study_guide(args.study_guide)
         return
 
-    if choose_action(args) == "study_guide":
-        run_study_guide(choose_study_guide_class(args))
+    if args.flashcards:
+        run_flashcards(args.flashcards)
+        return
+
+    action = choose_action(args)
+    if action == "study_guide":
+        run_study_guide(choose_notes_class(args))
+        return
+    if action == "flashcards":
+        run_flashcards(choose_notes_class(args))
         return
 
     cls = choose_class(args)

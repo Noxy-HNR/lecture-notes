@@ -7,6 +7,7 @@ Formatting is tried in this order:
   3. Local, dependency-free formatter - used if we're offline or both of the above fail.
 """
 import difflib
+import json
 import os
 import re
 import shutil
@@ -510,6 +511,108 @@ def generate_study_guide(class_code: str, class_title: str,
         pass  # .docx is a mirror of the .md; never let it block saving the study guide
 
     return True, None, out_path
+
+
+FLASHCARD_COUNT = 15
+
+
+def _build_flashcards_prompt(class_title: str, class_code: str, all_notes: str, count: int) -> str:
+    return f"""You are writing a {count}-question multiple-choice quiz for exam review, covering
+{class_title} ({class_code}) based on the full notes below (spanning the whole semester so far).
+
+Requirements:
+- Write exactly {count} questions, spread across the different topics in the notes below
+  (don't cluster them all on one topic) - weight coverage toward topics with more material
+- Each question has exactly 4 answer options, only one of which is correct
+- Wrong options should be plausible (real related terms/concepts a student might confuse
+  the right answer with), not obviously silly - this is meant to actually test understanding
+- Write a short (1-2 sentence) explanation for each question, given after the student
+  answers, that states the correct answer and briefly why - written so it makes sense
+  whether the student got it right or wrong
+- Base questions only on material actually present in the notes below - do not invent facts
+- Vary question difficulty and style (definitions, applying a concept, distinguishing
+  similar terms, etc.) rather than making them all simple recall
+
+Output ONLY a raw JSON array (no markdown code fences, no preamble/explanation), where each
+element has exactly this shape:
+{{"question": "...", "options": ["...", "...", "...", "..."], "correct_index": 0, "explanation": "..."}}
+
+"correct_index" is the 0-based index into "options" of the correct answer. Put the correct
+answer in a varied/random position across questions, not always the same index.
+
+Notes to quiz on:
+---
+{all_notes}
+---
+"""
+
+
+def _parse_flashcards_json(raw: str) -> list[dict] | None:
+    """Extracts and validates the JSON array from a flashcards LLM response - tolerant of
+    stray markdown code fences or preamble text around the actual array, since models don't
+    always follow "output ONLY json" instructions exactly. Drops individual malformed
+    questions rather than failing the whole batch; returns None only if nothing usable
+    survives."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+    questions = []
+    for item in parsed if isinstance(parsed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        q, options, idx, explanation = (item.get("question"), item.get("options"),
+                                         item.get("correct_index"), item.get("explanation"))
+        if (not isinstance(q, str) or not q.strip()
+                or not isinstance(options, list) or len(options) != 4
+                or not all(isinstance(o, str) and o.strip() for o in options)
+                or not isinstance(idx, int) or not (0 <= idx < 4)
+                or not isinstance(explanation, str)):
+            continue
+        questions.append({"question": q.strip(), "options": [o.strip() for o in options],
+                           "correct_index": idx, "explanation": explanation.strip()})
+    return questions or None
+
+
+def generate_flashcards(class_code: str, class_title: str, mode: str = "auto",
+                         count: int = FLASHCARD_COUNT) -> tuple[bool, str | None, list[dict] | None]:
+    """Generates a multiple-choice quiz from all of a class's notes so far. CLI/API only -
+    same reasoning as generate_study_guide: writing plausible wrong answers and covering
+    material proportionally needs real understanding of the whole notes file, not just
+    single-chunk formatting. Returns (True, None, questions) on success, where each question
+    is {"question", "options" (4 strings), "correct_index", "explanation"}, or
+    (False, reason, None)."""
+    if mode not in FORMATTING_MODES:
+        raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
+    if mode != "auto":
+        return False, f"no LLM available in '{mode}' mode", None
+
+    path = notes_path(class_code)
+    if not path.exists():
+        return False, "no notes yet for this class", None
+
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return False, "no notes yet for this class", None
+
+    prompt = _build_flashcards_prompt(class_title, class_code, content, count)
+    raw = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    if not raw:
+        return False, "Claude CLI/API unavailable", None
+
+    questions = _parse_flashcards_json(raw)
+    if not questions:
+        return False, "Claude's response couldn't be parsed into quiz questions", None
+
+    return True, None, questions
 
 
 def condense_session(class_code: str, class_title: str, before_length: int,
