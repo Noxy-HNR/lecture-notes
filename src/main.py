@@ -48,6 +48,7 @@ import transcribe
 import notes
 import docx_export
 import diarize
+import gpu_formatter
 import vocab as vocab_module
 import soundfile as sf
 import console_colors as c
@@ -442,19 +443,20 @@ def _check_whisper_model() -> tuple[bool, str]:
         return True, c.error(f"  Whisper model FAILED to load: {e}")
 
 
-def run_preflight_checks(source: str) -> bool:
+def run_preflight_checks(source: str, formatting_mode: str = "auto") -> bool:
     """Quick sanity checks before committing to a recording session, so a broken mic
     or a dead GPU shows up now - not silently mid-lecture, which is how most of this
     app's real bugs actually surfaced. Warnings don't block starting; only a genuinely
     unusable audio device or a Whisper model that fails to load does (returns False).
 
-    The three checks run concurrently (audio device, disk space, Whisper model load)
-    since they touch entirely independent subsystems (WASAPI, filesystem, GPU) with no
-    shared state - safe to parallelize. Whisper's load time dominates (several seconds,
-    especially cold), so overlapping the ~3s audio sample against it is a real, free
-    time saving rather than just running things concurrently for its own sake. Results
-    are printed in a fixed order after all three finish, not in completion order, so
-    the output stays consistent run to run."""
+    The checks run concurrently (audio device, disk space, Whisper model load, and -
+    "local" mode only - the local GPU formatter's warm-up) since they touch entirely
+    independent subsystems (WASAPI, filesystem, GPU) with no shared state - safe to
+    parallelize. Whisper's load time dominates (several seconds, especially cold), so
+    overlapping the ~3s audio sample against it is a real, free time saving rather than
+    just running things concurrently for its own sake. Results are printed in a fixed
+    order after all finish, not in completion order, so the output stays consistent run
+    to run."""
     print(c.heading("Running preflight checks..."))
     ok = True
 
@@ -466,10 +468,16 @@ def run_preflight_checks(source: str) -> bool:
         if mic_mute.check_and_unmute() == "unmuted":
             print(c.warning("  Microphone was muted at the system level - unmuted it automatically."))
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         audio_future = executor.submit(_check_audio_device, source)
         disk_future = executor.submit(_check_disk_space)
         whisper_future = executor.submit(_check_whisper_model)
+        # Only in "local" mode is this tier guaranteed to be needed - in "auto" mode
+        # it's a fallback that's usually never touched (Claude CLI/API handle
+        # everything), so warming it up there would just burn VRAM/startup time for
+        # nothing in the common case. See gpu_formatter.warm_up() for the full reasoning.
+        gpu_future = (executor.submit(gpu_formatter.warm_up)
+                      if formatting_mode == "local" and gpu_formatter.available() else None)
 
         blocks, msg = audio_future.result()
         print(msg)
@@ -482,6 +490,11 @@ def run_preflight_checks(source: str) -> bool:
         blocks, msg = whisper_future.result()
         print(msg)
         ok = ok and not blocks
+
+        if gpu_future is not None:
+            print(c.success("  Local GPU formatter warmed up and ready.")
+                  if gpu_future.result() else
+                  c.warning("  Local GPU formatter failed to warm up - will retry lazily when actually needed."))
 
     if diarize.available():
         print(c.info("  Speaker diarization: enabled (HUGGINGFACE_TOKEN set)"))
@@ -938,7 +951,7 @@ def run():
     initial_prompt = vocab_module.initial_prompt_for_class(cls["code"])
 
     print()
-    if not run_preflight_checks(source):
+    if not run_preflight_checks(source, formatting_mode):
         print(c.error("Preflight checks failed - fix the issue above before recording "
                        "(this prevents starting a session that would silently fail)."))
         sys.exit(1)

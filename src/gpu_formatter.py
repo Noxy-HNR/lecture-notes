@@ -60,6 +60,16 @@ def available() -> bool:
     return LLAMA_SERVER_EXE.exists() and MODEL_PATH.exists()
 
 
+def warm_up() -> bool:
+    """Starts llama-server now instead of waiting for the first real format_transcript()/
+    condense_transcript() call to lazily do it. Worth calling during preflight only in
+    "local" formatting mode, where this tier is guaranteed to be needed eventually - in
+    "auto" mode it's usually never touched (Claude CLI/API handle everything), so
+    pre-warming there would just burn ~3.4GB VRAM and ~30s of startup time for nothing in
+    the common case. Returns whether the server ended up healthy."""
+    return _ensure_server_running()
+
+
 def _server_healthy() -> bool:
     try:
         with urllib.request.urlopen(f"{BASE_URL}/health", timeout=2) as resp:
