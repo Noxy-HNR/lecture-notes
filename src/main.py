@@ -54,6 +54,7 @@ import soundfile as sf
 import console_colors as c
 import keep_awake
 import mic_mute
+import telemetry as telemetry_module
 
 try:
     import msvcrt  # Windows-only stdlib module for non-blocking console keypress detection
@@ -260,6 +261,9 @@ class SaveWorker:
     def has_pending(self) -> bool:
         return not self._queue.empty()
 
+    def pending_count(self) -> int:
+        return self._queue.qsize()
+
     def wait_idle(self):
         self._queue.join()
 
@@ -293,8 +297,9 @@ class TranscriptionWorker:
         while True:
             chunk_audio = self._queue.get()
             try:
+                started = time.time()
                 whisper_segments = self._transcriber.process(chunk_audio)
-                self._on_result(chunk_audio, whisper_segments)
+                self._on_result(chunk_audio, whisper_segments, time.time() - started)
             except Exception as e:
                 print(c.error(f"Transcription failed for a chunk (continuing): {e}"))
             finally:
@@ -305,6 +310,9 @@ class TranscriptionWorker:
 
     def has_pending(self) -> bool:
         return not self._queue.empty()
+
+    def pending_count(self) -> int:
+        return self._queue.qsize()
 
     def wait_idle(self):
         self._queue.join()
@@ -747,6 +755,41 @@ def run_study_guide(code: str):
     _pause_before_exit()
 
 
+def run_search(query: str, class_code: str | None = None):
+    """Terminal-side search. The dashboard's search box hits the same search module, so
+    both surfaces always agree about what a query matches."""
+    import search as search_module
+
+    if class_code and sched.get_class_by_code(class_code) is None:
+        print(c.error(f"No class with code '{class_code}' found in schedule.json."))
+        sys.exit(1)
+
+    hits = search_module.search(query, class_code=class_code)
+    if not hits:
+        print(c.warning(f"No matches for '{query}'"
+                         f"{f' in {class_code}' if class_code else ''}."))
+        return
+
+    notes_hits = [h for h in hits if h.source == "notes"]
+    transcript_hits = [h for h in hits if h.source == "transcript"]
+    print(c.heading(f"{len(hits)} match(es) for '{query}'"
+                     f"{f' in {class_code}' if class_code else ''}\n"))
+
+    if notes_hits:
+        print(c.info(f"In your notes ({len(notes_hits)}):"))
+        for h in notes_hits:
+            where = f"{h.class_code} · {h.location}" + (f" · {h.section}" if h.section else "")
+            print(f"  {c.dim(where)}\n    {h.text}")
+        print()
+
+    if transcript_hits:
+        print(c.info(f"In raw transcripts ({len(transcript_hits)}):"))
+        for h in transcript_hits[:40]:
+            print(f"  {c.dim(f'{h.class_code} · {h.location} · {h.timestamp}')}\n    {h.text}")
+        if len(transcript_hits) > 40:
+            print(c.dim(f"  ... and {len(transcript_hits) - 40} more"))
+
+
 def run_flashcards(code: str):
     """Generates a multiple-choice quiz from a class's notes so far, then runs it
     interactively in the terminal: one question at a time, immediate right/wrong feedback
@@ -999,6 +1042,12 @@ def run():
                          help="Quiz yourself with an interactive multiple-choice flashcard session "
                               "generated from all of a class's notes so far, and exit. Same CLI/API "
                               "requirement as --study-guide.")
+    parser.add_argument("--search", metavar="QUERY",
+                         help="Search your notes (and raw transcripts) for a term and exit. "
+                              "Combine with --class to search one class only.")
+    parser.add_argument("--dashboard", action="store_true",
+                         help="Open the web dashboards (notes browser + live diagnostics) and exit. "
+                              "Runs as its own process - safe to leave open during a recording.")
     args = parser.parse_args()
 
     if args.list:
@@ -1024,6 +1073,15 @@ def run():
 
     if args.flashcards:
         run_flashcards(args.flashcards)
+        return
+
+    if args.search:
+        run_search(args.search, args.klass)
+        return
+
+    if args.dashboard:
+        import dashboard
+        dashboard.serve()
         return
 
     action = choose_action(args)
@@ -1097,20 +1155,38 @@ def run():
     save_listener.start()
     save_worker = SaveWorker()
 
-    def _handle_transcription_result(chunk_audio, whisper_segments):
+    # Everything the diagnostics dashboard shows comes from here. Best-effort throughout:
+    # a telemetry failure must never affect the recording itself (see telemetry.py).
+    tel = telemetry_module.Telemetry()
+    tel.start_session(class_code=cls["code"], class_title=cls["title"], source=source,
+                       formatting_mode=formatting_mode, whisper_device=transcribe.device_info(),
+                       notes_path=str(notes.notes_path(cls["code"])), wav_path=str(wav_path))
+    tel.add_event("info", f"Recording started: {cls['code']} ({source})")
+
+    def _handle_transcription_result(chunk_audio, whisper_segments, transcribe_seconds=0.0):
         nonlocal silence_warned
         session.write_chunk(chunk_audio, whisper_segments)
         for seg in whisper_segments:
             stamp = time.strftime("%H:%M:%S")
             print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
+            tel.add_transcript(stamp, seg["text"])
             with open(raw_log_path, "a", encoding="utf-8") as f:
                 f.write(f"[{stamp}] {seg['text']}\n")
 
+        tel.record_chunk(len(chunk_audio) / audio.SAMPLE_RATE, transcribe_seconds,
+                          len(whisper_segments))
+        tel.update(consecutive_silent_chunks=transcriber.consecutive_silent_chunks,
+                    queue_transcription=transcription_worker.pending_count(),
+                    queue_saves=save_worker.pending_count())
+        tel.flush()
+
         silent_seconds = transcriber.consecutive_silent_chunks * args.chunk
         if silent_seconds >= SILENCE_WARNING_SECONDS and not silence_warned:
-            print(c.warning(f"No audio detected for ~{silent_seconds/60:.1f} min - "
-                             f"check your {'microphone' if source == 'mic' else 'system audio'} "
-                             f"source (muted? disconnected?)."))
+            message = (f"No audio detected for ~{silent_seconds/60:.1f} min - "
+                        f"check your {'microphone' if source == 'mic' else 'system audio'} "
+                        f"source (muted? disconnected?).")
+            print(c.warning(message))
+            tel.add_event("warning", message)
             silence_warned = True
         elif transcriber.consecutive_silent_chunks == 0:
             silence_warned = False
@@ -1126,12 +1202,24 @@ def run():
             if chunk_audio is not None:
                 transcription_worker.submit(chunk_audio)
 
+            # The diagnostics dashboard's buttons land here - same two actions the
+            # terminal offers ('s' and Ctrl+C), just arriving from another process.
+            # Routed through the identical code paths rather than duplicated, so the
+            # two front-ends can't drift apart in behaviour.
+            dashboard_command = telemetry_module.take_command()
+            if dashboard_command == "save_now":
+                save_listener.requested.set()
+                tel.add_event("info", "Save requested from dashboard")
+            elif dashboard_command == "stop":
+                tel.add_event("info", "Stop requested from dashboard")
+                raise KeyboardInterrupt
+
             if save_listener.requested.is_set():
                 save_listener.requested.clear()
                 if session.has_pending():
                     print(c.autosave(f"\n'{SAVE_NOW_KEY.decode()}' pressed - saving now..."))
                     _save(cls, session, session_date, formatting_mode, note="(manual save)",
-                          save_worker=save_worker)
+                          save_worker=save_worker, telemetry=tel)
                 else:
                     print(c.dim(f"\n'{SAVE_NOW_KEY.decode()}' pressed, but nothing new to save yet."))
                 last_autosave = time.time()  # reset either way - that's what was asked for
@@ -1146,8 +1234,9 @@ def run():
                 # this it could look like nothing was happening for however long that
                 # takes, then a "Saved..." line would just appear out of nowhere.
                 print(c.autosave("\n(autosaving in background...)"))
+                tel.add_event("info", "Autosave started (background)")
                 _save(cls, session, session_date, formatting_mode, note="(autosave)",
-                      save_worker=save_worker)
+                      save_worker=save_worker, telemetry=tel)
                 last_autosave = time.time()
     except KeyboardInterrupt:
         print(c.autosave("\nStopping - wrapping up your notes now, this can take a moment..."))
@@ -1201,7 +1290,7 @@ def run():
                 n_pending = len(session.pending_segments)
                 _step(f"Formatting and saving the final segment ({n_pending} transcribed chunk(s))...")
                 save_start = time.time()
-                _save(cls, session, session_date, formatting_mode, is_final=False)
+                _save(cls, session, session_date, formatting_mode, is_final=False, telemetry=tel)
                 print(c.dim(f"  final save completed in {time.time() - save_start:.1f}s."))
             else:
                 _step("Nothing pending to save (already flushed by the last autosave).")
@@ -1243,9 +1332,12 @@ def run():
         print(c.dim(f"Raw transcript backup: {raw_log_path}"))
         print(c.dim(f"Audio backup: {wav_path}"))
 
+        tel.add_event("info", f"Session ended after {session.elapsed()/60:.1f} min")
+        tel.end_session()  # dashboard flips to "idle" and disables its controls
+
 
 def _save(cls, session: Session, session_date, mode, note="", is_final=False,
-          save_worker: "SaveWorker | None" = None):
+          save_worker: "SaveWorker | None" = None, telemetry=None):
     """pop_pending_text() always runs synchronously on the calling thread right now, so
     it correctly snapshots whatever's pending at this instant - the actual slow work
     (format_and_save's CLI/API/file-write call) is handed to `save_worker` when given,
@@ -1256,7 +1348,13 @@ def _save(cls, session: Session, session_date, mode, note="", is_final=False,
     full_text = session.pop_pending_text(run_diarization=is_final)
 
     def do_save():
+        save_started = time.time()
         path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date, mode=mode)
+        if telemetry is not None:
+            telemetry.record_save(method, time.time() - save_started)
+            telemetry.add_event("success" if method in ("cli", "api") else "warning",
+                                 f"Saved via {method} in {time.time() - save_started:.1f}s {note}".strip())
+            telemetry.flush()
         chose_this_mode = mode != "auto"
         tag, colorize = {
             "cli": (" [formatted with Claude Code CLI]", c.success),

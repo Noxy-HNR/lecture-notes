@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture Notes</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><span class="dot"></span>Lecture Notes</div>
+  <nav class="tabs">
+    <a href="/" class="active">Notes</a>
+    <a href="/diagnostics">Diagnostics</a>
+  </nav>
+  <div class="search-wrap">
+    <input id="search" class="search" type="search" autocomplete="off"
+           placeholder="Search all notes and transcripts…  (/ to focus)">
+  </div>
+</header>
+
+<div class="shell">
+  <aside>
+    <div class="section-label">Classes</div>
+    <div id="class-list"></div>
+    <div class="section-label" style="margin-top:22px">Library</div>
+    <button class="class-card" data-view="sessions">
+      <div class="code">Recordings</div>
+      <div class="title">Raw audio &amp; transcripts</div>
+    </button>
+  </aside>
+
+  <main id="main">
+    <div class="empty">Loading…</div>
+  </main>
+</div>
+
+<script>
+const state = { classes: [], activeClass: null, kind: 'notes', view: 'class', query: '' };
+const main = document.getElementById('main');
+const searchBox = document.getElementById('search');
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtDate = ts => new Date(ts * 1000).toLocaleDateString(undefined, { month:'short', day:'numeric' });
+
+async function api(path) { const r = await fetch(path); return r.json(); }
+
+// Renders a search snippet: escapes it, applies the notes' inline markdown, and marks the
+// matched terms. All three passes run against sentinel characters rather than real HTML,
+// then tags are substituted in at the very end - otherwise the highlight regex would
+// happily match inside the markup it just produced (searching "mark" or "strong" would
+// corrupt the output).
+const S = { b0:'\u0001', b1:'\u0002', i0:'\u0003', i1:'\u0004', m0:'\u0005', m1:'\u0006' };
+
+function renderSnippet(text, query) {
+  // Drop the source line's list marker - the snippet is shown in its own card, so a
+  // stray leading "- " is just noise from the markdown it came from.
+  let out = esc(text.replace(/^\s*[-*]\s+/, ''))
+    .replace(/\*\*(.+?)\*\*/g, `${S.b0}$1${S.b1}`)
+    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, `${S.i0}$1${S.i1}`);
+
+  for (const t of query.toLowerCase().split(/\s+/).filter(Boolean)) {
+    // Escape regex metacharacters so a search for "C++" or "p < .05" can't break the pattern.
+    const safe = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`(${safe})`, 'gi'), `${S.m0}$1${S.m1}`);
+  }
+
+  return out
+    .replaceAll(S.b0, '<strong>').replaceAll(S.b1, '</strong>')
+    .replaceAll(S.i0, '<em>').replaceAll(S.i1, '</em>')
+    .replaceAll(S.m0, '<mark>').replaceAll(S.m1, '</mark>');
+}
+
+// ---------- sidebar ----------
+
+function renderSidebar() {
+  const list = document.getElementById('class-list');
+  list.innerHTML = state.classes.map(c => `
+    <button class="class-card ${state.view === 'class' && state.activeClass === c.code ? 'active' : ''}"
+            data-class="${esc(c.code)}">
+      <div class="code">${esc(c.code)}</div>
+      <div class="title">${esc(c.title)}</div>
+      <div class="meta">${c.lectures} lecture${c.lectures === 1 ? '' : 's'} ·
+        ${c.words.toLocaleString()} words · ${fmtDate(c.updated)}</div>
+    </button>`).join('');
+  list.querySelectorAll('[data-class]').forEach(el =>
+    el.onclick = () => openClass(el.dataset.class));
+  document.querySelector('[data-view="sessions"]').onclick = openSessions;
+}
+
+// ---------- class document ----------
+
+async function openClass(code, kind = 'notes') {
+  state.activeClass = code; state.kind = kind; state.view = 'class';
+  searchBox.value = ''; state.query = '';
+  renderSidebar();
+  main.innerHTML = '<div class="empty">Loading…</div>';
+
+  const cls = state.classes.find(c => c.code === code) || {};
+  const doc = await api(`/api/document?class=${encodeURIComponent(code)}&kind=${kind}`);
+
+  const tabs = `
+    <div class="seg" id="kind-tabs">
+      <button data-kind="notes" class="${kind==='notes'?'active':''}">Notes</button>
+      <button data-kind="study_guide" class="${kind==='study_guide'?'active':''}"
+        ${cls.has_study_guide ? '' : 'disabled'}>Study guide</button>
+      <button data-kind="flashcards" class="${kind==='flashcards'?'active':''}"
+        ${cls.has_flashcards ? '' : 'disabled'}>Flashcards</button>
+    </div>`;
+
+  let body;
+  if (doc.error) {
+    body = `<div class="empty">Nothing here yet.<br><span style="font-size:13px">
+      ${kind === 'study_guide' ? 'Generate one with <code class="mono">--study-guide</code>.'
+        : kind === 'flashcards' ? 'Generate some with <code class="mono">--flashcards</code>.' : ''}
+      </span></div>`;
+  } else if (kind === 'flashcards') {
+    body = `<div class="page-sub">${doc.cards.length} cards · click to reveal</div>` +
+      doc.cards.map(c => `<div class="flashcard">
+        <div class="front">${esc(c.front)}</div>
+        <div class="back">${esc(c.back)}</div>
+        <div class="reveal-hint">click to reveal</div></div>`).join('');
+  } else {
+    const toc = (doc.toc || []).length > 1
+      ? `<div class="toc"><div class="section-label">Lectures</div>
+         ${doc.toc.map(t => `<a href="#${t.anchor}">${esc(t.date)}</a>`).join('')}</div>`
+      : '<div></div>';
+    body = `<div class="with-toc"><div class="doc">${doc.html}</div>${toc}</div>`;
+  }
+
+  main.innerHTML = `
+    <h1 class="page-title">${esc(cls.title || code)}</h1>
+    <div class="page-sub">${esc(code)} · ${cls.lectures || 0} lectures${
+      doc.words ? ` · ${doc.words.toLocaleString()} words` : ''}</div>
+    <div style="margin-bottom:22px">${tabs}</div>
+    ${body}`;
+
+  main.querySelectorAll('#kind-tabs button').forEach(b =>
+    b.onclick = () => !b.disabled && openClass(code, b.dataset.kind));
+  main.querySelectorAll('.flashcard').forEach(card =>
+    card.onclick = () => card.classList.toggle('revealed'));
+}
+
+// ---------- recordings ----------
+
+async function openSessions() {
+  state.view = 'sessions'; state.activeClass = null;
+  searchBox.value = ''; state.query = '';
+  renderSidebar();
+  document.querySelector('[data-view="sessions"]').classList.add('active');
+  main.innerHTML = '<div class="empty">Loading…</div>';
+
+  const sessions = await api('/api/sessions');
+  const total = sessions.reduce((a, s) => a + s.mb, 0);
+  main.innerHTML = `
+    <h1 class="page-title">Recordings</h1>
+    <div class="page-sub">${sessions.length} sessions · ${(total/1000).toFixed(1)} GB of audio backups</div>
+    ${sessions.length ? sessions.map(s => `
+      <div class="hit">
+        <div class="hit-meta">
+          <span class="badge notes">${esc(s.class_code)}</span>
+          <span>${esc(s.date)} at ${esc(s.time)}</span>
+          <span>·</span><span>${s.minutes} min</span>
+          <span>·</span><span>${s.mb} MB</span>
+          ${s.has_transcript ? `<span>·</span><span>${s.transcript_lines} transcript lines</span>` : ''}
+        </div>
+        <div class="hit-text mono" style="font-size:12.5px;color:var(--text-dim)">${esc(s.wav)}</div>
+      </div>`).join('') : '<div class="empty">No recordings yet.</div>'}`;
+}
+
+// ---------- search ----------
+
+let searchTimer = null;
+searchBox.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 180);  // debounce: search hits disk on every keystroke
+});
+
+async function runSearch() {
+  const q = searchBox.value.trim();
+  state.query = q;
+  if (!q) { if (state.activeClass) openClass(state.activeClass, state.kind); return; }
+  state.view = 'search';
+  const hits = await api(`/api/search?q=${encodeURIComponent(q)}`);
+
+  const notes = hits.filter(h => h.source === 'notes');
+  const transcripts = hits.filter(h => h.source === 'transcript');
+  const group = (title, rows) => !rows.length ? '' : `
+    <div class="section-label" style="margin:24px 0 10px">${title} (${rows.length})</div>
+    ${rows.map(h => `
+      <div class="hit">
+        <div class="hit-meta">
+          <span class="badge ${h.source}">${h.source === 'notes' ? h.class_code : h.class_code}</span>
+          <span>${esc(h.location)}</span>
+          ${h.section ? `<span>·</span><span>${esc(h.section)}</span>` : ''}
+          ${h.timestamp ? `<span>·</span><span class="mono">${esc(h.timestamp)}</span>` : ''}
+        </div>
+        <div class="hit-text">${renderSnippet(h.text, q)}</div>
+      </div>`).join('')}`;
+
+  main.innerHTML = `
+    <h1 class="page-title">Search</h1>
+    <div class="page-sub">${hits.length} result${hits.length === 1 ? '' : 's'} for “${esc(q)}”</div>
+    ${hits.length ? group('In your notes', notes) + group('In raw transcripts', transcripts)
+                  : '<div class="empty">No matches.</div>'}`;
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && document.activeElement !== searchBox) { e.preventDefault(); searchBox.focus(); }
+  if (e.key === 'Escape' && document.activeElement === searchBox) { searchBox.blur(); }
+});
+
+// ---------- boot ----------
+
+(async () => {
+  state.classes = await api('/api/classes');
+  renderSidebar();
+  if (state.classes.length) openClass(state.classes[0].code);
+  else main.innerHTML = '<div class="empty">No notes yet — record a lecture first.</div>';
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnostics · Lecture Notes</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><span class="dot"></span>Lecture Notes</div>
+  <nav class="tabs">
+    <a href="/">Notes</a>
+    <a href="/diagnostics" class="active">Diagnostics</a>
+  </nav>
+  <div class="search-wrap"></div>
+  <div id="poll-state" class="chip">connecting…</div>
+</header>
+
+<main style="max-width:1280px">
+  <div id="banner" class="live-banner">
+    <div>
+      <div style="display:flex;align-items:center;gap:9px">
+        <span class="live-dot"></span>
+        <span id="banner-title" style="font-weight:600">Loading…</span>
+      </div>
+      <div id="banner-sub" class="muted" style="font-size:13px;margin-top:4px"></div>
+    </div>
+    <div style="display:flex;gap:9px">
+      <button id="btn-save" class="btn primary" disabled>Save now</button>
+      <button id="btn-stop" class="btn danger" disabled>Stop recording</button>
+    </div>
+  </div>
+
+  <div class="stack">
+    <div>
+      <div class="section-label">Session</div>
+      <div class="metrics" id="session-metrics"></div>
+    </div>
+
+    <div>
+      <div class="section-label">Transcription performance</div>
+      <div class="metrics" id="perf-metrics"></div>
+    </div>
+
+    <div>
+      <div class="section-label">Services</div>
+      <div id="services" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    </div>
+
+    <div class="two-col">
+      <div>
+        <div class="row-between" style="margin-bottom:9px">
+          <div class="section-label" style="margin:0">Live transcript</div>
+          <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:6px">
+            <input type="checkbox" id="autoscroll" checked> follow
+          </label>
+        </div>
+        <div class="stream" id="transcript"></div>
+      </div>
+      <div>
+        <div class="section-label">Events</div>
+        <div class="stream" id="events"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function metric(label, value, sub = '', cls = '') {
+  return `<div class="metric">
+    <div class="label">${esc(label)}</div>
+    <div class="value ${cls}">${esc(value)}</div>
+    ${sub ? `<div class="sub">${esc(sub)}</div>` : ''}</div>`;
+}
+
+function duration(seconds) {
+  if (!seconds || seconds < 0) return '—';
+  const m = Math.floor(seconds / 60), s = Math.floor(seconds % 60);
+  return m >= 60 ? `${Math.floor(m/60)}h ${m%60}m` : `${m}m ${String(s).padStart(2,'0')}s`;
+}
+
+function ago(ts) {
+  if (!ts) return 'never';
+  const d = Date.now() / 1000 - ts;
+  if (d < 60) return `${Math.floor(d)}s ago`;
+  if (d < 3600) return `${Math.floor(d/60)}m ago`;
+  return `${Math.floor(d/3600)}h ago`;
+}
+
+// Realtime factor is the headline health number: GPU-seconds spent per second of audio.
+// Under 1.0 means transcription outruns the lecture; above 1.0 means it's falling behind
+// and the live view will drift further back the longer the session runs.
+function rtfClass(rtf) {
+  if (!rtf) return '';
+  if (rtf < 0.6) return 'good';
+  if (rtf < 1.0) return 'warn';
+  return 'bad';
+}
+
+const serviceClass = v =>
+  /available|running|enabled|key set/.test(v) ? 'good'
+  : /unavailable|no key|error|not installed/.test(v) ? 'bad' : 'warn';
+
+// -1, not 0: the transcript pane is only re-rendered when the line count changes, so
+// starting at 0 would match an empty first poll and skip drawing the placeholder.
+let lastTranscriptCount = -1;
+
+async function poll() {
+  let data;
+  try {
+    data = await (await fetch('/api/status')).json();
+    document.getElementById('poll-state').className = 'chip good';
+    document.getElementById('poll-state').textContent = 'live';
+  } catch {
+    document.getElementById('poll-state').className = 'chip bad';
+    document.getElementById('poll-state').textContent = 'dashboard offline';
+    return;
+  }
+
+  const active = !!data.active;
+  const stale = data.updated_at && (Date.now()/1000 - data.updated_at) > 30;
+  const banner = document.getElementById('banner');
+  banner.className = 'live-banner' + (active && !stale ? ' recording' : '');
+
+  document.getElementById('banner-title').textContent =
+    !data.updated_at ? 'No session recorded yet'
+    : active && !stale ? `Recording · ${data.class_code} — ${data.class_title}`
+    : active && stale ? `${data.class_code} — no heartbeat (recorder may have exited)`
+    : `Idle · last session: ${data.class_code || '—'}`;
+
+  document.getElementById('banner-sub').textContent = !data.updated_at ? ''
+    : [active ? duration(data.elapsed) : `ended ${ago(data.updated_at)}`,
+       data.source === 'mic' ? 'microphone' : data.source === 'system' ? 'system audio' : '',
+       data.formatting_mode ? `${data.formatting_mode} formatting` : '',
+       data.whisper_device].filter(Boolean).join(' · ');
+
+  document.getElementById('btn-save').disabled = !active || stale;
+  document.getElementById('btn-stop').disabled = !active || stale;
+
+  document.getElementById('session-metrics').innerHTML =
+    metric('Elapsed', active ? duration(data.elapsed) : '—') +
+    metric('Chunks', data.chunks_transcribed ?? 0, `${data.segments_transcribed ?? 0} segments`) +
+    metric('Audio processed', duration(data.audio_seconds_transcribed)) +
+    metric('Saves', data.saves_completed ?? 0,
+           data.last_save_method ? `last: ${data.last_save_method} · ${ago(data.last_save_at)}` : 'none yet') +
+    metric('Silent chunks', data.consecutive_silent_chunks ?? 0,
+           (data.consecutive_silent_chunks ?? 0) > 3 ? 'check the mic' : 'in a row',
+           (data.consecutive_silent_chunks ?? 0) > 3 ? 'warn' : '');
+
+  const rtf = data.realtime_factor ?? 0;
+  document.getElementById('perf-metrics').innerHTML =
+    metric('Realtime factor', rtf ? rtf.toFixed(2) + '×' : '—',
+           rtf ? (rtf < 1 ? `${(1/rtf).toFixed(1)}× faster than realtime` : 'falling behind') : '',
+           rtfClass(rtf)) +
+    metric('Last chunk', data.last_chunk_duration ? data.last_chunk_duration.toFixed(1) + 's' : '—',
+           data.last_chunk_seconds ? `${data.last_chunk_seconds}s of audio` : '') +
+    metric('Transcribe queue', data.queue_transcription ?? 0,
+           (data.queue_transcription ?? 0) > 2 ? 'backlog building' : 'keeping up',
+           (data.queue_transcription ?? 0) > 2 ? 'warn' : '') +
+    metric('Save queue', data.queue_saves ?? 0) +
+    metric('GPU time', duration(data.transcribe_seconds_spent));
+
+  const services = data.services || {};
+  document.getElementById('services').innerHTML = Object.entries(services).map(([k, v]) =>
+    `<span class="chip ${serviceClass(v)}">${esc(k.replace(/_/g,' '))}: ${esc(v)}</span>`).join('');
+
+  const t = document.getElementById('transcript');
+  const lines = data.transcript || [];
+  if (lines.length !== lastTranscriptCount) {
+    lastTranscriptCount = lines.length;
+    t.innerHTML = lines.map(l =>
+      `<div class="row"><span class="ts">${esc(l.time)}</span><span class="msg">${esc(l.text)}</span></div>`).join('')
+      || '<div class="muted">Nothing transcribed yet.</div>';
+    if (document.getElementById('autoscroll').checked) t.scrollTop = t.scrollHeight;
+  }
+
+  const e = document.getElementById('events');
+  e.innerHTML = (data.events || []).map(ev =>
+    `<div class="row"><span class="ts">${esc(ev.time)}</span><span class="msg ${esc(ev.level)}">${esc(ev.message)}</span></div>`)
+    .join('') || '<div class="muted">No events yet.</div>';
+}
+
+async function send(action, btn) {
+  btn.disabled = true;
+  await fetch('/api/command', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action }),
+  });
+  setTimeout(poll, 300);
+}
+document.getElementById('btn-save').onclick = e => send('save_now', e.target);
+document.getElementById('btn-stop').onclick = e => send('stop', e.target);
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
