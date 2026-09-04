@@ -154,6 +154,37 @@ session itself. Requirements:
 """
 
 
+# Phrases that mean the model replied ABOUT the task instead of doing it - asking for
+# permission, offering to proceed, describing what it would write. Every call in this
+# module asks for content directly (notes, a corrected transcript, a study guide, JSON),
+# so none of them should ever come back as a message to the user.
+_CHATTER_PHRASES = (
+    "grant permission", "needs your approval", "need your approval",
+    "let me know if", "i'll proceed", "i will proceed", "would you like me to",
+    "i've drafted", "i have drafted", "ready to write", "shall i",
+)
+
+
+def _looks_like_assistant_chatter(text: str) -> bool:
+    """Catches a real, confirmed failure: `claude -p` sometimes decides to act as an
+    agent, tries to write the file itself, hits a permission gate it can't clear
+    headlessly, and returns "I've drafted ... please grant permission to write to
+    notes/BIOL_1440.md" as its answer. That text was then saved verbatim as if it were
+    the lecture notes, and a whole lecture's content was lost until it was recovered
+    from audio. --disallowedTools now prevents the cause; this catches the shape of the
+    failure regardless of cause, so it can't silently reach a file again.
+
+    Deliberately requires BOTH a permission/offer phrase AND an absence of markdown
+    structure: real notes are full of bullets and headings, and a lecture could
+    legitimately quote an instructor saying something like "let me know if...". Needing
+    both keeps this from rejecting genuine content."""
+    lowered = text.lower()
+    if not any(phrase in lowered for phrase in _CHATTER_PHRASES):
+        return False
+    has_structure = any(line.lstrip().startswith(("-", "*", "#")) for line in text.splitlines())
+    return not has_structure
+
+
 def _try_claude_cli_format(prompt: str) -> str | None:
     """Returns clean markdown via the Claude Code CLI (subscription usage), or None if unusable."""
     cli = _find_claude_cli()
@@ -171,7 +202,9 @@ def _try_claude_cli_format(prompt: str) -> str | None:
         if result.returncode != 0:
             return None
         text = result.stdout.strip()
-        return text or None
+        if not text or _looks_like_assistant_chatter(text):
+            return None  # treated exactly like a failed call, so the caller falls through
+        return text
     except Exception:
         # CLI not logged in, timed out, offline, etc. -> fall back.
         return None
@@ -194,8 +227,10 @@ def _try_claude_api_format(prompt: str) -> str | None:
             max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(block.text for block in resp.content if hasattr(block, "text"))
-        return text.strip() or None
+        text = "".join(block.text for block in resp.content if hasattr(block, "text")).strip()
+        if not text or _looks_like_assistant_chatter(text):
+            return None
+        return text
     except Exception:
         # Offline, invalid key, rate-limited, etc. -> fall back to local formatting.
         return None

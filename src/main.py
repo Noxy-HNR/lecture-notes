@@ -74,6 +74,20 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
 
 AUTOSAVE_EVERY_SECONDS = 5 * 60  # flush partial notes periodically, not just at the end
+
+# Automatic retention for state/ backups, applied once at the end of each session.
+# Audio is essentially all of the disk cost (~70MB per lecture, ~1GB after two weeks)
+# while the raw transcript logs are a few KB each - so audio ages out and transcripts
+# are kept indefinitely. Transcripts are also the more useful half to keep long-term:
+# they're what --search reads, and they stay searchable years later for the price of
+# almost nothing.
+#
+# 30 days is deliberately far longer than the window in which the .wav actually matters.
+# Its job is recovery when a save goes wrong (which happened twice in real use, both
+# recovered from audio the same day) - notes are generated the day of the lecture, so
+# a month-old recording has long since done its job. Set AUDIO_RETENTION_DAYS = 0 to
+# turn automatic pruning off entirely.
+AUDIO_RETENTION_DAYS = 30
 SAVE_NOW_KEY = b"s"
 
 
@@ -668,6 +682,35 @@ def list_session_backups():
 
         print(f"  {class_code:<16} {when:<12} {audio_note}")
         print(c.dim(f"    --resume \"{wav_path if wav_path.exists() else raw_path}\""))
+
+
+def auto_prune_audio() -> None:
+    """Ages out old .wav backups at the end of a session, keeping raw transcripts.
+    Announces exactly what it removed rather than doing it silently - this deletes real
+    recordings, so it should never be something the user discovers later and can't
+    account for. Never raises: this runs during shutdown, after the notes are already
+    safely written, and a housekeeping failure must not take the exit path down with it."""
+    if AUDIO_RETENTION_DAYS <= 0:
+        return
+    try:
+        cutoff = time.time() - AUDIO_RETENTION_DAYS * 86400
+        old = [p for p in STATE_DIR.glob("*.wav") if p.stat().st_mtime < cutoff]
+        if not old:
+            return
+        freed = sum(p.stat().st_size for p in old)
+        removed = 0
+        for path in old:
+            try:
+                path.unlink()
+                removed += 1
+            except Exception:
+                pass  # locked/in use - it'll age out on a later run
+        if removed:
+            print(c.dim(f"Housekeeping: removed {removed} audio backup(s) older than "
+                         f"{AUDIO_RETENTION_DAYS} days, freeing {freed / 1e9:.2f}GB "
+                         f"(transcripts kept)."))
+    except Exception:
+        pass
 
 
 def prune_backups(older_than_days: int, confirm: bool):
@@ -1334,6 +1377,8 @@ def run():
 
         tel.add_event("info", f"Session ended after {session.elapsed()/60:.1f} min")
         tel.end_session()  # dashboard flips to "idle" and disables its controls
+
+        auto_prune_audio()  # last, so it can never delay or endanger saving the notes
 
 
 def _save(cls, session: Session, session_date, mode, note="", is_final=False,
