@@ -443,66 +443,86 @@ def _check_whisper_model() -> tuple[bool, str]:
         return True, c.error(f"  Whisper model FAILED to load: {e}")
 
 
-def run_preflight_checks(source: str, formatting_mode: str = "auto") -> bool:
-    """Quick sanity checks before committing to a recording session, so a broken mic
-    or a dead GPU shows up now - not silently mid-lecture, which is how most of this
-    app's real bugs actually surfaced. Warnings don't block starting; only a genuinely
-    unusable audio device or a Whisper model that fails to load does (returns False).
+class PreflightRunner:
+    """Same sanity checks as before (audio device, disk space, Whisper model load, and -
+    "local" mode only - the local GPU formatter's warm-up), but started as early as
+    possible instead of all at once right before recording. The interactive prompts
+    between "record a lecture" and actually starting (which class, which audio source,
+    which formatting mode) involve real wall-clock time spent waiting on the user to
+    type an answer - dead time that was previously wasted, since none of these checks
+    used to start until every prompt had already been answered.
 
-    The checks run concurrently (audio device, disk space, Whisper model load, and -
-    "local" mode only - the local GPU formatter's warm-up) since they touch entirely
-    independent subsystems (WASAPI, filesystem, GPU) with no shared state - safe to
-    parallelize. Whisper's load time dominates (several seconds, especially cold), so
-    overlapping the ~3s audio sample against it is a real, free time saving rather than
-    just running things concurrently for its own sake. Results are printed in a fixed
-    order after all finish, not in completion order, so the output stays consistent run
-    to run."""
-    print(c.heading("Running preflight checks..."))
-    ok = True
+    __init__ kicks off the two checks that don't depend on any user choice (disk space,
+    and Whisper model load - the slowest of the four, especially cold) immediately.
+    start_audio_check()/start_gpu_warmup() kick off the other two as soon as their own
+    answer (source / formatting_mode) is known, rather than waiting for every remaining
+    prompt too. finish() is the only thing that prints anything - it starts any check
+    that didn't get an early opportunity (so this class is still correct and safe to use
+    even if a caller skips the early start_*() calls entirely), then waits for and prints
+    every result together in the same fixed order as before, so the visible checks-then-
+    result output is unchanged; only the wall-clock time to get there shrinks."""
 
-    if source == "mic":
-        # Runs synchronously, before the mic gets opened by the audio-device check below -
-        # if the mic is muted at the OS level, this clears it first so that check actually
-        # picks up real audio instead of reporting silence. Only covers OS-level mute (see
-        # mic_mute.py docstring for what it can't see - hardware switches, app-level mutes).
-        if mic_mute.check_and_unmute() == "unmuted":
-            print(c.warning("  Microphone was muted at the system level - unmuted it automatically."))
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._disk_future = self._executor.submit(_check_disk_space)
+        self._whisper_future = self._executor.submit(_check_whisper_model)
+        self._audio_future = None
+        self._gpu_future = None
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        audio_future = executor.submit(_check_audio_device, source)
-        disk_future = executor.submit(_check_disk_space)
-        whisper_future = executor.submit(_check_whisper_model)
+    def start_audio_check(self, source: str):
+        if self._audio_future is not None:
+            return
+        if source == "mic":
+            # Synchronous, and must happen before the mic gets opened by the audio-device
+            # check below - if muted at the OS level, this clears it first so that check
+            # actually picks up real audio instead of reporting silence. Only covers
+            # OS-level mute (see mic_mute.py docstring for what it can't see).
+            if mic_mute.check_and_unmute() == "unmuted":
+                print(c.warning("  Microphone was muted at the system level - unmuted it automatically."))
+        self._audio_future = self._executor.submit(_check_audio_device, source)
+
+    def start_gpu_warmup(self, formatting_mode: str):
+        if self._gpu_future is not None:
+            return
         # Only in "local" mode is this tier guaranteed to be needed - in "auto" mode
         # it's a fallback that's usually never touched (Claude CLI/API handle
         # everything), so warming it up there would just burn VRAM/startup time for
         # nothing in the common case. See gpu_formatter.warm_up() for the full reasoning.
-        gpu_future = (executor.submit(gpu_formatter.warm_up)
-                      if formatting_mode == "local" and gpu_formatter.available() else None)
+        if formatting_mode == "local" and gpu_formatter.available():
+            self._gpu_future = self._executor.submit(gpu_formatter.warm_up)
 
-        blocks, msg = audio_future.result()
+    def finish(self, source: str, formatting_mode: str) -> bool:
+        self.start_audio_check(source)
+        self.start_gpu_warmup(formatting_mode)
+
+        print(c.heading("Running preflight checks..."))
+        ok = True
+
+        blocks, msg = self._audio_future.result()
         print(msg)
         ok = ok and not blocks
 
-        disk_msg = disk_future.result()
+        disk_msg = self._disk_future.result()
         if disk_msg is not None:
             print(disk_msg)
 
-        blocks, msg = whisper_future.result()
+        blocks, msg = self._whisper_future.result()
         print(msg)
         ok = ok and not blocks
 
-        if gpu_future is not None:
+        if self._gpu_future is not None:
             print(c.success("  Local GPU formatter warmed up and ready.")
-                  if gpu_future.result() else
+                  if self._gpu_future.result() else
                   c.warning("  Local GPU formatter failed to warm up - will retry lazily when actually needed."))
 
-    if diarize.available():
-        print(c.info("  Speaker diarization: enabled (HUGGINGFACE_TOKEN set)"))
-    else:
-        print(c.dim("  Speaker diarization: off (set HUGGINGFACE_TOKEN to enable Q&A speaker labeling)"))
+        if diarize.available():
+            print(c.info("  Speaker diarization: enabled (HUGGINGFACE_TOKEN set)"))
+        else:
+            print(c.dim("  Speaker diarization: off (set HUGGINGFACE_TOKEN to enable Q&A speaker labeling)"))
 
-    print()
-    return ok
+        print()
+        self._executor.shutdown(wait=False)
+        return ok
 
 
 def _resume_backup_paths(given: Path) -> tuple[Path, Path, str, str]:
@@ -945,13 +965,21 @@ def run():
         run_flashcards(choose_notes_class(args))
         return
 
+    # Starts the checks that don't depend on any answer below (disk space, Whisper model
+    # load - the slowest of the four) right now, so they run during the wall-clock time
+    # spent waiting on the user to answer the prompts below instead of only starting
+    # once every prompt is already answered.
+    preflight = PreflightRunner()
+
     cls = choose_class(args)
     source = choose_source(args)
+    preflight.start_audio_check(source)  # don't wait for the formatting-mode prompt too
     formatting_mode = choose_formatting_mode(args)
+    preflight.start_gpu_warmup(formatting_mode)
     initial_prompt = vocab_module.initial_prompt_for_class(cls["code"])
 
     print()
-    if not run_preflight_checks(source, formatting_mode):
+    if not preflight.finish(source, formatting_mode):
         print(c.error("Preflight checks failed - fix the issue above before recording "
                        "(this prevents starting a session that would silently fail)."))
         sys.exit(1)
