@@ -264,6 +264,52 @@ class SaveWorker:
         self._queue.join()
 
 
+class TranscriptionWorker:
+    """Runs RollingTranscriber.process() (the blocking Whisper inference call) on a
+    background thread, so the main loop is never stuck inside it - it can immediately go
+    back to the interruptible capture.collect_chunk() wait, instead of only checking for
+    a Ctrl+C/save-now keypress once the current chunk's transcription happens to finish.
+    Confirmed live: that could add several real seconds of extra delay before a
+    keypress registered, on top of the resolved-elsewhere autosave stall.
+
+    Chunks are processed strictly one at a time, in submission order (single worker
+    thread + ordered queue, not a thread pool) - RollingTranscriber keeps rolling state
+    (overlap audio, recent text, silence counter) across calls that only makes sense if
+    calls happen in the same order the audio was captured; two chunks processed out of
+    order, or concurrently, would corrupt that state.
+
+    `on_result(chunk_audio, whisper_segments)` runs on the worker thread for each chunk,
+    in order - the caller is expected to do its printing/session-writing/silence-check
+    there. Since only this one thread ever calls it, none of that needs its own lock."""
+
+    def __init__(self, transcriber: "RollingTranscriber", on_result):
+        self._transcriber = transcriber
+        self._on_result = on_result
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="transcription-worker")
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            chunk_audio = self._queue.get()
+            try:
+                whisper_segments = self._transcriber.process(chunk_audio)
+                self._on_result(chunk_audio, whisper_segments)
+            except Exception as e:
+                print(c.error(f"Transcription failed for a chunk (continuing): {e}"))
+            finally:
+                self._queue.task_done()
+
+    def submit(self, chunk_audio):
+        self._queue.put(chunk_audio)
+
+    def has_pending(self) -> bool:
+        return not self._queue.empty()
+
+    def wait_idle(self):
+        self._queue.join()
+
+
 class SaveNowListener:
     """Background thread that watches for a keypress (Windows console only, via
     msvcrt - no Enter needed, a raw keystroke is enough) to request an immediate
@@ -300,12 +346,19 @@ class Session:
     just flush plain transcript text (no diarization - see pop_pending_text for why);
     the final save at session end can instead re-diarize the WHOLE session (see
     run()'s shutdown sequence) using all_segments, which - unlike pending_segments -
-    is never cleared, so it always has the complete session's transcript available."""
+    is never cleared, so it always has the complete session's transcript available.
+
+    write_chunk() and pop_pending_text() can now run on different threads at the same
+    time (chunk transcription moved to a background TranscriptionWorker, and an autosave
+    can fire from the main loop while a later chunk is still being written) - _lock
+    protects every read/mutation of the shared frame counters and segment lists so the
+    two never corrupt each other's view of the session."""
 
     def __init__(self, wav_path):
         self.wav_path = wav_path
         self._sf = sf.SoundFile(str(wav_path), mode="w", samplerate=audio.SAMPLE_RATE,
                                  channels=1, subtype="FLOAT")
+        self._lock = threading.Lock()
         self.total_frames = 0
         self.last_save_frame = 0
         self.last_save_elapsed = 0.0
@@ -319,41 +372,54 @@ class Session:
     def flush(self):
         self._sf.flush()
 
+    def has_pending(self) -> bool:
+        with self._lock:
+            return bool(self.pending_segments)
+
     def write_chunk(self, chunk_audio, whisper_segments):
-        chunk_offset = self.total_frames / audio.SAMPLE_RATE
-        self._sf.write(chunk_audio)
-        self.total_frames += len(chunk_audio)
-        for seg in whisper_segments:
-            entry = {
-                "start": chunk_offset + seg["start"],
-                "end": chunk_offset + seg["end"],
-                "text": seg["text"],
-            }
-            self.pending_segments.append(entry)
-            self.all_segments.append(entry)
+        with self._lock:
+            chunk_offset = self.total_frames / audio.SAMPLE_RATE
+            self._sf.write(chunk_audio)
+            self.total_frames += len(chunk_audio)
+            for seg in whisper_segments:
+                entry = {
+                    "start": chunk_offset + seg["start"],
+                    "end": chunk_offset + seg["end"],
+                    "text": seg["text"],
+                }
+                self.pending_segments.append(entry)
+                self.all_segments.append(entry)
 
     def pop_pending_text(self, run_diarization: bool = False) -> str:
         """Returns speaker-labeled (if diarization succeeds and run_diarization=True) or
         plain transcript text for everything recorded since the last save, and resets
         the save window.
 
-        run_diarization defaults to False deliberately: the whole app is single-threaded,
-        so running diarization here blocks audio capture for however long it takes - on
-        a real multi-minute autosave window that was found to be minutes long, silently
-        losing whatever was actually said during the gap. Diarization is not real-time
-        (pyannote needs a complete clip to compute speaker segments, it can't label
-        speakers incrementally), so there was never a live-transcription benefit being
-        traded away here - only autosaves being pointlessly slow and lossy. Callers
-        should only pass True for the final save at the end of a session, after
-        recording has already stopped."""
-        if not self.pending_segments:
-            return ""
+        Only the quick part (snapshotting pending segments, resetting the window) holds
+        _lock - diarization (when run_diarization=True) does slow file I/O and GPU
+        inference against a local snapshot instead, so it never blocks a concurrent
+        write_chunk() call from a still-running TranscriptionWorker. In practice that
+        never actually happens today: run_diarization=True is only ever passed for the
+        final save, by which point the caller has already drained the transcription
+        worker - but the snapshot-then-release pattern keeps this correct regardless of
+        when it's called, not just under today's call sites.
 
-        window_start_sec = self.last_save_elapsed
-        window_start_frame = self.last_save_frame
-        window_end_frame = self.total_frames
-
-        text = " ".join(seg["text"] for seg in self.pending_segments)
+        run_diarization defaults to False deliberately: diarization needs a complete
+        clip to compute speaker segments (it can't label speakers incrementally), so
+        there's no live-transcription benefit to running it on every autosave - only
+        cost. Callers should only pass True for the final save at the end of a session,
+        after recording has already stopped."""
+        with self._lock:
+            if not self.pending_segments:
+                return ""
+            window_start_sec = self.last_save_elapsed
+            window_start_frame = self.last_save_frame
+            window_end_frame = self.total_frames
+            pending_snapshot = self.pending_segments
+            text = " ".join(seg["text"] for seg in pending_snapshot)
+            self.last_save_frame = self.total_frames
+            self.last_save_elapsed = self.elapsed()
+            self.pending_segments = []
 
         if run_diarization and diarize.available() and window_end_frame > window_start_frame:
             self._sf.flush()
@@ -369,7 +435,7 @@ class Session:
                     relative_segments = [
                         {"start": s["start"] - window_start_sec, "end": s["end"] - window_start_sec,
                          "text": s["text"]}
-                        for s in self.pending_segments
+                        for s in pending_snapshot
                     ]
                     labeled = diarize.assign_speakers(relative_segments, diar_segments)
                     labeled_text = diarize.to_labeled_transcript(labeled)
@@ -380,9 +446,6 @@ class Session:
             finally:
                 clip_path.unlink(missing_ok=True)
 
-        self.last_save_frame = self.total_frames
-        self.last_save_elapsed = self.elapsed()
-        self.pending_segments = []
         return text
 
     def close(self):
@@ -1028,25 +1091,38 @@ def run():
     save_listener.start()
     save_worker = SaveWorker()
 
+    def _handle_transcription_result(chunk_audio, whisper_segments):
+        nonlocal silence_warned
+        session.write_chunk(chunk_audio, whisper_segments)
+        for seg in whisper_segments:
+            stamp = time.strftime("%H:%M:%S")
+            print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
+            with open(raw_log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {seg['text']}\n")
+
+        silent_seconds = transcriber.consecutive_silent_chunks * args.chunk
+        if silent_seconds >= SILENCE_WARNING_SECONDS and not silence_warned:
+            print(c.warning(f"No audio detected for ~{silent_seconds/60:.1f} min - "
+                             f"check your {'microphone' if source == 'mic' else 'system audio'} "
+                             f"source (muted? disconnected?)."))
+            silence_warned = True
+        elif transcriber.consecutive_silent_chunks == 0:
+            silence_warned = False
+
+    transcription_worker = TranscriptionWorker(transcriber, _handle_transcription_result)
+
     try:
         while True:
             chunk_audio = capture.collect_chunk(args.chunk, interrupt_event=save_listener.requested)
             for err in capture.poll_errors():
                 print(c.error(f"Audio device error (auto-recovering, capture continues): {err}"))
 
-            whisper_segments = []
             if chunk_audio is not None:
-                whisper_segments = transcriber.process(chunk_audio)
-                session.write_chunk(chunk_audio, whisper_segments)
-                for seg in whisper_segments:
-                    stamp = time.strftime("%H:%M:%S")
-                    print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
-                    with open(raw_log_path, "a", encoding="utf-8") as f:
-                        f.write(f"[{stamp}] {seg['text']}\n")
+                transcription_worker.submit(chunk_audio)
 
             if save_listener.requested.is_set():
                 save_listener.requested.clear()
-                if session.pending_segments:
+                if session.has_pending():
                     print(c.autosave(f"\n'{SAVE_NOW_KEY.decode()}' pressed - saving now..."))
                     _save(cls, session, session_date, formatting_mode, note="(manual save)",
                           save_worker=save_worker)
@@ -1058,16 +1134,7 @@ def run():
             if chunk_audio is None:
                 continue  # nothing captured yet (e.g. very start) - keep waiting
 
-            silent_seconds = transcriber.consecutive_silent_chunks * args.chunk
-            if silent_seconds >= SILENCE_WARNING_SECONDS and not silence_warned:
-                print(c.warning(f"No audio detected for ~{silent_seconds/60:.1f} min - "
-                                 f"check your {'microphone' if source == 'mic' else 'system audio'} "
-                                 f"source (muted? disconnected?)."))
-                silence_warned = True
-            elif transcriber.consecutive_silent_chunks == 0:
-                silence_warned = False
-
-            if time.time() - last_autosave > AUTOSAVE_EVERY_SECONDS and session.pending_segments:
+            if time.time() - last_autosave > AUTOSAVE_EVERY_SECONDS and session.has_pending():
                 _save(cls, session, session_date, formatting_mode, note="(autosave)",
                       save_worker=save_worker)
                 last_autosave = time.time()
@@ -1085,6 +1152,15 @@ def run():
         _step("Stopping audio capture...")
         capture.stop()
         print(c.dim("  capture thread stopped."))
+
+        # Drain any chunks still queued for background transcription before touching
+        # `transcriber` directly below (tail-audio processing) or reading
+        # session.all_segments further down - RollingTranscriber's rolling state
+        # (overlap audio, recent text) only makes sense processed in capture order, and
+        # a still-in-flight chunk's segments wouldn't be in the session yet otherwise.
+        if transcription_worker.has_pending():
+            _step("Waiting for background transcription to catch up...")
+        transcription_worker.wait_idle()
 
         tail_audio = capture.drain_available()
         if tail_audio is not None and len(tail_audio) > 0:
