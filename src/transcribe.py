@@ -8,6 +8,13 @@ MODEL_SIZE = "large-v3"  # best available accuracy - GPU (RTX 5070 Ti) makes thi
 BEAM_SIZE = 8             # wider search than the default (5) for slightly better decoding
                           # accuracy - cheap given the GPU headroom on this machine.
 
+# Whether Whisper carries its own previous output forward as context within a chunk.
+# Off: each chunk decodes without inheriting earlier text, which prevents a single
+# mis-transcription from propagating and compounding (Whisper's classic failure mode is
+# looping/hallucinating once it goes off the rails). Module-level so tools/ can A/B it
+# against real audio rather than the setting being an untested assumption.
+CONDITION_ON_PREVIOUS_TEXT = False
+
 
 def get_model():
     global _model
@@ -73,7 +80,7 @@ def transcribe_chunk_segments(audio, sample_rate=16000, initial_prompt: str | No
         audio,
         language="en",
         vad_filter=True,          # skip silence instead of hallucinating text
-        condition_on_previous_text=False,
+        condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
         initial_prompt=initial_prompt,
         beam_size=BEAM_SIZE,
         repetition_penalty=1.1,   # mild nudge against the decoder looping on short phrases
