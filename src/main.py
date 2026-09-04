@@ -1135,6 +1135,11 @@ def run():
                 continue  # nothing captured yet (e.g. very start) - keep waiting
 
             if time.time() - last_autosave > AUTOSAVE_EVERY_SECONDS and session.has_pending():
+                # Printed the instant this kicks off, not just when it finishes - the
+                # save itself runs on save_worker's background thread now, so without
+                # this it could look like nothing was happening for however long that
+                # takes, then a "Saved..." line would just appear out of nowhere.
+                print(c.autosave("\n(autosaving in background...)"))
                 _save(cls, session, session_date, formatting_mode, note="(autosave)",
                       save_worker=save_worker)
                 last_autosave = time.time()

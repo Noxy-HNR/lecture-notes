@@ -15,9 +15,12 @@ Setup (one-time):
                      local_dir="state/llama_model")
 
 format_transcript()/condense_transcript() start the server automatically on first use
-(a few seconds - no NPU-style ahead-of-time compilation) and reuse it for the rest of
-the process's lifetime. Call stop_server() to shut it down (e.g. at app exit) so it
-doesn't sit in the background holding ~3.6GB of VRAM after the app closes.
+(a few seconds - no NPU-style ahead-of-time compilation). An idle-shutdown watchdog
+stops it automatically after IDLE_TIMEOUT_SECONDS of disuse, so a session where this
+tier is only ever a transient fallback (Claude CLI/API hiccup, then recovers) doesn't
+keep it holding ~3.4GB of VRAM for the rest of the session; it starts right back up on
+the next call if needed. Call stop_server() directly to shut it down immediately (e.g.
+at app exit, via the atexit hook this module registers on startup).
 
 Model notes: this replaced an earlier NPU-based tier (Phi-3.5-mini via OpenVINO) that
 was rolled back after repeated reliability failures on the real pipeline - degenerate
@@ -31,6 +34,7 @@ integrated graphics, not NVIDIA - a separate discovery) has been reliable in tes
 import atexit
 import json
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -53,7 +57,20 @@ STARTUP_TIMEOUT_SECONDS = 30
 CONTEXT_SIZE = 32768
 REQUEST_TIMEOUT_SECONDS = 180  # was 60 - too tight once output scales with input (below)
 
+# How long the server can sit unused before the idle watchdog shuts it down. This tier
+# is usually only a transient fallback (Claude CLI/API hiccups, then recovers) - without
+# this, one brief fallback anywhere in a session left it holding ~3.4GB of VRAM and idle
+# GPU power draw for the rest of that session even after CLI/API were working fine again
+# for everything since. 10 minutes is comfortably longer than a real autosave interval
+# (5 min), so a session actually still using this tier regularly never gets interrupted.
+IDLE_TIMEOUT_SECONDS = 600
+_WATCHDOG_POLL_SECONDS = 60  # module-level so tests can shrink both this and the
+                             # timeout above to verify real shutdown timing quickly,
+                             # without waiting out the real 10-minute window
+
 _server_process = None
+_last_used = 0.0
+_watchdog_stop_event = None
 
 
 def available() -> bool:
@@ -76,6 +93,37 @@ def _server_healthy() -> bool:
             return json.loads(resp.read()).get("status") == "ok"
     except Exception:
         return False
+
+
+def _touch():
+    """Marks the server as just-used, resetting the idle-shutdown clock. Called both
+    when the server is confirmed up (warm_up() or the first real call starting it - so
+    the idle window starts counting from "just started", not from a stale/zero
+    timestamp that would let the watchdog kill it before it's ever actually used) and
+    on every real _chat() call (so genuine ongoing use keeps it alive)."""
+    global _last_used
+    _last_used = time.time()
+
+
+def _start_idle_watchdog():
+    """One watchdog thread per server start, stopped and replaced whenever the server
+    is (re)started - not a single long-lived thread, since a plain threading.Event can
+    only ever transition low->high once and needs to be fresh for each server
+    lifetime."""
+    global _watchdog_stop_event
+    stop_event = threading.Event()
+    _watchdog_stop_event = stop_event
+
+    def _loop():
+        # wait() returns True (and exits the loop) as soon as stop_event is set, or
+        # False after each poll interval - so this reacts to stop_server() promptly
+        # instead of sleeping through it.
+        while not stop_event.wait(_WATCHDOG_POLL_SECONDS):
+            if time.time() - _last_used > IDLE_TIMEOUT_SECONDS:
+                stop_server()
+                return
+
+    threading.Thread(target=_loop, daemon=True, name="gpu-formatter-idle-watchdog").start()
 
 
 def _ensure_server_running() -> bool:
@@ -101,13 +149,18 @@ def _ensure_server_running() -> bool:
     deadline = time.time() + STARTUP_TIMEOUT_SECONDS
     while time.time() < deadline:
         if _server_healthy():
+            _touch()
+            _start_idle_watchdog()
             return True
         time.sleep(0.5)
     return False
 
 
 def stop_server():
-    global _server_process
+    global _server_process, _watchdog_stop_event
+    if _watchdog_stop_event is not None:
+        _watchdog_stop_event.set()
+        _watchdog_stop_event = None
     if _server_process is not None and _server_process.poll() is None:
         _server_process.terminate()
         try:
@@ -120,6 +173,8 @@ def stop_server():
 def _chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
     if not _ensure_server_running():
         return None
+    _touch()  # real use - covers the case where the server was already running/warmed
+              # up (the _ensure_server_running() early-return path doesn't touch it itself)
     payload = {
         "messages": [
             {"role": "system", "content": system_prompt},
