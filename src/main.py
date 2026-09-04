@@ -27,6 +27,7 @@ every few minutes) even if you stop abruptly.
 """
 import argparse
 import os
+import queue
 import random
 import re
 import shutil
@@ -218,6 +219,48 @@ class RollingTranscriber:
         self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
 
         return kept
+
+
+class SaveWorker:
+    """Runs the slow part of a save (notes.format_and_save, which can block for however
+    long a Claude CLI/API call takes - up to CLI_TIMEOUT_SECONDS = 180s) on a background
+    thread, so an autosave doesn't stall the main loop from pulling new audio off the
+    capture queue and printing/transcribing it. Confirmed live: the main loop visibly
+    stopped producing new transcript lines for the whole duration of a slow autosave -
+    audio itself was never lost (capture.py's own thread keeps buffering regardless of
+    what the main loop is doing), but live output and the save itself both stalled.
+
+    Jobs run strictly one at a time, in submission order (a plain queue + a single
+    worker thread, not a thread pool) - two saves running concurrently could interleave
+    writes to the same notes file and corrupt it. wait_idle() blocks until every
+    submitted job has finished; call it before anything that reads the notes file
+    (the final Ctrl+C save, full-session diarization's truncation, the condense pass)
+    so none of them can run against a file a still-in-flight autosave hasn't finished
+    writing to yet."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="save-worker")
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            job = self._queue.get()
+            try:
+                job()
+            except Exception as e:
+                print(c.error(f"Background save failed: {e}"))
+            finally:
+                self._queue.task_done()
+
+    def submit(self, job):
+        self._queue.put(job)
+
+    def has_pending(self) -> bool:
+        return not self._queue.empty()
+
+    def wait_idle(self):
+        self._queue.join()
 
 
 class SaveNowListener:
@@ -942,6 +985,7 @@ def run():
 
     save_listener = SaveNowListener()
     save_listener.start()
+    save_worker = SaveWorker()
 
     try:
         while True:
@@ -963,7 +1007,8 @@ def run():
                 save_listener.requested.clear()
                 if session.pending_segments:
                     print(c.autosave(f"\n'{SAVE_NOW_KEY.decode()}' pressed - saving now..."))
-                    _save(cls, session, session_date, formatting_mode, note="(manual save)")
+                    _save(cls, session, session_date, formatting_mode, note="(manual save)",
+                          save_worker=save_worker)
                 else:
                     print(c.dim(f"\n'{SAVE_NOW_KEY.decode()}' pressed, but nothing new to save yet."))
                 last_autosave = time.time()  # reset either way - that's what was asked for
@@ -982,7 +1027,8 @@ def run():
                 silence_warned = False
 
             if time.time() - last_autosave > AUTOSAVE_EVERY_SECONDS and session.pending_segments:
-                _save(cls, session, session_date, formatting_mode, note="(autosave)")
+                _save(cls, session, session_date, formatting_mode, note="(autosave)",
+                      save_worker=save_worker)
                 last_autosave = time.time()
     except KeyboardInterrupt:
         print(c.autosave("\nStopping - wrapping up your notes now, this can take a moment..."))
@@ -1011,6 +1057,11 @@ def run():
                 with open(raw_log_path, "a", encoding="utf-8") as f:
                     f.write(f"[{stamp}] {seg['text']}\n")
             print(c.dim(f"  {len(whisper_segments)} segment(s) transcribed from the tail."))
+
+        if save_worker.has_pending():
+            _step("Waiting for a still-in-flight background autosave to finish...")
+        save_worker.wait_idle()  # nothing below this point may run against the notes file
+                                  # until every prior background autosave has actually written it
 
         used_full_diarization = False
         if diarize.available() and session.all_segments:
@@ -1065,21 +1116,36 @@ def run():
         print(c.dim(f"Audio backup: {wav_path}"))
 
 
-def _save(cls, session: Session, session_date, mode, note="", is_final=False):
+def _save(cls, session: Session, session_date, mode, note="", is_final=False,
+          save_worker: "SaveWorker | None" = None):
+    """pop_pending_text() always runs synchronously on the calling thread right now, so
+    it correctly snapshots whatever's pending at this instant - the actual slow work
+    (format_and_save's CLI/API/file-write call) is handed to `save_worker` when given,
+    so the main loop can immediately go back to transcribing instead of blocking on it.
+    Pass save_worker=None (the final Ctrl+C save does this) to run it synchronously
+    instead - at that point there's no more live output to keep flowing anyway, and the
+    caller needs it to have actually finished before moving on to condensing."""
     full_text = session.pop_pending_text(run_diarization=is_final)
-    path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date, mode=mode)
-    chose_this_mode = mode != "auto"
-    tag, colorize = {
-        "cli": (" [formatted with Claude Code CLI]", c.success),
-        "api": (" [formatted with Claude API]", c.success),
-        "gpu": (" [formatted with local GPU model]" if chose_this_mode
-                else " [formatted with local GPU model - Claude CLI/API unavailable]", c.warning),
-        "local": (" [heuristic local formatting]" if chose_this_mode
-                  else " [heuristic local formatting - Claude CLI/API/GPU model unavailable]", c.warning),
-        "none": ("", c.dim),
-    }[method]
-    note_colored = c.autosave(note) if note else ""
-    print(colorize(f"Saved notes to {path}{tag}") + (f" {note_colored}" if note_colored else ""))
+
+    def do_save():
+        path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date, mode=mode)
+        chose_this_mode = mode != "auto"
+        tag, colorize = {
+            "cli": (" [formatted with Claude Code CLI]", c.success),
+            "api": (" [formatted with Claude API]", c.success),
+            "gpu": (" [formatted with local GPU model]" if chose_this_mode
+                    else " [formatted with local GPU model - Claude CLI/API unavailable]", c.warning),
+            "local": (" [heuristic local formatting]" if chose_this_mode
+                      else " [heuristic local formatting - Claude CLI/API/GPU model unavailable]", c.warning),
+            "none": ("", c.dim),
+        }[method]
+        note_colored = c.autosave(note) if note else ""
+        print(colorize(f"Saved notes to {path}{tag}") + (f" {note_colored}" if note_colored else ""))
+
+    if save_worker is not None:
+        save_worker.submit(do_save)
+    else:
+        do_save()
 
 
 if __name__ == "__main__":
