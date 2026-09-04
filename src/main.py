@@ -17,9 +17,10 @@ Usage:
     python src/main.py                 # auto-detect class from schedule, prompt for audio source
     python src/main.py --class "BIOL 1440"   # override class selection
     python src/main.py --source mic    # skip the audio-source prompt (mic | system)
-    python src/main.py --chunk 15      # seconds per transcription chunk (default 15, tuned for
-                                        # accuracy - more context per chunk. Lower it for more
-                                        # frequent live output at a slight accuracy cost)
+    python src/main.py --chunk 20      # seconds per transcription chunk (default 20, measured
+                                        # as the most accurate of 15/20/25/30 on real lectures -
+                                        # see DEFAULT_CHUNK_SECONDS. Lower it for more frequent
+                                        # live output at a real accuracy cost)
     python src/main.py --list          # list all classes in the schedule and exit
 
 Stop recording any time with Ctrl+C. Notes are saved (with a safety autosave
@@ -74,6 +75,25 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
 
 AUTOSAVE_EVERY_SECONDS = 5 * 60  # flush partial notes periodically, not just at the end
+
+# Chosen by measurement, not feel. tools/chunk_size_sweep.py, 5 min each of two real
+# lectures (different speakers and rooms), WER against a single-pass reference that has
+# no chunk boundaries at all:
+#
+#                    15s      20s      25s      30s
+#     PSYC 1300    15.30%   11.75%   11.20%   12.57%
+#     BIOL 1440    26.69%   22.74%   31.39%   24.81%
+#     average      21.00%   17.25%   21.30%   18.69%
+#
+# 20s is both the best average and the only size that beat the old 15s default on BOTH
+# lectures (-3.55 and -3.95 points) - 25s wins on one clip but is the worst of all four
+# on the other, so it isn't a safe default. It was also no slower: fewer chunks means
+# less per-chunk overhead, so the extra context is effectively free.
+#
+# The tradeoff is live-view latency - the terminal now prints a batch roughly every 20s
+# instead of 15s. That buys a real accuracy gain on the notes, which is what actually
+# gets studied from.
+DEFAULT_CHUNK_SECONDS = 20.0
 
 # Automatic retention for state/ backups, applied once at the end of each session.
 # Audio is essentially all of the disk cost (~70MB per lecture, ~1GB after two weeks)
@@ -1061,7 +1081,9 @@ def run():
     parser = argparse.ArgumentParser(description="Auto-transcribe your current lecture into notes.")
     parser.add_argument("--class", dest="klass", help="Override class code, e.g. 'BIOL 1440'")
     parser.add_argument("--source", choices=["mic", "system"], help="Audio source, skips the prompt")
-    parser.add_argument("--chunk", type=float, default=15.0, help="Seconds per transcription chunk")
+    parser.add_argument("--chunk", type=float, default=DEFAULT_CHUNK_SECONDS,
+                         help=f"Seconds per transcription chunk (default {DEFAULT_CHUNK_SECONDS:.0f}, "
+                              f"tuned for accuracy - see DEFAULT_CHUNK_SECONDS)")
     parser.add_argument("--formatting", choices=notes.FORMATTING_MODES,
                          help="Note formatting mode, skips the prompt (auto/local/heuristic)")
     parser.add_argument("--list", action="store_true", help="List classes from schedule.json and exit")
