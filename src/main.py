@@ -51,6 +51,7 @@ import vocab as vocab_module
 import soundfile as sf
 import console_colors as c
 import keep_awake
+import mic_mute
 
 try:
     import msvcrt  # Windows-only stdlib module for non-blocking console keypress detection
@@ -414,6 +415,14 @@ def run_preflight_checks(source: str) -> bool:
     print(c.heading("Running preflight checks..."))
     ok = True
 
+    if source == "mic":
+        # Runs synchronously, before the mic gets opened by the audio-device check below -
+        # if the mic is muted at the OS level, this clears it first so that check actually
+        # picks up real audio instead of reporting silence. Only covers OS-level mute (see
+        # mic_mute.py docstring for what it can't see - hardware switches, app-level mutes).
+        if mic_mute.check_and_unmute() == "unmuted":
+            print(c.warning("  Microphone was muted at the system level - unmuted it automatically."))
+
     with ThreadPoolExecutor(max_workers=3) as executor:
         audio_future = executor.submit(_check_audio_device, source)
         disk_future = executor.submit(_check_disk_space)
@@ -549,6 +558,15 @@ def prune_backups(older_than_days: int, confirm: bool):
     print(c.success(f"\nDeleted {deleted}/{len(candidates)} file(s), freed {total_bytes / 1e9:.2f}GB."))
 
 
+def _pause_before_exit():
+    """Keeps the console window open until a keypress before the process exits. Real
+    problem when the app is launched from a shortcut/double-click rather than an
+    already-open terminal: the window vanishes the instant the process exits, so a
+    result printed right before returning (a quiz score, a study guide path) is never
+    actually seen - confirmed live, this is why a flashcard score seemed to "not show"."""
+    input("\nPress Enter to exit...")
+
+
 def _resolve_class_for_llm_feature(code: str, feature: str) -> dict:
     """Shared setup for --study-guide/--flashcards: resolve the class code and confirm
     Claude CLI/API is available (both features need real cross-lecture synthesis - see
@@ -559,11 +577,13 @@ def _resolve_class_for_llm_feature(code: str, feature: str) -> dict:
         print(c.info("Known classes:"))
         for known_code, title in sched.list_all_classes():
             print(f"  {known_code} - {title}")
+        _pause_before_exit()
         sys.exit(1)
 
     if not notes.cli_available() and not os.environ.get("ANTHROPIC_API_KEY"):
         print(c.error(f"{feature} needs the Claude CLI (logged in) or "
                        "ANTHROPIC_API_KEY - neither is available right now."))
+        _pause_before_exit()
         sys.exit(1)
     return cls
 
@@ -580,10 +600,12 @@ def run_study_guide(code: str):
     ok, reason, path = notes.generate_study_guide(cls["code"], cls["title"])
     if not ok:
         print(c.error(f"Could not generate study guide: {reason}"))
+        _pause_before_exit()
         sys.exit(1)
 
     print(c.success(f"Study guide saved to {path} ({time.time() - start:.1f}s)."))
     print(c.info(f"Study guide (Word): {docx_export.study_guide_docx_path(cls['code'])}"))
+    _pause_before_exit()
 
 
 def run_flashcards(code: str):
@@ -601,6 +623,7 @@ def run_flashcards(code: str):
     ok, reason, questions = notes.generate_flashcards(cls["code"], cls["title"])
     if not ok:
         print(c.error(f"Could not generate flashcards: {reason}"))
+        _pause_before_exit()
         sys.exit(1)
     print(c.success(f"Quiz ready ({len(questions)} questions, {time.time() - start:.1f}s).\n"))
 
@@ -641,12 +664,14 @@ def run_flashcards(code: str):
 
     if answered == 0:
         print(c.dim("No questions answered - quiz ended."))
+        _pause_before_exit()
         return
 
     pct = 100 * score / answered
     print(c.heading("=" * 40))
     print(c.heading(f"Quiz complete! Score: {score}/{answered} ({pct:.0f}%)"))
     print(c.heading("=" * 40))
+    _pause_before_exit()
 
 
 def run_resume(target: str, args):

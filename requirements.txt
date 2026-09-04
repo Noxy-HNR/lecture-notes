@@ -6,6 +6,11 @@ python-docx>=1.1.0
 soundfile>=0.12.1
 colorama>=0.4.6
 
+# Proactive mic-mute detection/auto-unmute before recording starts (src/mic_mute.py).
+# Windows-only, same as the rest of this app.
+pycaw>=20240210
+comtypes>=1.4.0
+
 # GPU acceleration for Whisper transcription (faster-whisper/ctranslate2). Not
 # installed by default via this file since the right build is machine-specific -
 # see README "GPU acceleration" section. This machine has an RTX 5070 Ti, set up
