@@ -751,9 +751,12 @@ def run_flashcards(code: str):
     """Generates a multiple-choice quiz from a class's notes so far, then runs it
     interactively in the terminal: one question at a time, immediate right/wrong feedback
     with a short explanation, and a final score. CLI/API only - see
-    notes.generate_flashcards for why the local model isn't used here. Nothing is saved to
-    disk - this is a one-off study session, not a persisted artifact like the notes/study
-    guide."""
+    notes.generate_flashcards for why the local model isn't used here.
+
+    Also exports the same question set as an Anki-importable deck (recall-style, not
+    multiple-choice - see notes.export_flashcards_anki for why) - the terminal quiz is a
+    one-off test of where you stand right now, the Anki export is for actual ongoing
+    spaced-repetition review afterward, which Anki's scheduler already does well."""
     cls = _resolve_class_for_llm_feature(code, "Flashcard generation")
 
     print(c.heading(f"Building a {notes.FLASHCARD_COUNT}-question quiz for {cls['code']} - "
@@ -765,6 +768,9 @@ def run_flashcards(code: str):
         _pause_before_exit()
         sys.exit(1)
     print(c.success(f"Quiz ready ({len(questions)} questions, {time.time() - start:.1f}s).\n"))
+
+    anki_path = notes.export_flashcards_anki(cls["code"], cls["title"], questions)
+    print(c.info(f"Anki-importable deck saved to {anki_path} (Anki: File > Import).\n"))
 
     random.shuffle(questions)
     score = 0

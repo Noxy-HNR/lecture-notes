@@ -615,6 +615,52 @@ def generate_flashcards(class_code: str, class_title: str, mode: str = "auto",
     return True, None, questions
 
 
+def anki_export_path(class_code: str) -> Path:
+    safe = class_code.replace(" ", "_")
+    return NOTES_DIR / f"{safe}_flashcards_anki.txt"
+
+
+def export_flashcards_anki(class_code: str, class_title: str, questions: list[dict]) -> Path:
+    """Writes a class's flashcards as a plain-text file Anki can import directly (File >
+    Import), for real long-term spaced repetition - Anki's scheduler is a mature, proven
+    implementation of that; nothing here tries to reimplement it.
+
+    Deliberately recall-style, not multiple-choice: Front is just the question, Back is
+    the correct answer plus its explanation - dropping the other 3 options entirely.
+    Spaced-repetition research consistently favors active recall (produce the answer
+    yourself) over recognition (pick it out of a list) for durable retention, and
+    reviewing a card you can just pattern-match against 4 visible options would be a much
+    weaker signal of whether you actually know the material. The interactive terminal
+    quiz (which does use the full multiple-choice format) is a different, complementary
+    exercise - this export is for ongoing review afterward, not a one-off test.
+
+    The #directive header lines are recognized by Anki's own text importer (separator,
+    notetype, deck) so the import dialog comes up pre-configured instead of needing
+    manual field-mapping."""
+    def _clean(text: str) -> str:
+        # Tab-separated format - any literal tab/newline inside a field would corrupt
+        # the column structure, so collapse them to spaces. Content is LLM-generated
+        # prose and not expected to contain either, but this makes the guarantee real
+        # rather than assumed.
+        return " ".join(text.split())
+
+    lines = [
+        "#separator:tab",
+        "#html:false",
+        "#notetype:Basic",
+        f"#deck:{class_title} ({class_code})",
+    ]
+    for q in questions:
+        correct_option = q["options"][q["correct_index"]]
+        front = _clean(q["question"])
+        back = _clean(f"{correct_option} — {q['explanation']}")
+        lines.append(f"{front}\t{back}")
+
+    path = anki_export_path(class_code)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def condense_session(class_code: str, class_title: str, before_length: int,
                       mode: str = "auto") -> tuple[bool, str | None]:
     """Re-reviews everything written to this class's notes since `before_length`
