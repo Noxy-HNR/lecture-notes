@@ -52,6 +52,15 @@ class TestAssistantChatterGuard:
                 "the write.")
         assert notes._looks_like_assistant_chatter(real)
 
+    def test_rejects_the_variant_found_sitting_in_wrtg_notes(self):
+        """Found during an end-to-end smoke test, already in real WRTG 1310 notes. An
+        earlier grep for "approval"/"grant permission" missed it - this one says
+        "approve"/"I need permission" - which is the whole reason the phrase list gets
+        widened from observed failures rather than assumed complete."""
+        real = ("I need permission to write to that file — please approve the write when "
+                "prompted, or let me know if you'd like the notes elsewhere.")
+        assert notes._looks_like_assistant_chatter(real)
+
     def test_accepts_normal_notes(self):
         assert not notes._looks_like_assistant_chatter(
             "## Monday, September 1, 2026\n\n### Covalent Bonding\n"

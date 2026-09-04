@@ -162,6 +162,12 @@ _CHATTER_PHRASES = (
     "grant permission", "needs your approval", "need your approval",
     "let me know if", "i'll proceed", "i will proceed", "would you like me to",
     "i've drafted", "i have drafted", "ready to write", "shall i",
+    # Found later, already sitting in real WRTG 1310 notes: "I need permission to write
+    # to that file - please approve the write when prompted...". A grep for "approval"
+    # and "grant permission" missed it because it says "approve"/"I need permission",
+    # which is why the phrase list is matched against a guard rather than trusted as an
+    # exhaustive list of everything a model might say.
+    "i need permission", "approve the write", "permission to write",
 )
 
 
