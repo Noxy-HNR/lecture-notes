@@ -621,9 +621,13 @@ class PreflightRunner:
                   c.warning("  Local GPU formatter failed to warm up - will retry lazily when actually needed."))
 
         if diarize.available():
-            print(c.info("  Speaker diarization: enabled (HUGGINGFACE_TOKEN set)"))
+            print(c.warning("  Speaker diarization: ON (--diarize) - adds roughly half the "
+                             "lecture's length to the Ctrl+C wait"))
+        elif diarize.ENABLED:
+            print(c.dim("  Speaker diarization: requested but unavailable (no HUGGINGFACE_TOKEN)"))
         else:
-            print(c.dim("  Speaker diarization: off (set HUGGINGFACE_TOKEN to enable Q&A speaker labeling)"))
+            print(c.dim("  Speaker diarization: off (default - measured as not worth its cost "
+                         "for single-speaker lectures; pass --diarize for seminars/discussions)"))
 
         print()
         self._executor.shutdown(wait=False)
@@ -1107,6 +1111,11 @@ def run():
                          help="Quiz yourself with an interactive multiple-choice flashcard session "
                               "generated from all of a class's notes so far, and exit. Same CLI/API "
                               "requirement as --study-guide.")
+    parser.add_argument("--diarize", action="store_true",
+                         help="Enable speaker diarization (off by default: measured at ~0.55x "
+                              "realtime on the whole session at Ctrl+C - ~27 min for a 50 min "
+                              "lecture - to find under 2s of non-instructor speech. Worth it "
+                              "for genuinely multi-voice recordings like seminars.)")
     parser.add_argument("--search", metavar="QUERY",
                          help="Search your notes (and raw transcripts) for a term and exit. "
                               "Combine with --class to search one class only.")
@@ -1114,6 +1123,7 @@ def run():
                          help="Open the web dashboards (notes browser + live diagnostics) and exit. "
                               "Runs as its own process - safe to leave open during a recording.")
     args = parser.parse_args()
+    diarize.ENABLED = args.diarize  # opt-in; see diarize.py for why it's off by default
 
     if args.list:
         for code, title in sched.list_all_classes():

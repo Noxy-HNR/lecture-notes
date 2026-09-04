@@ -35,8 +35,29 @@ _pipeline = None
 _load_failed = False
 
 
+# Off by default because it was measured and does not earn its cost on this workload.
+# tools/diarization_check.py against two real lectures (10 min each):
+#
+#                    cost                       speakers   non-instructor speech
+#     PSYC 1300    341s for 600s (0.57x)            2         1.4s  (0.2%)
+#     BIOL 1440    325s for 600s (0.54x)            2         0.9s  (0.2%)
+#
+# It runs on the WHOLE session at Ctrl+C, so at ~0.55x realtime a 50-minute lecture
+# pays roughly 27 minutes of shutdown wait - to identify under two seconds of
+# non-instructor speech. A laptop mic near one student picks the lecturer up clearly
+# and everyone else barely at all, so there is almost never a second voice to label.
+#
+# And the feature it exists to enable already works without it: the Q&A sections in the
+# real notes were produced from transcripts containing NO speaker tags at all, by Claude
+# recognising the instructor restating and answering a question from context.
+#
+# Still worth enabling (--diarize) for genuinely multi-voice recordings - a seminar, a
+# discussion section, an online call where everyone is on the same audio stream.
+ENABLED = False
+
+
 def available() -> bool:
-    return bool(os.environ.get("HUGGINGFACE_TOKEN"))
+    return ENABLED and bool(os.environ.get("HUGGINGFACE_TOKEN"))
 
 
 def _get_pipeline():
