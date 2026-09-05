@@ -150,14 +150,16 @@ def choose_class(args):
 
 def choose_action(args) -> str:
     """Top-level startup menu, shown whenever no flag already decided what to do (--list,
-    --resume, --study-guide, --flashcards, etc. all return before this runs). Lets "generate
-    a study guide"/"quiz me" be picked interactively instead of only being reachable via flags."""
+    --resume, --study-guide, --flashcards, --dashboard etc. all return before this runs).
+    Everything here is also reachable by flag; the menu exists so none of it has to be
+    remembered."""
     print(c.heading("What would you like to do?"))
     print("  1. Record a lecture (default)")
     print("  2. Generate a study guide from a class's notes so far")
     print("  3. Quiz yourself with flashcards")
+    print("  4. Open the dashboard (browse/search notes, live diagnostics)")
     choice = input("Choose [1]: ").strip() or "1"
-    return {"2": "study_guide", "3": "flashcards"}.get(choice, "record")
+    return {"2": "study_guide", "3": "flashcards", "4": "dashboard"}.get(choice, "record")
 
 
 def choose_notes_class(args) -> str:
@@ -1165,6 +1167,14 @@ def run():
         return
     if action == "flashcards":
         run_flashcards(choose_notes_class(args))
+        return
+    if action == "dashboard":
+        # Blocks until Ctrl+C, same as --dashboard. Picked from the menu it takes over
+        # this terminal, which is the honest behaviour: the dashboard is a long-running
+        # server, not a command that finishes. Run it in its own window (or with
+        # --dashboard) if you want to record at the same time.
+        import dashboard
+        dashboard.serve()
         return
 
     # Starts the checks that don't depend on any answer below (disk space, Whisper model

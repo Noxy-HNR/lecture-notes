@@ -74,6 +74,34 @@ class TestAssistantChatterGuard:
 
 
 # ---------------------------------------------------------------------------
+# Startup menu
+# ---------------------------------------------------------------------------
+
+class TestStartupMenu:
+    """The menu is the only way most of these features get discovered, and a wrong
+    mapping would silently start the wrong thing - recording when you asked for the
+    dashboard is a particularly bad failure, since it opens the mic."""
+
+    @pytest.mark.parametrize("keystroke,expected", [
+        ("1", "record"),
+        ("", "record"),          # bare Enter takes the default
+        ("2", "study_guide"),
+        ("3", "flashcards"),
+        ("4", "dashboard"),
+        ("99", "record"),        # unrecognised input must not do something surprising
+        ("  3  ", "flashcards"),  # whitespace tolerated
+    ])
+    def test_menu_choice_maps_to_the_right_action(self, keystroke, expected, monkeypatch):
+        import main
+        monkeypatch.setattr("builtins.input", lambda *a: keystroke)
+
+        class Args:
+            klass = None
+
+        assert main.choose_action(Args()) == expected
+
+
+# ---------------------------------------------------------------------------
 # Duplicate "## <date>" headings
 # ---------------------------------------------------------------------------
 
