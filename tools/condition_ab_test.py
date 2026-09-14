@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--chunk", type=float, default=20.0)
     args = parser.parse_args()
 
+    transcribe.use_backend("whisper")  # a Whisper-only setting; don't silently measure Cohere
     transcribe.get_model()
     all_results = {Path(w).name: run_clip(w, args.seconds, args.chunk) for w in args.wavs}
 

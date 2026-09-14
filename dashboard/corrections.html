@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Correct lecture notes</title><link rel="stylesheet" href="/style.css">
+<style>
+.correction-main{max-width:1500px;margin:auto;padding:28px}
+.toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:18px 0}
+.toolbar label{flex:1;min-width:180px}.field{display:flex;flex-direction:column;gap:7px;font-size:13px;color:var(--text-dim)}
+select,input,textarea{font:inherit;color:var(--text);background:var(--bg-inset);border:1px solid var(--border);border-radius:7px;padding:10px;box-sizing:border-box}
+select{width:100%}textarea{resize:vertical;width:100%;line-height:1.6}textarea:focus,select:focus,input:focus{outline:2px solid var(--accent)}
+.work-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.panel{padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);min-width:0}
+.panel h2{font-size:18px;margin:0 0 12px}.muted{font-size:13px;color:var(--text-dim)}
+.segment-list{max-height:330px;overflow:auto;margin:12px 0;border:1px solid var(--border);border-radius:8px}
+.segment{display:flex;gap:10px;padding:12px;border-bottom:1px solid var(--border)}.segment:last-child{border-bottom:0}
+.segment.active{background:var(--bg-inset)}.segment button{flex:1;border:0;text-align:left;background:transparent;color:var(--text);font:inherit;cursor:pointer;line-height:1.5}
+.segment small{display:block;color:var(--text-dim);font-size:11px}.segment input{flex-shrink:0}
+.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.notice{padding:12px 16px;border:1px solid var(--border);border-radius:8px;margin-bottom:16px;white-space:pre-wrap}.notice.error{border-color:var(--bad);color:var(--bad)}
+.preview-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.preview-grid pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.6}
+audio{width:100%;margin:12px 0}button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
+@media(max-width:850px){.work-grid,.preview-grid{grid-template-columns:1fr}.correction-main{padding:16px}}
+</style></head>
+<body>
+<header class="topbar"><div class="brand"><span class="dot"></span>Lecture Notes</div>
+<nav class="tabs" aria-label="Lecture tools"><a href="/">Notes</a><a href="/corrections" class="active" aria-current="page">Corrections</a><a href="/diagnostics">Diagnostics</a></nav></header>
+<main class="correction-main">
+<div class="eyebrow">Refine your notes</div><h1 class="page-title">A clearer record of your lecture.</h1>
+<p class="muted">Listen, fix the transcript, then replace only the note section you choose.</p>
+<div id="notice" class="notice" role="status" aria-live="polite">Loading recordings…</div>
+<div class="toolbar"><label class="field">Recording<select id="recording" aria-label="Recording"><option value="">Choose a recording</option></select></label>
+<button class="btn" id="reload">Reload recording</button></div>
+<div id="workspace" hidden>
+<div class="work-grid">
+<section class="panel"><div class="eyebrow">01 / Listen &amp; correct</div><h2>Transcript &amp; audio</h2>
+<p id="audioHint" class="muted"></p><audio id="audio" controls preload="none" aria-label="Source recording"></audio>
+<label class="field">Find a segment<input id="filter" type="search" placeholder="Filter transcript text"></label>
+<div class="actions"><span id="selectionCount" class="muted">0 segments selected</span><button class="btn" id="clearSelection">Clear selection</button></div>
+<div id="segments" class="segment-list" aria-label="Transcript segments"></div>
+<label class="field">Corrected transcript segment<textarea id="segmentEdit" rows="4" disabled></textarea></label>
+<details><summary class="muted">Original captured text</summary><p id="original" class="muted"></p></details>
+<div class="toolbar"><label class="field">Remember a term for this class (optional)<input id="term" maxlength="120" placeholder="For example: mitochondria"></label></div>
+<div class="actions"><button id="saveCorrection" class="btn primary" disabled>Save transcript correction</button><button id="restoreOriginal" class="btn" disabled>Use original text</button><button id="discardEdit" class="btn" disabled>Discard edit</button></div>
+<p class="muted">The original capture is preserved. Remembered terms help future transcription and formatting.</p>
+</section>
+<section class="panel"><div class="eyebrow">02 / Choose &amp; regenerate</div><h2>Selected note section</h2>
+<label class="field">Section to update<select id="section" aria-label="Section to update"><option value="">Choose a section</option></select></label>
+<p id="sectionHint" class="muted"></p>
+<label class="field">Current notes<textarea id="currentNotes" rows="15" readonly></textarea></label>
+<div class="toolbar"><label class="field">Regeneration method<select id="mode"><option value="local">Local model, with transcript-bullet fallback</option><option value="auto">Claude CLI/API, with local fallback</option><option value="heuristic">Transcript bullets only (no model)</option></select></label></div>
+<p id="methodHint" class="muted">Uses the local model; no transcript is sent to Claude.</p>
+<button id="regenerate" class="btn primary" disabled>Generate section preview</button>
+<p class="muted">Select the transcript segments that support this section. Previewing does not change your notes.</p>
+</section>
+</div>
+<section id="previewPanel" class="panel" style="margin-top:20px" hidden>
+<div class="eyebrow">03 / Review &amp; apply</div><h2>Review the replacement</h2><p id="previewMethod" class="muted"></p>
+<div class="preview-grid"><div><h3>Before</h3><pre id="before"></pre></div><label class="field">After — editable<textarea id="after" rows="12"></textarea></label></div>
+<div class="actions"><button id="apply" class="btn primary">Apply this section only</button><button id="discard" class="btn">Discard preview</button></div>
+<p class="muted">Applying preserves a revision of your notes and updates the Word copy.</p>
+</section></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let data=null,active=null,selected=new Set(),job=null,version=0,busy=false;
+const clock=s=>s==null?'No precise timestamp':`${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function notice(text,error=false){$('notice').textContent=text;$('notice').classList.toggle('error',error);}
+async function api(path,body){const response=await fetch('/api/corrections/'+path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});const result=await response.json();if(!response.ok)throw new Error(result.error||`Request failed (${response.status})`);return result;}
+function dirty(){return active!==null&&$('segmentEdit').value!==data.segments[active].text;}
+function invalidate(){job=null;$('previewPanel').hidden=true;}
+function controls(){
+  $('saveCorrection').disabled=busy||active===null;
+  $('restoreOriginal').disabled=busy||active===null;
+  $('discardEdit').disabled=busy||active===null;
+  $('clearSelection').disabled=busy;$('discard').disabled=busy;$('after').disabled=busy;
+  $('segmentEdit').disabled=busy||active===null;$('term').disabled=busy;$('mode').disabled=busy;
+  document.querySelectorAll('[data-include]').forEach(el=>el.disabled=busy);
+  $('regenerate').disabled=busy||!$('section').value||!selected.size||dirty();
+  $('selectionCount').textContent=`${selected.size} segment${selected.size===1?'':'s'} selected for regeneration`;
+  $('apply').disabled=busy||!job||dirty();
+  $('recording').disabled=busy;$('reload').disabled=busy;$('section').disabled=busy;
+}
+function renderSegments(){
+  const filter=$('filter').value.toLowerCase();
+  $('segments').innerHTML=data.segments.filter(s=>s.text.toLowerCase().includes(filter)).map(s=>`<div class="segment ${active===s.index?'active':''}"><input type="checkbox" aria-label="Include segment ${s.index+1}" data-include="${s.index}" ${selected.has(s.index)?'checked':''}><button data-edit="${s.index}"><small>${clock(s.start)} · segment ${s.index+1}${s.text!==s.original?' · corrected':''}</small>${esc(s.text)}</button></div>`).join('')||'<p class="muted" style="padding:12px">No matching segments.</p>';
+  document.querySelectorAll('[data-include]').forEach(el=>el.onchange=()=>{const n=Number(el.dataset.include);if(el.checked)selected.add(n);else selected.delete(n);invalidate();controls();});
+  document.querySelectorAll('[data-edit]').forEach(el=>el.onclick=()=>editSegment(Number(el.dataset.edit)));
+  controls();
+}
+function editSegment(index){
+  if(busy)return;
+  if(dirty()){notice('Save your current transcript edit before choosing another segment.',true);return;}
+  active=index;const s=data.segments[index];$('segmentEdit').disabled=false;$('segmentEdit').value=s.text;$('original').textContent=s.original;
+  if(data.audio_file&&s.start!=null){const player=$('audio');const seek=()=>{player.currentTime=Math.max(0,s.start);};if(player.readyState>=1)seek();else{player.addEventListener('loadedmetadata',seek,{once:true});player.load();}}
+  renderSegments();
+}
+function renderWorkspace(){
+  $('workspace').hidden=false;$('filter').value='';active=null;selected.clear();invalidate();
+  $('segmentEdit').value='';$('segmentEdit').disabled=true;$('original').textContent='';$('term').value='';
+  $('audio').hidden=!data.audio_file;if(data.audio_file)$('audio').src='/api/audio?file='+encodeURIComponent(data.audio_file);else $('audio').removeAttribute('src');
+  $('audioHint').textContent=!data.audio_file?'Audio is unavailable; transcript corrections still work.':data.timed?'Choose a segment to seek to that moment, then press Play.':'Legacy transcript: audio is available, but segment timing is not precise.';
+  const sections=data.sections.filter(s=>!s.session_id||s.session_id===data.session_id);
+  $('section').innerHTML='<option value="">Choose a section</option>'+sections.map(s=>`<option value="${s.id}">${esc(s.title)}${!s.session_id?' (choose source manually)':''}</option>`).join('');
+  const own=sections.find(s=>s.session_id===data.session_id);if(own)$('section').value=own.id;
+  renderSection();renderSegments();
+}
+function renderSection(){
+  invalidate();const section=data.sections.find(s=>s.id===$('section').value);$('currentNotes').value=section?.text||'';
+  $('sectionHint').textContent=!data.sections.length?'No existing note sections. Save or recover this lecture’s notes first.':!section?'Choose the exact section that the transcript supports.':section.session_id?'This section belongs to the selected recording.':'This section predates recording links. Verify that it belongs to this lecture before applying a replacement.';
+  controls();
+}
+async function loadRecording(){
+  const id=$('recording').value;if(!id)return;
+  if(dirty()){notice('Save your transcript edit before switching recordings.',true);$('recording').value=data.session_id;return;}
+  const request=++version;notice('Loading recording…');
+  try{const result=await api('session?session='+encodeURIComponent(id));if(request!==version)return;data=result;renderWorkspace();notice('Choose a segment to correct, and check the segments to use for regeneration.');}
+  catch(e){notice(e.message,true);$('workspace').hidden=true;}
+}
+$('recording').onchange=loadRecording;$('reload').onclick=loadRecording;$('filter').oninput=()=>data&&renderSegments();$('section').onchange=renderSection;
+$('segmentEdit').oninput=()=>{invalidate();controls();};
+$('restoreOriginal').onclick=()=>{$('segmentEdit').value=data.segments[active].original;invalidate();controls();};
+$('discardEdit').onclick=()=>{$('segmentEdit').value=data.segments[active].text;$('term').value='';controls();notice('Unsaved transcript edit discarded.');};
+$('clearSelection').onclick=()=>{selected.clear();invalidate();renderSegments();};
+$('mode').onchange=()=>{$('methodHint').textContent=$('mode').value==='auto'?'Sends the selected note section and transcript excerpt to Claude when available.':$('mode').value==='local'?'Uses the local model; no transcript is sent to Claude.':'Copies the selected corrected transcript into bullets without a model.';invalidate();};
+$('saveCorrection').onclick=async()=>{
+  busy=true;controls();notice('Saving correction…');
+  try{const result=await api('save',{session_id:data.session_id,transcript_revision:data.transcript_revision,edits:[{index:active,text:$('segmentEdit').value}],glossary_term:$('term').value});data=result.workspace;$('term').value='';$('segmentEdit').value=data.segments[active].text;invalidate();renderSegments();notice(result.warning||'Correction saved. The original transcript is preserved.');}
+  catch(e){notice(e.message,true);}finally{busy=false;controls();}
+};
+$('regenerate').onclick=async()=>{
+  busy=true;controls();invalidate();notice('Generating a preview… You can continue reading the source.');const request=version;
+  try{const started=await api('regenerate',{session_id:data.session_id,notes_revision:data.notes_revision,transcript_revision:data.transcript_revision,section_id:$('section').value,segment_indices:[...selected],mode:$('mode').value});
+    let result;do{await new Promise(resolve=>setTimeout(resolve,700));result=await api('job?id='+started.job_id);if(request!==version)return;}while(result.status==='running');
+    if(result.status!=='ready')throw new Error(result.error||'Preview failed');job=result;$('before').textContent=result.before;$('after').value=result.preview;$('previewMethod').textContent='Generated using '+result.method+'. Review the content before applying.';$('previewPanel').hidden=false;notice('Preview ready. Applying will replace only the selected section.');
+  }catch(e){notice(e.message,true);}finally{busy=false;controls();}
+};
+$('apply').onclick=async()=>{busy=true;controls();notice('Applying this section…');try{const result=await api('apply',{job_id:job.id,text:$('after').value});data=result.workspace;renderWorkspace();notice(result.warning||'Section updated. Other sections are unchanged, and the previous notes are saved as a revision.');}catch(e){notice(e.message,true);}finally{busy=false;controls();}};
+$('discard').onclick=()=>{invalidate();controls();notice('Preview discarded. Notes were not changed.');};
+window.addEventListener('beforeunload',event=>{if(dirty()||job){event.preventDefault();event.returnValue='';}});
+(async()=>{try{const sessions=await api('sessions');$('recording').innerHTML='<option value="">Choose a recording</option>'+sessions.map(s=>`<option value="${esc(s.id)}">${esc(s.class_code)} · ${s.date.slice(0,4)}-${s.date.slice(4,6)}-${s.date.slice(6)} ${s.time.slice(0,2)}:${s.time.slice(2,4)}</option>`).join('');const requested=new URLSearchParams(location.search).get('session');if(sessions.some(s=>s.id===requested)){$('recording').value=requested;await loadRecording();}else notice(sessions.length?'Choose a recording to begin.':'No transcripts yet. Record or recover a lecture first.');}catch(e){notice(e.message,true);}})();
+</script></body></html>

@@ -10,12 +10,13 @@
 
 <header class="topbar">
   <div class="brand"><span class="dot"></span>Lecture Notes</div>
-  <nav class="tabs">
-    <a href="/" class="active">Notes</a>
+  <nav class="tabs" aria-label="Lecture tools">
+    <a href="/" class="active" aria-current="page">Notes</a>
+    <a href="/corrections">Corrections</a>
     <a href="/diagnostics">Diagnostics</a>
   </nav>
   <div class="search-wrap">
-    <input id="search" class="search" type="search" autocomplete="off"
+    <input id="search" aria-label="Search notes and transcripts" class="search" type="search" autocomplete="off"
            placeholder="Search all notes and transcripts…  (/ to focus)">
   </div>
 </header>
@@ -44,7 +45,22 @@ const searchBox = document.getElementById('search');
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtDate = ts => new Date(ts * 1000).toLocaleDateString(undefined, { month:'short', day:'numeric' });
 
-async function api(path) { const r = await fetch(path); return r.json(); }
+let viewVersion = 0;
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`Request failed (${r.status})`);
+  return r.json();
+}
+function player(file, seconds = null) {
+  if (!file) return '';
+  const start = seconds == null ? '' : `#t=${Math.max(0, seconds).toFixed(2)}`;
+  return `<div style="margin-top:12px"><div class="page-sub">${seconds == null ? 'Recording' : 'Play this moment'}
+    </div><audio controls preload="none" aria-label="Lecture recording"
+    src="/api/audio?file=${encodeURIComponent(file)}${start}" style="width:100%;max-width:600px"></audio></div>`;
+}
+window.addEventListener('unhandledrejection', event => {
+  main.innerHTML = `<div class="empty">${esc(event.reason?.message || 'Could not load this view.')}<br>Refresh to retry.</div>`;
+});
 
 // Renders a search snippet: escapes it, applies the notes' inline markdown, and marks the
 // matched terms. All three passes run against sentinel characters rather than real HTML,
@@ -92,6 +108,7 @@ function renderSidebar() {
 // ---------- class document ----------
 
 async function openClass(code, kind = 'notes') {
+  const version = ++viewVersion;
   state.activeClass = code; state.kind = kind; state.view = 'class';
   searchBox.value = ''; state.query = '';
   renderSidebar();
@@ -100,6 +117,7 @@ async function openClass(code, kind = 'notes') {
   const cls = state.classes.find(c => c.code === code) || {};
   const doc = await api(`/api/document?class=${encodeURIComponent(code)}&kind=${kind}`);
 
+  if (version !== viewVersion) return;
   const tabs = `
     <div class="seg" id="kind-tabs">
       <button data-kind="notes" class="${kind==='notes'?'active':''}">Notes</button>
@@ -117,7 +135,7 @@ async function openClass(code, kind = 'notes') {
       </span></div>`;
   } else if (kind === 'flashcards') {
     body = `<div class="page-sub">${doc.cards.length} cards · click to reveal</div>` +
-      doc.cards.map(c => `<div class="flashcard">
+      doc.cards.map(c => `<div class="flashcard" role="button" tabindex="0" aria-expanded="false">
         <div class="front">${esc(c.front)}</div>
         <div class="back">${esc(c.back)}</div>
         <div class="reveal-hint">click to reveal</div></div>`).join('');
@@ -131,20 +149,25 @@ async function openClass(code, kind = 'notes') {
 
   main.innerHTML = `
     <h1 class="page-title">${esc(cls.title || code)}</h1>
-    <div class="page-sub">${esc(code)} · ${cls.lectures || 0} lectures${
+    <div class="page-sub">${esc(code)} · ${cls.lectures || 0} lecture${cls.lectures === 1 ? '' : 's'}${
       doc.words ? ` · ${doc.words.toLocaleString()} words` : ''}</div>
     <div style="margin-bottom:22px">${tabs}</div>
     ${body}`;
 
   main.querySelectorAll('#kind-tabs button').forEach(b =>
     b.onclick = () => !b.disabled && openClass(code, b.dataset.kind));
-  main.querySelectorAll('.flashcard').forEach(card =>
-    card.onclick = () => card.classList.toggle('revealed'));
+  main.querySelectorAll('.flashcard').forEach(card => {
+    card.onclick = () => card.setAttribute('aria-expanded', String(card.classList.toggle('revealed')));
+    card.onkeydown = event => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); card.click(); }
+    };
+  });
 }
 
 // ---------- recordings ----------
 
 async function openSessions() {
+  const version = ++viewVersion;
   state.view = 'sessions'; state.activeClass = null;
   searchBox.value = ''; state.query = '';
   renderSidebar();
@@ -152,6 +175,7 @@ async function openSessions() {
   main.innerHTML = '<div class="empty">Loading…</div>';
 
   const sessions = await api('/api/sessions');
+  if (version !== viewVersion) return;
   const total = sessions.reduce((a, s) => a + s.mb, 0);
   main.innerHTML = `
     <h1 class="page-title">Recordings</h1>
@@ -166,6 +190,8 @@ async function openSessions() {
           ${s.has_transcript ? `<span>·</span><span>${s.transcript_lines} transcript lines</span>` : ''}
         </div>
         <div class="hit-text mono" style="font-size:12.5px;color:var(--text-dim)">${esc(s.wav)}</div>
+        ${player(s.wav)}
+        <a class="btn" href="/corrections?session=${encodeURIComponent(s.wav.replace(/\.wav$/,''))}">Correct this lecture</a>
       </div>`).join('') : '<div class="empty">No recordings yet.</div>'}`;
 }
 
@@ -178,12 +204,14 @@ searchBox.addEventListener('input', () => {
 });
 
 async function runSearch() {
+  const version = ++viewVersion;
   const q = searchBox.value.trim();
   state.query = q;
   if (!q) { if (state.activeClass) openClass(state.activeClass, state.kind); return; }
   state.view = 'search';
   const hits = await api(`/api/search?q=${encodeURIComponent(q)}`);
 
+  if (version !== viewVersion || q !== searchBox.value.trim()) return;
   const notes = hits.filter(h => h.source === 'notes');
   const transcripts = hits.filter(h => h.source === 'transcript');
   const group = (title, rows) => !rows.length ? '' : `
@@ -191,12 +219,13 @@ async function runSearch() {
     ${rows.map(h => `
       <div class="hit">
         <div class="hit-meta">
-          <span class="badge ${h.source}">${h.source === 'notes' ? h.class_code : h.class_code}</span>
+          <span class="badge ${h.source}">${esc(h.class_code)}</span>
           <span>${esc(h.location)}</span>
           ${h.section ? `<span>·</span><span>${esc(h.section)}</span>` : ''}
           ${h.timestamp ? `<span>·</span><span class="mono">${esc(h.timestamp)}</span>` : ''}
         </div>
         <div class="hit-text">${renderSnippet(h.text, q)}</div>
+        ${player(h.audio_file, h.audio_seconds)}
       </div>`).join('')}`;
 
   main.innerHTML = `

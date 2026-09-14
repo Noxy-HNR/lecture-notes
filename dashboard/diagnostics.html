@@ -10,15 +10,18 @@
 
 <header class="topbar">
   <div class="brand"><span class="dot"></span>Lecture Notes</div>
-  <nav class="tabs">
+  <nav class="tabs" aria-label="Lecture tools">
     <a href="/">Notes</a>
-    <a href="/diagnostics" class="active">Diagnostics</a>
+    <a href="/corrections">Corrections</a>
+    <a href="/diagnostics" class="active" aria-current="page">Diagnostics</a>
   </nav>
   <div class="search-wrap"></div>
   <div id="poll-state" class="chip">connecting…</div>
 </header>
 
-<main style="max-width:1280px">
+<main style="max-width:1280px;margin:auto">
+  <div class="page-heading"><div class="eyebrow">Recording monitor</div>
+    <h1 class="page-title">Session overview</h1><p class="page-sub">Follow your recording, transcription, and service health in one place.</p></div>
   <div id="banner" class="live-banner">
     <div>
       <div style="display:flex;align-items:center;gap:9px">
@@ -27,12 +30,14 @@
       </div>
       <div id="banner-sub" class="muted" style="font-size:13px;margin-top:4px"></div>
     </div>
-    <div style="display:flex;gap:9px">
+    <div style="display:flex;gap:9px;flex-wrap:wrap">
+      <button id="btn-start" class="btn primary" disabled>Start Notes</button>
       <button id="btn-save" class="btn primary" disabled>Save now</button>
       <button id="btn-stop" class="btn danger" disabled>Stop recording</button>
     </div>
   </div>
 
+  <p id="command-status" class="muted" role="status">Start Notes opens the recorder's class and audio setup window.</p>
   <div class="stack">
     <div>
       <div class="section-label">Session</div>
@@ -102,8 +107,8 @@ function rtfClass(rtf) {
 }
 
 const serviceClass = v =>
-  /available|running|enabled|key set/.test(v) ? 'good'
-  : /unavailable|no key|error|not installed/.test(v) ? 'bad' : 'warn';
+  /unavailable|no key|error|not installed/i.test(v) ? 'bad'
+  : /available|running|enabled|key set/i.test(v) ? 'good' : 'warn';
 
 // -1, not 0: the transcript pane is only re-rendered when the line count changes, so
 // starting at 0 would match an empty first poll and skip drawing the placeholder.
@@ -112,7 +117,9 @@ let lastTranscriptCount = -1;
 async function poll() {
   let data;
   try {
-    data = await (await fetch('/api/status')).json();
+    const response = await fetch('/api/status');
+    if (!response.ok) throw new Error(`Status request failed (${response.status})`);
+    data = await response.json();
     document.getElementById('poll-state').className = 'chip good';
     document.getElementById('poll-state').textContent = 'live';
   } catch {
@@ -123,6 +130,9 @@ async function poll() {
 
   const active = !!data.active;
   const stale = data.updated_at && (Date.now()/1000 - data.updated_at) > 30;
+  const recorderOpen = !!data.recorder?.running;
+  document.getElementById('btn-start').disabled = recorderOpen || (active && !stale);
+  document.getElementById('btn-start').textContent = recorderOpen ? 'Notes is open' : 'Start Notes';
   const banner = document.getElementById('banner');
   banner.className = 'live-banner' + (active && !stale ? ' recording' : '');
 
@@ -137,6 +147,10 @@ async function poll() {
        data.source === 'mic' ? 'microphone' : data.source === 'system' ? 'system audio' : '',
        data.formatting_mode ? `${data.formatting_mode} formatting` : '',
        data.whisper_device].filter(Boolean).join(' · ');
+  if (recorderOpen && (!active || stale)) {
+    document.getElementById('banner-title').textContent = 'Notes window open';
+    document.getElementById('banner-sub').textContent = 'Complete setup in the recorder window. Preflight may take a moment before recording begins.';
+  }
 
   document.getElementById('btn-save').disabled = !active || stale;
   document.getElementById('btn-stop').disabled = !active || stale;
@@ -147,9 +161,9 @@ async function poll() {
     metric('Audio processed', duration(data.audio_seconds_transcribed)) +
     metric('Saves', data.saves_completed ?? 0,
            data.last_save_method ? `last: ${data.last_save_method} · ${ago(data.last_save_at)}` : 'none yet') +
-    metric('Silent chunks', data.consecutive_silent_chunks ?? 0,
-           (data.consecutive_silent_chunks ?? 0) > 3 ? 'check the mic' : 'in a row',
-           (data.consecutive_silent_chunks ?? 0) > 3 ? 'warn' : '');
+    metric('Silent audio', duration(data.silent_seconds ?? 0),
+           (data.silent_seconds ?? 0) >= 45 ? 'check the mic' : 'since last sound',
+           (data.silent_seconds ?? 0) >= 45 ? 'warn' : '');
 
   const rtf = data.realtime_factor ?? 0;
   document.getElementById('perf-metrics').innerHTML =
@@ -170,8 +184,9 @@ async function poll() {
 
   const t = document.getElementById('transcript');
   const lines = data.transcript || [];
-  if (lines.length !== lastTranscriptCount) {
-    lastTranscriptCount = lines.length;
+  const transcriptVersion = JSON.stringify(lines);
+  if (transcriptVersion !== lastTranscriptCount) {
+    lastTranscriptCount = transcriptVersion;
     t.innerHTML = lines.map(l =>
       `<div class="row"><span class="ts">${esc(l.time)}</span><span class="msg">${esc(l.text)}</span></div>`).join('')
       || '<div class="muted">Nothing transcribed yet.</div>';
@@ -186,12 +201,20 @@ async function poll() {
 
 async function send(action, btn) {
   btn.disabled = true;
-  await fetch('/api/command', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ action }),
-  });
-  setTimeout(poll, 300);
+  const status=document.getElementById('command-status');
+  status.textContent=action==='start'?'Opening Notes startup…':'Sending command…';
+  try {
+    const response=await fetch('/api/command', {
+      method: 'POST', headers: {'Content-Type': 'application/json','X-Notes-Dashboard':'1'},
+      body: JSON.stringify({ action }),
+    });
+    const result=await response.json();
+    if(!response.ok || !result.ok)throw new Error(result.error||'The command could not be delivered.');
+    status.textContent=result.message||(action==='stop'?'Stop requested. Notes will finish saving.':'Save requested.');
+  } catch(error) { status.textContent=error.message; }
+  finally { await poll(); }
 }
+document.getElementById('btn-start').onclick = e => send('start', e.target);
 document.getElementById('btn-save').onclick = e => send('save_now', e.target);
 document.getElementById('btn-stop').onclick = e => send('stop', e.target);
 

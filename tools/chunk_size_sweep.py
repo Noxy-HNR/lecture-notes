@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--sizes", type=float, nargs="+", default=[15, 20, 25, 30])
     args = parser.parse_args()
 
+    transcribe.use_backend("whisper")  # tunes Whisper; don't silently measure the default Cohere model
     transcribe.get_model()
     all_results = {Path(w).name: sweep_clip(w, args.seconds, args.sizes) for w in args.wavs}
 

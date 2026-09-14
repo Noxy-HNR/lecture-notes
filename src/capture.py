@@ -116,8 +116,10 @@ def ends_on_pause(blocks: list[np.ndarray], tail_frames: int,
 
 
 class CaptureThread:
-    def __init__(self, source: str):
+    def __init__(self, source: str, on_block=None):
         self.source = source
+        self.on_block = on_block
+        self.fatal_error = None
         self.audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
         self.error_queue: "queue.Queue[Exception]" = queue.Queue()
         self._stop_event = threading.Event()
@@ -224,6 +226,14 @@ class CaptureThread:
                 with recorder:
                     while not self._stop_event.is_set():
                         block = audio.record_chunk(recorder, READ_SECONDS)
+                        if self.on_block is not None:
+                            try:
+                                self.on_block(block)  # persist before any inference queue
+                            except Exception as error:
+                                self.fatal_error = error
+                                self.error_queue.put(error)
+                                self._stop_event.set()
+                                return
                         self.audio_queue.put(block)
             except Exception as e:
                 # Device dropped out (sleep/resume hiccup, USB mic unplugged, etc.) -

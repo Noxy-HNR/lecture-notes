@@ -10,6 +10,8 @@ they carry a wall-clock timestamp, which is the closest thing this app has to
 "jump to that moment in the recording" - the matching .wav sits next to the log.
 """
 import re
+import json
+from transcripts import load_transcript
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +32,8 @@ class Hit:
     text: str            # the matching line
     line_number: int
     timestamp: str = ""  # wall-clock time, transcript hits only
+    audio_file: str = ""
+    audio_seconds: float | None = None
     section: str = ""    # nearest "###" subheading, notes hits only
     context: list = field(default_factory=list)  # neighbouring lines, for display
 
@@ -58,7 +62,7 @@ def search_notes(query: str, class_code: str | None = None, match_all: bool = Tr
         return []
 
     hits = []
-    codes = [class_code] if class_code else _class_codes()
+    codes = [class_code] if class_code in _class_codes() else ([] if class_code else _class_codes())
     for code in codes:
         path = NOTES_DIR / f"{code.replace(' ', '_')}.md"
         if not path.exists():
@@ -72,6 +76,8 @@ def search_notes(query: str, class_code: str | None = None, match_all: bool = Tr
                 continue
             if line.startswith("### "):
                 current_section = line[4:].strip()
+            if line.startswith("<!--"):
+                continue
             if not _matches(line, terms, match_all) or not line.strip():
                 continue
             if line.startswith("#"):
@@ -102,6 +108,36 @@ def search_transcripts(query: str, class_code: str | None = None,
         if class_code and code != class_code:
             continue
         session = f"{name_match.group(2)} {name_match.group(3)}"
+        wav = path.with_name(path.name.removesuffix("_raw.txt") + ".wav")
+        sidecar = path.with_name(path.name.removesuffix("_raw.txt") + "_segments.jsonl")
+        overlay = wav.with_name(wav.stem + "_corrections.json")
+        if overlay.exists():
+            corrected = load_transcript(STATE_DIR, wav.stem)
+            for segment in corrected["segments"]:
+                if not _matches(segment["text"], terms, match_all):
+                    continue
+                seconds = segment["start"]
+                hits.append(Hit(class_code=code, source="transcript", location=session,
+                                text=segment["text"], line_number=segment["index"]+1,
+                                timestamp=(f"{int(seconds)//60:02}:{int(seconds)%60:02}" if seconds is not None else ""),
+                                audio_file=wav.name if wav.exists() else "",audio_seconds=seconds))
+            continue
+        if sidecar.exists():
+            # Audio-relative offsets are independent of transcription latency.
+            for i, line in enumerate(sidecar.read_text(encoding="utf-8").splitlines()):
+                try:
+                    segment = json.loads(line)
+                    text = str(segment["text"])
+                    seconds = float(segment["start"])
+                except (ValueError, KeyError, TypeError):
+                    continue  # an interrupted final append must not hide earlier segments
+                if _matches(text, terms, match_all):
+                    hits.append(Hit(class_code=code, source="transcript", location=session,
+                                    text=text, line_number=i + 1,
+                                    timestamp=f"{int(seconds)//60:02}:{int(seconds)%60:02}",
+                                    audio_file=wav.name if wav.exists() else "",
+                                    audio_seconds=max(0, seconds)))
+            continue
         for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines()):
             if not _matches(line, terms, match_all):
                 continue
@@ -111,6 +147,7 @@ def search_transcripts(query: str, class_code: str | None = None,
                 text=(stamped.group(2) if stamped else line).strip(),
                 line_number=i + 1,
                 timestamp=stamped.group(1) if stamped else "",
+                audio_file=wav.name if wav.exists() else "",
             ))
     return hits
 
