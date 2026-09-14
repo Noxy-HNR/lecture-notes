@@ -289,21 +289,29 @@ class TestTelemetry:
         monkeypatch.setattr(telemetry, "COMMAND_PATH", tmp_path / "command.json")
         return tmp_path
 
+    # start_session() starts a heartbeat thread. Each test ends its session so the thread
+    # can't outlive the temp paths and write fake status into a live recording's file.
     def test_status_round_trips(self, tel_dir):
         tel = telemetry.Telemetry()
         tel.start_session(class_code="TEST 100", class_title="Test")
-        tel.add_transcript("12:00:00", "hello")
-        tel.flush()
-        status = telemetry.read_status()
-        assert status["active"] and status["class_code"] == "TEST 100"
-        assert status["transcript"][-1]["text"] == "hello"
+        try:
+            tel.add_transcript("12:00:00", "hello")
+            tel.flush()
+            status = telemetry.read_status()
+            assert status["active"] and status["class_code"] == "TEST 100"
+            assert status["transcript"][-1]["text"] == "hello"
+        finally:
+            tel.end_session()
 
     def test_realtime_factor_is_gpu_seconds_per_audio_second(self, tel_dir):
         tel = telemetry.Telemetry()
         tel.start_session(class_code="T", class_title="T")
-        tel.record_chunk(audio_seconds=20.0, transcribe_seconds=5.0, segments=2)
-        tel.flush()
-        assert telemetry.read_status()["realtime_factor"] == pytest.approx(0.25)
+        try:
+            tel.record_chunk(audio_seconds=20.0, transcribe_seconds=5.0, segments=2)
+            tel.flush()
+            assert telemetry.read_status()["realtime_factor"] == pytest.approx(0.25)
+        finally:
+            tel.end_session()
 
     def test_command_is_consumed_exactly_once(self, tel_dir):
         """A dashboard click must not be able to fire the same save twice."""

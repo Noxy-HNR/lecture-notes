@@ -11,6 +11,17 @@ colorama>=0.4.6
 pycaw>=20240210
 comtypes>=1.4.0
 
+# Default transcription model: Cohere Transcribe 03-2026 (src/transcribe.py). Needs a CUDA
+# build of torch (same cu128 index URL as the diarization note below) plus a one-time
+# download into this project's state/cohere_transcribe/. The Hugging Face repo is gated:
+# accept its terms on https://huggingface.co/CohereLabs/cohere-transcribe-03-2026 with the
+# account behind HUGGINGFACE_TOKEN, then:
+#   python -c "import os; from huggingface_hub import snapshot_download; snapshot_download('CohereLabs/cohere-transcribe-03-2026', local_dir='state/cohere_transcribe', token=os.environ['HUGGINGFACE_TOKEN'])"
+# Without it the app falls back to Whisper large-v3 (faster-whisper, above) automatically.
+transformers>=5.4.0
+sentencepiece>=0.2.0
+accelerate>=1.0.0
+
 # GPU acceleration for Whisper transcription (faster-whisper/ctranslate2). Not
 # installed by default via this file since the right build is machine-specific -
 # see README "GPU acceleration" section. This machine has an RTX 5070 Ti, set up
@@ -30,3 +41,5 @@ comtypes>=1.4.0
 # separate process on its own port - see README "Local GPU note formatting".
 # No pip packages needed for this one - just the llama.cpp binary + a GGUF model
 # downloaded into this project's own state/llama_model/.
+# Process discovery for the diagnostics Start Notes button.
+psutil>=5.9

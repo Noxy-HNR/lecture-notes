@@ -7,6 +7,7 @@ Formatting is tried in this order:
   3. Local, dependency-free formatter - used if we're offline or both of the above fail.
 """
 import difflib
+from performance import stage
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from storage import atomic_write, update_session, session_bounds, session_markers
 import docx_export
 import gpu_formatter
 import local_formatter
@@ -354,11 +356,13 @@ def _proofread(class_title: str, class_code: str, transcript: str) -> str:
     never lets a failure here affect the actual proofreading result)."""
     prompt = _build_proofread_prompt(class_title, class_code, transcript)
     cleaned = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
-    if cleaned:
-        try:
-            vocab_module.save_learned_terms(class_code, _detect_corrections(transcript, cleaned))
-        except Exception:
-            pass
+    # Automatic vocabulary learning from this diff is deliberately OFF. It ran for two
+    # weeks and mostly learned ordinary words ("really", "morning", "shark") plus
+    # confident mis-corrections ("R-isomer", "antiemetic" in a lecture about anions and
+    # cations). Those went straight back into the transcription prompt, and a side-by-side
+    # test on real lectures caught a model writing "an R-isomer or an antiemetic" where
+    # the lecturer said "an anion or a cation". Terms now only enter vocab.json by hand or
+    # through the corrections review, where a person has confirmed them.
     return cleaned or transcript
 
 
@@ -370,13 +374,14 @@ FORMATTING_MODES = ("auto", "local", "heuristic")
 
 def format_and_save(class_code: str, class_title: str, transcript: str,
                      session_date: str | None = None, mode: str = "auto",
-                     combine_proofread: bool = False) -> Path:
+                     combine_proofread: bool = False, session_id: str | None = None,
+                     replace_session: bool = False) -> tuple[Path, str]:
     """Formats `transcript` into notes and appends them to notes/<CODE>.md. Returns the file path.
     `mode` controls which formatting tiers are allowed - see FORMATTING_MODES above.
     `combine_proofread`: do proofreading + notes-formatting as one CLI/API call instead
     of two sequential ones (see _build_combined_prompt) - worth it for a large,
     latency-sensitive transcript (e.g. the full-session-diarization save at Ctrl+C),
-    not worth the lost vocab-learning signal for the normal small per-chunk saves."""
+    available for comparison on normal saves; vocabulary auto-learning is disabled."""
     if mode not in FORMATTING_MODES:
         raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
     if not session_date:
@@ -396,12 +401,15 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
         if combine_proofread:
             prompt = _build_combined_prompt(class_title, class_code, session_date, transcript, prior_tail)
         else:
-            proofread_transcript = _proofread(class_title, class_code, transcript)
+            with stage('proofreading'):
+                proofread_transcript = _proofread(class_title, class_code, transcript)
             prompt = _build_notes_prompt(class_title, class_code, session_date, proofread_transcript, prior_tail)
-        section = _try_claude_cli_format(prompt)
+        with stage('format_cli'):
+            section = _try_claude_cli_format(prompt)
         method = "cli"
         if section is None:
-            section = _try_claude_api_format(prompt)
+            with stage('format_api'):
+                section = _try_claude_api_format(prompt)
             method = "api"
 
     # An NPU tier (Phi-3.5-mini via OpenVINO) was tried here first and rolled back: on
@@ -411,7 +419,8 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
     # unlike OpenVINO's Intel-only "GPU" device) has been reliable in testing for this
     # per-chunk task specifically - see gpu_formatter.py for the full story.
     if section is None and mode in ("auto", "local"):
-        section = gpu_formatter.format_transcript(class_title, session_date, transcript)
+        with stage('format_local_gpu'):
+            section = gpu_formatter.format_transcript(class_title, session_date, transcript)
         if section is not None:
             # Smaller model than Claude, inconsistently catches mis-transcribed
             # vocabulary - run the same fuzzy glossary fix-up the heuristic formatter
@@ -424,15 +433,19 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
         method = "local"
 
     path = notes_path(class_code)
+    existing = _read_existing(class_code)  # re-read after the potentially slow formatter
+    before_save = existing
     if not existing:
-        header = f"# {class_title} ({class_code})\n\n"
-        path.write_text(header + section + "\n\n", encoding="utf-8")
+        existing = f"# {class_title} ({class_code})\n\n"
+    if session_id:
+        updated = update_session(existing, session_id, section, replace=replace_session)
     else:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n" + section + "\n\n")
+        updated = existing.rstrip() + "\n\n" + section.strip() + "\n"
+    atomic_write(path, updated, expected=before_save)
 
     try:
-        docx_export.append_section(class_code, class_title, section)
+        with stage('word_export'):
+            docx_export.rebuild(class_code, class_title, updated)
     except Exception:
         # .docx is a nice-to-have mirror of the .md; never let it block saving notes.
         pass
@@ -703,7 +716,7 @@ def export_flashcards_anki(class_code: str, class_title: str, questions: list[di
 
 
 def condense_session(class_code: str, class_title: str, before_length: int,
-                      mode: str = "auto") -> tuple[bool, str | None]:
+                      mode: str = "auto", session_id: str | None = None) -> tuple[bool, str | None]:
     """Re-reviews everything written to this class's notes since `before_length`
     (the file's length when this recording session started), collapsing duplicate/
     multi-autosave sections into one clean section. Only runs in "auto" mode (CLI/API)
@@ -739,11 +752,18 @@ def condense_session(class_code: str, class_title: str, before_length: int,
             title_end = split_at + 2
     preserve_length = max(before_length, title_end)
 
-    if preserve_length >= len(content):
+    if preserve_length >= len(content) and not session_id:
         return False, "nothing new to condense"
 
     header_part = content[:preserve_length]
     session_part = content[preserve_length:]
+    if session_id:
+        bounds = session_bounds(content, session_id)
+        if not bounds:
+            return False, "session has no saved notes"
+        left, right = bounds
+        start_marker, end_marker = session_markers(session_id)
+        session_part = content[left + len(start_marker):right - len(end_marker)]
     if not session_part.strip():
         return False, "nothing new to condense"
 
@@ -753,7 +773,11 @@ def condense_session(class_code: str, class_title: str, before_length: int,
         return False, "Claude CLI/API unavailable"
 
     new_content = header_part.rstrip("\n") + "\n\n" + condensed.strip() + "\n"
-    path.write_text(new_content, encoding="utf-8")
+    if session_id:
+        new_content = update_session(content, session_id, condensed, replace=True)
+    if path.read_text(encoding="utf-8") != content:
+        return False, "notes changed during formatting; retry condensation"
+    atomic_write(path, new_content, expected=content)
 
     try:
         docx_export.rebuild(class_code, class_title, new_content)

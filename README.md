@@ -1,8 +1,87 @@
 # Lecture Notes App
 
+## Starting Notes from diagnostics
+
+Open the dashboard's **Diagnostics** page and click **Start Notes**. It opens the
+existing recorder startup window, where you choose the action, class, audio source,
+and formatting mode. Recording begins only after that setup and the normal preflight
+checks. Diagnostics shows "Notes window open" during startup, then live session
+status once capture starts. Use **Save now** and **Stop recording** there as usual.
+
+The Start button is disabled while a recorder process is open, including a recorder
+launched outside the dashboard. Closing that window makes Start available again.
+The dashboard reports launch/command errors rather than silently ignoring them.
+The dashboard and recorder remain separate processes, so restarting or closing the
+dashboard does not stop a recording. Restart the dashboard after installing this update.
+
+## Correcting a lecture
+
+Open **Corrections** in the dashboard, or **Correct this lecture** in Recordings.
+
+1. Choose a recording. Click a transcript segment to seek the audio, then press Play.
+2. Edit the transcript text. Optionally enter a corrected technical term to remember
+   in that class's glossary, then select **Save transcript correction**.
+3. Choose the precise note section to update. Check the transcript segments that
+   support it; use the filter to find relevant passages in a long recording.
+4. Select a regeneration method and generate a preview. Local mode is the default;
+   Claude mode sends only the selected section and excerpt to the CLI/API. The
+   no-model option produces lossless transcript bullets. The preview identifies
+   which method actually succeeded.
+5. Review the before/after text, edit the proposed content if needed, and select
+   **Apply this section only**. Other sections remain unchanged. Keep the original
+   section heading when editing the preview.
+
+Corrections are stored in `state/<recording>_corrections.json`; original audio,
+raw text, and timed segments remain intact. Search and recovery use reviewed
+wording. Notes, glossary changes, and correction replacements preserve revisions.
+The existing revision restoration command can restore the prior notes file.
+
+Legacy recordings without precise timing still support text correction and
+whole-recording playback. Legacy notes without recording markers require you to
+choose their section manually. Finish recording a class before editing its notes.
+Concurrent edits are checked when saving and when applying previews; reload after
+a conflict. Unsaved transcript edits have a **Discard edit** control.
+
+Restart the dashboard server after updating to load the new API routes. Generation
+runs in the background; previews expire after one hour or a dashboard restart.
+
+## Recording, recovery, and playback improvements
+
+- Each captured audio block is flushed to the WAV **before** entering the
+  transcription queue. Failed inference preserves the source audio; backlog
+  entries store disk offsets rather than retaining whole audio arrays.
+- New sessions save `_segments.jsonl` beside the recording, with audio-relative
+  start/end times. Search results expose **Play this moment**, and Recordings
+  provides an audio player with seeking. Older recordings retain whole-recording
+  playback; their legacy wall-clock timestamps are not used for inaccurate seeks.
+  Recovering an old WAV creates precise segment offsets after transcription succeeds.
+- Autosaves, final diarization, and recovery use session IDs inside Markdown
+  comments. Repeating recovery replaces that session's contribution. Earlier
+  same-day sessions are preserved. Legacy unmarked notes are left intact because
+  their ownership cannot be reconstructed reliably; the first recovery may coexist
+  with those old notes, while subsequent recoveries replace the marked section.
+- Every replaced notes file is saved with an atomic write and a prior-version
+  snapshot under `notes/.revisions/<filename>/`. Formatting failures no longer
+  truncate the old notes before replacement content is ready. The Word mirror is
+  rebuilt after saves and excludes the internal session comments.
+- Recovery reads WAV data in chunks, and cleanup closes the recording even when
+  final processing fails. A disk write failure stops capture and reports the error.
+
+To list revisions and restore one (stop recording before restoring):
+
+```powershell
+venv\Scripts\python.exe tools/restore_revision.py --class "BIOL 1440"
+venv\Scripts\python.exe tools/restore_revision.py --class "BIOL 1440" --revision <filename-from-list>
+```
+
+Restoring preserves the current version too. Revisions are not automatically
+deleted. Run offline regressions with `venv\Scripts\python.exe -m pytest tests -q`.
+Physical microphone/GPU behavior should still be smoke-tested before a lecture.
+
 Auto-detects which class you're in (from `schedule.json`, based on the day/time),
-records + transcribes the lecture fully locally with Whisper, and turns the
-transcript into clean notes appended to that class's ongoing notes file.
+records + transcribes the lecture fully locally (Cohere Transcribe by default, with
+Whisper large-v3 as an automatic fallback), and turns the transcript into clean notes
+appended to that class's ongoing notes file.
 
 Note formatting is tried in this order, each falling back to the next if unavailable:
 1. **Claude Code CLI** (`claude -p`) — uses your logged-in Pro/Max subscription, no per-token billing
@@ -35,17 +114,51 @@ Also:
 - The live console view is color-coded: cyan timestamps, white transcript text,
   green for successful saves, yellow/red for fallback or error states, magenta
   for autosave markers.
+- **One transcription pass**: the terminal and dashboard show the accurate output
+  used for notes, normally after each two-minute Cohere window plus processing time.
+  Lines use blue timestamps and light text without pass headings. Audio keeps
+  recording between updates; no extra preview inference runs.
 
 ## One-time setup
 
+### Performance and recovery checks
+
+Transcription retries an inference failure once, restoring rolling context before
+retrying. Result-writing callbacks are never automatically replayed. Unresolved
+windows are recorded beside the audio as `.failed.json`, and shutdown reports the
+existing `--resume` command. Resume still recovers the session from its backup;
+the ledger identifies gaps rather than introducing another recovery format.
+
+Stage durations (without transcript text) are appended to `state/performance.jsonl`.
+They include audio reads, transcription windows, Cohere preprocessing/inference,
+proofreading, formatting calls, and Word export.
+
+`tools/quality_benchmark.py` supports `format` comparisons on a saved transcript
+and `accuracy` comparisons on a JSON list of audio cases. It refuses to run while
+the recorder is open. Pass `--output` with a new report filename. Formatting uses
+Claude CLI and writes only the report, never class notes. Accuracy cases provide
+`audio`, human-checked `reference`, and optional `start`, `seconds`, and
+`quiet_padding` (seconds added on each side). Audio must be mono 16 kHz.
+
+Combined formatting remains opt-in pending quality review. Real-model quiet-audio
+testing and the duplicate-splitting optimization are pending measurement; tuned
+recognition settings and timestamp splitting have not been changed.
+
 ```bash
-cd C:/AI/lecture-notes
+cd C:/AI/Projects/lecture-notes
 python -m venv venv
 ./venv/Scripts/python.exe -m pip install -r requirements.txt
 ```
 
-The first time you transcribe, `faster-whisper` downloads the model (~150MB
-for the default `base.en`) and caches it — after that it runs fully offline.
+**Transcription model (one-time download, ~4GB):** the default model is
+[Cohere Transcribe 03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026).
+Its repo is gated, so accept the terms on that page with the Hugging Face account
+behind `HUGGINGFACE_TOKEN`, then run the download command in `requirements.txt`. It
+goes into this project's `state/cohere_transcribe/` rather than the shared Hugging Face
+cache, so a general cache cleanup can't delete it. If it's missing, or there's no CUDA
+GPU, the app falls back to Whisper large-v3 automatically (which faster-whisper
+downloads, ~3GB, on first use) and says so during preflight. After that everything
+runs fully offline.
 
 **Recommended:** the Claude Code CLI is already installed
 (`C:\Users\braxt\.local\bin\claude.exe`, on PATH as `claude`). Log in once with
@@ -119,9 +232,10 @@ to fix, not something to ignore.
 
 - Before anything else, it runs **preflight checks**: opens your audio device
   and confirms it's actually picking up sound (not silent/muted), checks disk
-  space, and confirms the Whisper model loads - so a broken mic or a dead GPU
-  shows up now, not silently mid-lecture. A genuinely broken audio device or
-  Whisper model stops the app here rather than starting a doomed session;
+  space, and confirms the transcription model loads (saying so plainly if it had to
+  fall back from Cohere to Whisper) - so a broken mic or a dead GPU shows up now, not
+  silently mid-lecture. A genuinely broken audio device or a transcription model that
+  can't load at all stops the app here rather than starting a doomed session;
   other issues are just warnings and don't block starting.
 - It checks `schedule.json` against the current day/time and tells you which
   class it thinks you're in (with a 10-minute grace window before/after, so
@@ -145,11 +259,14 @@ to fix, not something to ignore.
   you just want to be sure something important is captured. This also resets
   the 5-minute autosave timer, so it doesn't immediately trigger another save
   right after. Doesn't wait for a full chunk to finish collecting first — it
-  saves whatever's been transcribed so far within about half a second.
+  sends the audio so far to transcription, then saves once that text is ready.
 - Press **Ctrl+C** to stop — you'll see a detailed, timestamped play-by-play
   of the shutdown sequence (stopping capture, transcribing any final buffered
   audio, diarizing if enabled, saving, condensing) rather than a silent pause,
   since some of these steps can take a while on a long/complex final segment.
+  Pressing Ctrl+C again during shutdown doesn't cancel it; it prints "Already
+  stopping" and keeps saving. Closing the window instead can lose the final notes
+  (the audio backup is kept for `--resume`).
   Notes are formatted and appended to `notes/<CLASS_CODE>.md`. Long sessions
   also autosave every 5 minutes so nothing is lost if the app closes
   unexpectedly.
@@ -163,7 +280,7 @@ python src/main.py --source system         # capture system audio (loopback)
 python src/main.py --formatting auto       # skip the formatting-mode prompt
 python src/main.py --formatting local      # local only - no CLI/API calls this session
 python src/main.py --formatting heuristic  # heuristic only - no LLM anywhere
-python src/main.py --chunk 8               # transcribe in 8s chunks for more frequent output (default 15)
+python src/main.py --chunk 30              # transcribe in 30s chunks for more frequent output (default: 120 Cohere / 20 Whisper)
 python src/main.py --list                  # show all classes from schedule.json
 python src/main.py --list-sessions         # list recoverable session backups (see below)
 python src/main.py --resume PATH           # recover a crashed session (see below)
@@ -173,7 +290,7 @@ python src/main.py --prune-backups         # clean up old state/ backups (see be
 ## Recovering a crashed/interrupted session
 
 If the app dies unexpectedly (not a clean Ctrl+C - a crash, a power loss),
-the final formatting/condense step never runs, but nothing is actually lost:
+the final formatting/condense step never runs, the persisted audio and transcript remain available:
 the raw transcript and full audio are written incrementally throughout the
 session (`state/*_raw.txt` and `state/*.wav`), not just at the end.
 
@@ -187,9 +304,8 @@ matching pair automatically). If the audio backup exists, it's **re-transcribed
 from scratch** (not just replayed from the raw log) so diarization can run on
 it too - safe to do now since recording has already stopped, unlike during a
 live session. It's then formatted, saved, and condensed exactly like a normal
-final save, including merging against any earlier autosaves already in the
-notes file for that same date - previous lecture dates in the file are left
-untouched. Falls back to the raw transcript log alone (no diarization
+final save, replacing the same session section written by earlier autosaves. Other sessions,
+including recordings from the same date, are left untouched. Falls back to the raw transcript log alone (no diarization
 possible) if only that backup survived.
 
 ## Full-session diarization at Ctrl+C
@@ -275,28 +391,51 @@ Add/remove classes or sessions as your schedule changes each term.
 
 The app is currently tuned for accuracy over live-update frequency:
 
-- **Model size**: `"large-v3"` (the most accurate Whisper model) in
-  `src/transcribe.py` - practical because of the GPU (see below). If you ever
-  run this CPU-only, drop it to `"small.en"` or `"medium.en"`, or `large-v3`
-  will be painfully slow.
-- **Chunk size** (`--chunk`, default 15s): larger chunks give Whisper more
-  context per call, which improves accuracy. Live console updates arrive less
-  often as a result - lower this if you want faster feedback at some accuracy
-  cost.
-- **Chunk overlap**: consecutive chunks overlap by 1.5s (`RollingTranscriber`
-  in `src/main.py`) so a word split across a chunk boundary doesn't get
-  clipped/mis-heard. The overlapping portion's already-emitted text is
-  automatically deduplicated.
-- **Rolling context prompt**: each chunk is transcribed with the tail of the
-  previous chunk's text fed back in as Whisper's `initial_prompt` (alongside
-  the vocab hints), so it has continuity across chunks instead of starting
-  cold every time.
-- **Beam size**: `BEAM_SIZE = 8` in `src/transcribe.py` (Whisper's default is
-  5) - a wider decoding search for slightly better accuracy, cheap given the
-  GPU headroom on this machine.
-- **Latin/technical vocabulary**: add terms to `vocab.json` under your class's
-  code (or `"_global"` for terms that apply everywhere). These both prime
-  Whisper's recognition and get fuzzy-corrected during proofreading.
+- **Model**: Cohere Transcribe 03-2026 by default, chosen by measurement. In a
+  three-way test on real PSYC 1300 and BIOL 1440 lectures (`tools/model_ab_test.py`)
+  it disagreed least with the other two models on both clips, ran several times
+  faster than Whisper large-v3 or Qwen3-ASR, and got technical terms right with no
+  vocabulary prompt. Whisper large-v3 is the automatic fallback (`BACKEND_PREFERENCE`
+  in `src/transcribe.py`). Cohere returns no word timings; each piece it decodes (up
+  to 35s) is one timed segment, so search jumps to the right half-minute of a
+  recording, not the exact word.
+- **Cohere settings** (`COHERE_*` in `src/transcribe.py`): tuned by
+  `tools/cohere_tuning.py` against human-verified TED-LIUM transcripts, not other
+  models. The app hands Cohere 2-minute windows, which its own splitter cuts at the
+  quietest moment near each 35s mark - versus fixed 20s cuts that land mid-word, WER
+  went 2.88% → 2.44% on the tuning talks and 4.33% → 3.73% on held-out talks. Beam search (2/4/8), no dither, and full 32-bit precision were all
+  within noise of greedy bf16 while running 2-8× slower, so the defaults stay. Even
+  so it transcribes 2 minutes of audio in ~2-4 seconds.
+- **Cohere failure guards** (`looks_degenerate` / `is_silent_audio` in
+  `src/transcribe.py`): two failures seen live in CHEM 1450 (2026-09-14), both
+  reproducible. A muted or dropped-out mic (pure digital silence) came back as
+  invented sentences ("The world is a very important part of the world" ×6), so
+  pieces with no sound get no text. Very quiet room audio (class working) made the
+  decoder loop until its length cap ("the other one is the other one…", 770 words
+  from 33s), so a piece that repeats a phrase 4+ times, or has more words than
+  anyone can say in that time, is re-decoded in 10s sub-pieces and anything still
+  looping is dropped. Pieces that pass both checks keep exactly the normal output:
+  re-running that session changed only its 6 failed pieces out of 63. A repetition
+  penalty was tried first and rejected because it also changed correct words.
+- **Chunk size** (`--chunk`): defaults to the loaded model's tuned window - 120s for
+  Cohere, 20s for the Whisper fallback (the most accurate of 15/20/25/30s in
+  `tools/chunk_size_sweep.py`). Accurate text arrives in 2-minute batches,
+  without an additional preview pass. A window is only
+  skipped as silent if every 20s slice of it is silent.
+- **Chunk overlap** (Whisper fallback only): consecutive chunks overlap by 1.5s
+  (`RollingTranscriber` in `src/main.py`) so a word split across a boundary isn't
+  clipped, with the repeated text dropped using Whisper's segment timings. Cohere
+  has no timings to drop repeats with, so it runs on back-to-back chunks - which is
+  also exactly how it was tested.
+- **Whisper-only settings**: a rolling context prompt (the previous chunk's text fed
+  back in as `initial_prompt`) and `BEAM_SIZE = 8` in `src/transcribe.py`. Cohere
+  has no prompt input and ignores both.
+- **Latin/technical vocabulary**: add terms to `vocab.json` under your class's code
+  (or `"_global"` for terms that apply everywhere). They prime the Whisper fallback,
+  and the proofreading pass fuzzy-corrects toward them. Terms are no longer learned
+  automatically - that filled the list with ordinary words and mis-corrections that
+  steered transcription toward words nobody said - so add them by hand or through the
+  corrections review.
 - **Proofreading + fact flags**: whenever the CLI/API is available, transcripts
   get proofread and possible mis-transcription-driven factual oddities get
   flagged inline (`⚠️ verify`) rather than silently changed — always double
@@ -422,11 +561,12 @@ theoretical hardening:
   waste real battery for a 50+ minute lecture for no benefit, since the app
   doesn't need the screen on to keep recording in the background.
 - **Silence detection** (`audio.is_silent`, used in `RollingTranscriber`): if
-  a chunk is at/near total silence, it's skipped before ever reaching Whisper.
-  Feeding Whisper silence is a known way to get it to hallucinate repeated
-  punctuation/filler (`...`, `you`) instead of just emitting nothing - if
-  you've seen streams of dots in the output, this is why. If silence continues
-  for 2+ minutes, you'll get a one-time console warning suggesting you check
+  a whole window is at/near total silence, it's skipped before ever reaching the
+  model; silent pieces inside a window are dropped by the Cohere guard above.
+  Feeding a model silence is a known way to get it to hallucinate repeated
+  punctuation/filler (`...`, `you`) or whole invented sentences instead of just
+  emitting nothing. If silence continues for about 45 seconds, you'll get a
+  one-time console and dashboard warning suggesting you check
   whether your mic is muted/disconnected (or, on system audio, whether
   anything's actually playing) - the app keeps running either way, but this
   flags a real audio-source problem instead of silently producing garbage.

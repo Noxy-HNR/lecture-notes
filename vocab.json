@@ -54,7 +54,14 @@
     "REM",
     "circadian",
     "introspection",
-    "psychopathology"
+    "psychopathology",
+    "unobtrusive",
+    "naturalistic",
+    "Rosenthal",
+    "reactance",
+    "glial",
+    "Prozac",
+    "L-DOPA"
   ],
   "BIOL 1440": [
     "photosynthesis",
@@ -93,14 +100,32 @@
     "lysosome",
     "vacuole",
     "hydrophobic",
+    "hydrophilic",
+    "amphipathic",
     "solutes",
-    "carrying",
     "detergents",
     "hydration",
-    "hydrophilic",
     "micelle",
     "micelles",
-    "hydronium"
+    "hydronium",
+    "equilibria",
+    "molarity",
+    "molar",
+    "anion",
+    "cation",
+    "hydrocarbons",
+    "hydroxyl",
+    "carboxyl",
+    "covalent",
+    "polar",
+    "phosphorus",
+    "condensation",
+    "cellulose",
+    "monosaccharide",
+    "disaccharides",
+    "trisaccharide",
+    "trioses",
+    "vertebrates"
   ],
   "CHEM 1450": [
     "stoichiometry",
@@ -126,13 +151,7 @@
     "in situ",
     "noble",
     "paramagnetic",
-    "rodeo",
-    "francium",
-    "charge",
-    "lowercase",
-    "obviously"
+    "francium"
   ],
-  "WRTG 1310": [
-    "youthful"
-  ]
+  "WRTG 1310": []
 }

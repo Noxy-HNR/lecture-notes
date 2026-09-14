@@ -30,6 +30,7 @@ def _add_inline_runs(paragraph, text: str):
 
 
 def _append_markdown(doc: Document, markdown: str):
+    markdown = re.sub(r"<!-- /?session:[A-Za-z0-9_-]+ -->", "", markdown)
     for raw_line in markdown.split("\n"):
         line = raw_line.rstrip()
         if not line.strip():

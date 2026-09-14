@@ -102,6 +102,9 @@ def main_cli():
         samples = samples.mean(axis=1)
     print(f"Clip: {args.wav} ({len(samples) / audio.SAMPLE_RATE:.0f}s)\n")
 
+    # This tunes Whisper's chunking. Pin it: the app's default model is now Cohere, which
+    # would otherwise be measured here silently.
+    transcribe.use_backend("whisper")
     transcribe.get_model()  # load once so timings below exclude model load
 
     print("Reference (single pass, no chunk boundaries)...")

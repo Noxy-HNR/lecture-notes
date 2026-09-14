@@ -35,6 +35,9 @@ class Telemetry:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = None
         self._transcript = deque(maxlen=MAX_TRANSCRIPT_LINES)
         self._events = deque(maxlen=MAX_EVENT_LINES)
         self._state = {
@@ -77,7 +80,17 @@ class Telemetry:
             self._state["started_at"] = time.time()
         self.flush()
 
+        self._heartbeat_stop.clear()
+        def heartbeat():
+            while not self._heartbeat_stop.wait(5):
+                self.flush()
+        self._heartbeat_thread = threading.Thread(target=heartbeat, daemon=True, name="notes-heartbeat")
+        self._heartbeat_thread.start()
+
     def end_session(self):
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2)
         with self._lock:
             self._state["active"] = False
         self.flush()
@@ -121,6 +134,11 @@ class Telemetry:
                                   "level": level, "message": message})
 
     def flush(self):
+        # Serialize snapshot and replacement: heartbeat and result callbacks share a file.
+        with self._write_lock:
+            self._flush_locked()
+
+    def _flush_locked(self):
         with self._lock:
             payload = dict(self._state)
             payload["updated_at"] = time.time()

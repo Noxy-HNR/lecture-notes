@@ -17,21 +17,25 @@ Usage:
     python src/main.py                 # auto-detect class from schedule, prompt for audio source
     python src/main.py --class "BIOL 1440"   # override class selection
     python src/main.py --source mic    # skip the audio-source prompt (mic | system)
-    python src/main.py --chunk 20      # seconds per transcription chunk (default 20, measured
-                                        # as the most accurate of 15/20/25/30 on real lectures -
-                                        # see DEFAULT_CHUNK_SECONDS. Lower it for more frequent
-                                        # live output at a real accuracy cost)
+    python src/main.py --chunk 20      # seconds of audio per transcription call (default: tuned
+                                        # per model - 120 for Cohere, 20 for the Whisper fallback;
+                                        # see transcribe.py. Lower it for more frequent live
+                                        # output at a real accuracy cost)
     python src/main.py --list          # list all classes in the schedule and exit
 
 Stop recording any time with Ctrl+C. Notes are saved (with a safety autosave
 every few minutes) even if you stop abruptly.
 """
 import argparse
+import json
 import os
 import queue
 import random
 import re
 import shutil
+import signal
+import copy
+from performance import stage
 import sys
 import threading
 import time
@@ -47,6 +51,7 @@ import audio
 import capture as capture_module
 import transcribe
 import notes
+from storage import atomic_write
 import docx_export
 import diarize
 import gpu_formatter
@@ -93,7 +98,24 @@ AUTOSAVE_EVERY_SECONDS = 5 * 60  # flush partial notes periodically, not just at
 # The tradeoff is live-view latency - the terminal now prints a batch roughly every 20s
 # instead of 15s. That buys a real accuracy gain on the notes, which is what actually
 # gets studied from.
+#
+# That sweep was Whisper's. The default model is now Cohere Transcribe, tuned separately
+# (transcribe.COHERE_WINDOW_SECONDS), so --chunk defaults to whatever the loaded model
+# prefers; this constant is only the Whisper value and the fallback if that can't be read.
 DEFAULT_CHUNK_SECONDS = 20.0
+# Silence gate granularity: a long window is only skipped if every slice of this length is
+# silent, so 110s of dead air around 10s of speech still gets transcribed.
+SILENCE_CHECK_SECONDS = 20.0
+
+
+def resolve_chunk_seconds(args) -> float:
+    """--chunk if given, else the loaded transcription model's tuned window."""
+    if args.chunk is None:
+        try:
+            args.chunk = transcribe.preferred_chunk_seconds()
+        except Exception:
+            args.chunk = DEFAULT_CHUNK_SECONDS
+    return args.chunk
 
 # Automatic retention for state/ backups, applied once at the end of each session.
 # Audio is essentially all of the disk cost (~70MB per lecture, ~1GB after two weeks)
@@ -222,17 +244,27 @@ class RollingTranscriber:
     def process(self, new_chunk: np.ndarray) -> list[dict]:
         """Returns segments (start/end/text) with timestamps relative to `new_chunk`,
         ready to pass to Session.write_chunk alongside it."""
+        # The overlap trick needs per-segment timestamps to drop the words that came from
+        # the repeated audio. Cohere Transcribe returns only text, so prepending the overlap
+        # would duplicate ~1.5s of speech at every chunk boundary. Timestamp-less backends
+        # run on plain back-to-back chunks instead - the exact setup that was measured as
+        # most accurate in tools/model_ab_test.py.
+        overlap_seconds = self.OVERLAP_SECONDS if transcribe.supports_timestamps() else 0.0
+        if overlap_seconds == 0.0:
+            self.overlap_audio = np.zeros(0, dtype=np.float32)
+        overlap_frames = int(overlap_seconds * audio.SAMPLE_RATE)
         overlap_duration = len(self.overlap_audio) / audio.SAMPLE_RATE
         combined = np.concatenate([self.overlap_audio, new_chunk])
 
-        if audio.is_silent(combined):
-            # Skip Whisper entirely on (near-)silence - otherwise it tends to hallucinate
+        step = int(SILENCE_CHECK_SECONDS * audio.SAMPLE_RATE)
+        if all(audio.is_silent(combined[i:i + step]) for i in range(0, max(len(combined), 1), step)):
+            # Skip the model entirely on (near-)silence - otherwise it tends to hallucinate
             # repeated punctuation/filler ("...", "you") rather than emitting nothing,
             # which is what happens if the mic gets muted/disconnected or the "system
             # audio" source goes quiet while the app keeps running unattended.
             self.consecutive_silent_chunks += 1
-            overlap_frames = int(self.OVERLAP_SECONDS * audio.SAMPLE_RATE)
-            self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
+            if overlap_frames:
+                self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
             return []
         self.consecutive_silent_chunks = 0
 
@@ -253,8 +285,8 @@ class RollingTranscriber:
             new_text = " ".join(s["text"] for s in kept)
             self.recent_text = (self.recent_text + " " + new_text)[-self.CONTEXT_CHARS:]
 
-        overlap_frames = int(self.OVERLAP_SECONDS * audio.SAMPLE_RATE)
-        self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
+        if overlap_frames:
+            self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
 
         return kept
 
@@ -322,8 +354,12 @@ class TranscriptionWorker:
     in order - the caller is expected to do its printing/session-writing/silence-check
     there. Since only this one thread ever calls it, none of that needs its own lock."""
 
-    def __init__(self, transcriber: "RollingTranscriber", on_result):
+    def __init__(self, transcriber: "RollingTranscriber", on_result, audio_reader=None, failure_path=None):
         self._transcriber = transcriber
+        self._audio_reader = audio_reader
+        self.failure_path = Path(failure_path) if failure_path else None
+        self.failures = []
+        self._scheduled_frames = 0
         self._on_result = on_result
         self._queue = queue.Queue()
         self._thread = threading.Thread(target=self._run, daemon=True, name="transcription-worker")
@@ -331,18 +367,59 @@ class TranscriptionWorker:
 
     def _run(self):
         while True:
-            chunk_audio = self._queue.get()
+            job = self._queue.get()
+            offset = 0
             try:
+                if callable(job):
+                    job()
+                    continue
+                offset, payload = job
+                with stage('audio_read'):
+                    chunk_audio = self._audio_reader(offset, payload) if self._audio_reader else payload
                 started = time.time()
-                whisper_segments = self._transcriber.process(chunk_audio)
-                self._on_result(chunk_audio, whisper_segments, time.time() - started)
+                # Restore rolling context on inference failure; never retry result writes.
+                snapshot = {key: copy.deepcopy(getattr(self._transcriber, key))
+                            for key in ('overlap_audio', 'recent_text', 'consecutive_silent_chunks')
+                            if hasattr(self._transcriber, key)}
+                for attempt in range(2):
+                    try:
+                        with stage('transcription_window'):
+                            segments = self._transcriber.process(chunk_audio)
+                        break
+                    except Exception:
+                        for key, value in snapshot.items():
+                            setattr(self._transcriber, key, copy.deepcopy(value))
+                        if attempt:
+                            raise
+                if self._audio_reader:
+                    self._on_result(chunk_audio, segments, time.time() - started,
+                                    offset / audio.SAMPLE_RATE)
+                else:
+                    self._on_result(chunk_audio, segments, time.time() - started)
             except Exception as e:
-                print(c.error(f"Transcription failed for a chunk (continuing): {e}"))
+                if not callable(job):
+                    self.failures.append({'offset_frames': offset,
+                                          'frames': payload if self._audio_reader else len(payload),
+                                          'error': str(e)})
+                    if self.failure_path:
+                        try:
+                            atomic_write(self.failure_path, json.dumps(self.failures, indent=2))
+                        except Exception as ledger_error:
+                            print(c.error(f'Could not write recovery ledger: {ledger_error}'))
+                print(c.error(f"Transcription failed at {offset / audio.SAMPLE_RATE:.1f}s: {e}. "
+                              "Captured audio remains available for recovery."))
             finally:
                 self._queue.task_done()
 
     def submit(self, chunk_audio):
-        self._queue.put(chunk_audio)
+        offset = self._scheduled_frames
+        self._scheduled_frames += len(chunk_audio)
+        # A slow GPU queues offsets, not hours of float arrays in memory.
+        self._queue.put((offset, len(chunk_audio) if self._audio_reader else chunk_audio))
+
+    def after_pending(self, callback):
+        """Run a save snapshot after all audio already submitted, before later audio."""
+        self._queue.put(callback)
 
     def has_pending(self) -> bool:
         return not self._queue.empty()
@@ -385,6 +462,53 @@ class SaveNowListener:
             time.sleep(0.1)
 
 
+class StopRequest:
+    """Ctrl+C handling for a live recording. The first press asks the main loop to stop at
+    a safe point (never mid queue/offset bookkeeping) and wakes a part-filled audio
+    collection so its audio goes into the final window. Later presses don't abort
+    shutdown, since that would lose the final transcription and notes. They get a message
+    saying it's already stopping.
+
+    The handler itself never prints: shutdown prints constantly, and a signal handler that
+    printed while the main thread was mid-print could raise a reentrant-call error inside
+    the save. A small thread prints the message instead."""
+
+    MESSAGE = ("\nAlready stopping - finishing transcription and saving your notes. Please wait; "
+               "closing this window now could lose the final notes (the audio backup is kept).")
+
+    def __init__(self, wake_event: threading.Event):
+        self.requested = threading.Event()
+        self._wake = wake_event
+        self._repeats = 0
+        self._announce = threading.Event()
+        self._closed = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="stop-feedback")
+        self._thread.start()
+
+    def handle(self, signum, frame):
+        if self.requested.is_set():
+            self._repeats += 1
+            self._announce.set()
+            return
+        self.requested.set()
+        self._wake.set()
+
+    def _run(self):
+        while True:
+            self._announce.wait()
+            self._announce.clear()
+            if self._repeats:
+                self._repeats = 0
+                print(c.warning(self.MESSAGE))
+            if self._closed.is_set():
+                return
+
+    def close(self):
+        self._closed.set()
+        self._announce.set()
+        self._thread.join(timeout=2)
+
+
 class Session:
     """Tracks the running WAV recording + transcript segments for one lecture. Autosaves
     just flush plain transcript text (no diarization - see pop_pending_text for why);
@@ -400,9 +524,11 @@ class Session:
 
     def __init__(self, wav_path):
         self.wav_path = wav_path
-        self._sf = sf.SoundFile(str(wav_path), mode="w", samplerate=audio.SAMPLE_RATE,
+        self._sf = sf.SoundFile(str(wav_path), mode="x", samplerate=audio.SAMPLE_RATE,
                                  channels=1, subtype="FLOAT")
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.session_id = wav_path.stem
+        self.segments_path = wav_path.with_name(wav_path.stem + "_segments.jsonl")
         self.total_frames = 0
         self.last_save_frame = 0
         self.last_save_elapsed = 0.0
@@ -420,19 +546,39 @@ class Session:
         with self._lock:
             return bool(self.pending_segments)
 
-    def write_chunk(self, chunk_audio, whisper_segments):
+    def persist_audio(self, block):
         with self._lock:
-            chunk_offset = self.total_frames / audio.SAMPLE_RATE
-            self._sf.write(chunk_audio)
-            self.total_frames += len(chunk_audio)
-            for seg in whisper_segments:
-                entry = {
-                    "start": chunk_offset + seg["start"],
-                    "end": chunk_offset + seg["end"],
-                    "text": seg["text"],
-                }
-                self.pending_segments.append(entry)
-                self.all_segments.append(entry)
+            self._sf.write(block)
+            self._sf.flush()  # update the WAV header as well as the samples
+            self.total_frames += len(block)
+
+    def read_audio(self, offset, frames):
+        with self._lock:
+            with sf.SoundFile(str(self.wav_path)) as source:
+                source.seek(offset)
+                result = source.read(frames, dtype="float32")
+        if len(result) != frames:
+            raise IOError("Audio backup is shorter than the queued chunk")
+        return result
+
+    def record_segments(self, whisper_segments, chunk_offset):
+        with self._lock:
+            entries = [{"start": chunk_offset + seg["start"],
+                        "end": chunk_offset + seg["end"], "text": seg["text"]}
+                       for seg in whisper_segments]
+            with self.segments_path.open("a", encoding="utf-8") as handle:
+                for entry in entries:
+                    handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                handle.flush()
+            self.pending_segments.extend(entries)
+            self.all_segments.extend(entries)
+
+    def write_chunk(self, chunk_audio, whisper_segments):
+        """Compatibility helper for offline callers; live capture persists independently."""
+        with self._lock:
+            offset = self.total_frames / audio.SAMPLE_RATE
+            self.persist_audio(chunk_audio)
+            self.record_segments(whisper_segments, offset)
 
     def pop_pending_text(self, run_diarization: bool = False) -> str:
         """Returns speaker-labeled (if diarization succeeds and run_diarization=True) or
@@ -493,7 +639,9 @@ class Session:
         return text
 
     def close(self):
-        self._sf.close()
+        with self._lock:
+            if not self._sf.closed:
+                self._sf.close()
 
 
 MIN_FREE_DISK_GB = 2.0
@@ -543,11 +691,18 @@ def _check_disk_space() -> str | None:
 
 
 def _check_whisper_model() -> tuple[bool, str]:
+    """Loads the transcription model (Cohere Transcribe, falling back to Whisper). Says so
+    plainly when the fallback kicked in, rather than quietly recording on a different model."""
     try:
         transcribe.get_model()
-        return False, c.success(f"  Whisper model OK ({transcribe.device_info()})")
+        message = c.success(f"  Transcription model OK ({transcribe.backend_name()}, "
+                            f"{transcribe.device_info()})")
+        if transcribe.fallback_reason():
+            message += "\n" + c.warning(f"  Preferred model unavailable, using fallback - "
+                                        f"{transcribe.fallback_reason()}")
+        return False, message
     except Exception as e:
-        return True, c.error(f"  Whisper model FAILED to load: {e}")
+        return True, c.error(f"  Transcription model FAILED to load: {e}")
 
 
 class PreflightRunner:
@@ -684,19 +839,22 @@ def _relative_time(dt: datetime) -> str:
 
 
 def list_session_backups():
-    backups = sorted(STATE_DIR.glob("*_raw.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # A crash before the first successful transcription can leave only the WAV.
+    by_session = {p.name.removesuffix("_raw.txt"): p for p in STATE_DIR.glob("*_raw.txt")}
+    by_session.update({p.stem: p for p in STATE_DIR.glob("*.wav")
+                       if re.fullmatch(r".+_\d{8}_\d{6}", p.stem)})
+    backups = sorted(by_session.values(), key=lambda p: p.stat().st_mtime, reverse=True)
     if not backups:
         print("No session backups found in state/.")
         return
     print(c.heading("Session backups available to resume (most recent first):\n"))
-    for raw_path in backups:
-        wav_path = raw_path.parent / raw_path.name.replace("_raw.txt", ".wav")
+    for backup in backups:
         try:
-            _, _, class_code, _ = _resume_backup_paths(raw_path)
+            raw_path, wav_path, class_code, _ = _resume_backup_paths(backup)
         except ValueError:
-            class_code = raw_path.stem
+            continue
 
-        m = re.search(r"(\d{8}_\d{6})", raw_path.name)
+        m = re.search(r"(\d{8}_\d{6})", backup.name)
         when = _relative_time(datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")) if m else "?"
 
         if wav_path.exists():
@@ -956,28 +1114,44 @@ def run_resume(target: str, args):
     print(c.heading(f"\nRecovering session for {class_code} - {class_title} ({session_date})\n"))
 
     transcript_text = None
-    if wav_path.exists():
+    correction_path = wav_path.with_name(wav_path.stem + "_corrections.json")
+    if correction_path.exists():
+        # User-reviewed corrections take precedence over a fresh Whisper guess.
+        from transcripts import load_transcript
+        reviewed = load_transcript(wav_path.parent, wav_path.stem)
+        transcript_text = " ".join(s["text"] for s in reviewed["segments"])
+        print(c.info("Using reviewed transcript corrections; original audio is unchanged."))
+        if reviewed["timed"] and wav_path.exists() and diarize.available():
+            diar_segments = diarize.diarize(wav_path)
+            if diar_segments:
+                labeled = diarize.assign_speakers(reviewed["segments"], diar_segments)
+                transcript_text = diarize.to_labeled_transcript(labeled) or transcript_text
+    elif wav_path.exists():
         print(c.info(f"Found audio backup ({wav_path.name}) - re-transcribing so diarization "
                       f"can run on it (safe now: recording has already stopped)..."))
         transcribe.get_model()
         initial_prompt = vocab_module.initial_prompt_for_class(class_code)
         transcriber = RollingTranscriber(initial_prompt)
 
-        with sf.SoundFile(str(wav_path), mode="r") as f:
-            data = f.read(len(f), dtype="float32")
-
-        chunk_frames = max(1, int(args.chunk * audio.SAMPLE_RATE))
+        chunk_frames = max(1, int(resolve_chunk_seconds(args) * audio.SAMPLE_RATE))
         all_segments = []
         offset_seconds = 0.0
-        for pos in range(0, len(data), chunk_frames):
-            piece = data[pos: pos + chunk_frames]
-            for seg in transcriber.process(piece):
-                all_segments.append({
-                    "start": offset_seconds + seg["start"],
-                    "end": offset_seconds + seg["end"],
-                    "text": seg["text"],
-                })
-            offset_seconds += len(piece) / audio.SAMPLE_RATE
+        with sf.SoundFile(str(wav_path), mode="r") as source:
+            if source.samplerate != audio.SAMPLE_RATE or source.channels != 1:
+                raise ValueError("Recovery expects a mono 16 kHz session recording")
+            while True:
+                piece = source.read(chunk_frames, dtype="float32")
+                if not len(piece):
+                    break
+                for seg in transcriber.process(piece):
+                    all_segments.append({"start": offset_seconds + seg["start"],
+                                         "end": offset_seconds + seg["end"], "text": seg["text"]})
+                offset_seconds += len(piece) / audio.SAMPLE_RATE
+        # Refresh source-linked search for recovered sessions only after transcription succeeds.
+        sidecar = wav_path.with_name(wav_path.stem + "_segments.jsonl")
+        atomic_write(sidecar, "".join(json.dumps(seg, ensure_ascii=False) + "\n" for seg in all_segments))
+        if not raw_log_path.exists():
+            atomic_write(raw_log_path, "".join(seg["text"] + "\n" for seg in all_segments))
 
         transcript_text = " ".join(s["text"] for s in all_segments)
 
@@ -1010,12 +1184,13 @@ def run_resume(target: str, args):
     boundary = _find_date_section_boundary(existing_content, session_date)
 
     path, method = notes.format_and_save(class_code, class_title, transcript_text,
-                                          session_date, mode=formatting_mode)
+                                          session_date, mode=formatting_mode,
+                                          session_id=wav_path.stem, replace_session=True)
     print(c.success(f"Recovered transcript formatted and saved (method: {method})."))
 
     if formatting_mode == "auto" and notes.cli_available():
         print(c.info("Condensing recovered notes against any earlier autosaves from the same date..."))
-        ok, reason = notes.condense_session(class_code, class_title, boundary, mode=formatting_mode)
+        ok, reason = notes.condense_session(class_code, class_title, boundary, mode=formatting_mode, session_id=wav_path.stem)
         if ok:
             print(c.success("Recovered notes condensed and cleaned up."))
         else:
@@ -1061,23 +1236,10 @@ def try_full_session_diarization(cls, session: Session, session_date, session_st
         return False
     print(c.dim(f"  Diarization complete ({time.time() - diar_start:.1f}s)."))
 
-    notes_path = notes.notes_path(cls["code"])
-    existing = notes_path.read_text(encoding="utf-8") if notes_path.exists() else ""
-    # Discard everything already written for TODAY's date - not just session_start_offset
-    # (this session's own start). If the app was run more than once today for this class
-    # (recording paused and resumed in a fresh process), session_start_offset from a later
-    # run wouldn't know about an earlier run's "## <date>" section for the same day,
-    # leaving two separate headers side by side with nothing to merge them (this path
-    # skips the condense pass entirely, so that duplication would never get cleaned up).
-    # Finding the date heading fresh sweeps in everything for today regardless of how
-    # many separate runs wrote it, and safely falls back to session_start_offset's
-    # equivalent (append after everything) if today's date hasn't appeared yet.
-    truncate_at = _find_date_section_boundary(existing, session_date)
-    notes_path.write_text(existing[:truncate_at], encoding="utf-8")
-
     save_start = time.time()
     path, method = notes.format_and_save(cls["code"], cls["title"], labeled_text, session_date,
-                                          mode=formatting_mode, combine_proofread=True)
+                                          mode=formatting_mode, combine_proofread=True,
+                                          session_id=session.session_id, replace_session=True)
     print(c.success(f"  Full session formatted and saved as one clean section "
                      f"(method: {method}, {time.time() - save_start:.1f}s)."))
     return True
@@ -1087,9 +1249,9 @@ def run():
     parser = argparse.ArgumentParser(description="Auto-transcribe your current lecture into notes.")
     parser.add_argument("--class", dest="klass", help="Override class code, e.g. 'BIOL 1440'")
     parser.add_argument("--source", choices=["mic", "system"], help="Audio source, skips the prompt")
-    parser.add_argument("--chunk", type=float, default=DEFAULT_CHUNK_SECONDS,
-                         help=f"Seconds per transcription chunk (default {DEFAULT_CHUNK_SECONDS:.0f}, "
-                              f"tuned for accuracy - see DEFAULT_CHUNK_SECONDS)")
+    parser.add_argument("--chunk", type=float, default=None,
+                         help="Seconds of audio per transcription call (default: tuned per model - "
+                              "120 for Cohere, 20 for the Whisper fallback)")
     parser.add_argument("--formatting", choices=notes.FORMATTING_MODES,
                          help="Note formatting mode, skips the prompt (auto/local/heuristic)")
     parser.add_argument("--list", action="store_true", help="List classes from schedule.json and exit")
@@ -1195,6 +1357,7 @@ def run():
         print(c.error("Preflight checks failed - fix the issue above before recording "
                        "(this prevents starting a session that would silently fail)."))
         sys.exit(1)
+    resolve_chunk_seconds(args)  # the model is loaded by now (preflight), so this is instant
 
     mode_descriptions = {
         "auto": "auto (Claude CLI/API -> local GPU model -> heuristic)",
@@ -1222,7 +1385,7 @@ def run():
     session = Session(wav_path)
     transcriber = RollingTranscriber(initial_prompt)
     silence_warned = False
-    SILENCE_WARNING_SECONDS = 120  # warn once if this much continuous silence is seen
+    SILENCE_WARNING_SECONDS = 45  # warn once if this much continuous silence is seen
 
     keep_awake.prevent_sleep()  # a system sleep mid-recording silently kills the whole
                                  # process, not just the display - block that for the
@@ -1233,7 +1396,7 @@ def run():
     # processing step takes (a slow API call, diarization, anything), capture itself
     # never stalls and the OS buffer never gets a chance to silently overflow and drop
     # audio. See capture.py for the full story (this was a real, confirmed bug).
-    capture = capture_module.CaptureThread(source)
+    capture = capture_module.CaptureThread(source, on_block=session.persist_audio)
     capture.start()
 
     save_listener = SaveNowListener()
@@ -1248,11 +1411,14 @@ def run():
                        notes_path=str(notes.notes_path(cls["code"])), wav_path=str(wav_path))
     tel.add_event("info", f"Recording started: {cls['code']} ({source})")
 
-    def _handle_transcription_result(chunk_audio, whisper_segments, transcribe_seconds=0.0):
-        nonlocal silence_warned
-        session.write_chunk(chunk_audio, whisper_segments)
+    # Collect short slices for controls and silence checks; transcribe only full windows.
+    collect_seconds = min(5.0, args.chunk)
+    window_parts = []
+
+    def _handle_transcription_result(chunk_audio, whisper_segments, transcribe_seconds=0.0, chunk_offset=0.0):
+        session.record_segments(whisper_segments, chunk_offset)
         for seg in whisper_segments:
-            stamp = time.strftime("%H:%M:%S")
+            stamp = time.strftime("%H:%M:%S", time.localtime(session.session_start + chunk_offset + seg["start"]))
             print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
             tel.add_transcript(stamp, seg["text"])
             with open(raw_log_path, "a", encoding="utf-8") as f:
@@ -1265,27 +1431,48 @@ def run():
                     queue_saves=save_worker.pending_count())
         tel.flush()
 
-        silent_seconds = transcriber.consecutive_silent_chunks * args.chunk
-        if silent_seconds >= SILENCE_WARNING_SECONDS and not silence_warned:
-            message = (f"No audio detected for ~{silent_seconds/60:.1f} min - "
-                        f"check your {'microphone' if source == 'mic' else 'system audio'} "
-                        f"source (muted? disconnected?).")
-            print(c.warning(message))
-            tel.add_event("warning", message)
-            silence_warned = True
-        elif transcriber.consecutive_silent_chunks == 0:
-            silence_warned = False
 
-    transcription_worker = TranscriptionWorker(transcriber, _handle_transcription_result)
+    transcription_worker = TranscriptionWorker(transcriber, _handle_transcription_result, session.read_audio,
+                                              wav_path.with_suffix('.failed.json'))
 
+    def _flush_window():
+        """Sends everything captured since the last window to the accurate pass."""
+        if window_parts:
+            transcription_worker.submit(np.concatenate(window_parts))
+            window_parts.clear()
+
+    # Ctrl+C requests shutdown; it must never interrupt queue/offset mutations.
+    stop_request = StopRequest(save_listener.requested)  # wakes collection, keeping its partial audio
+    stop_requested = stop_request.requested
+    previous_sigint = signal.signal(signal.SIGINT, stop_request.handle)
+    silent_seconds = 0.0
     try:
         while True:
-            chunk_audio = capture.collect_chunk(args.chunk, interrupt_event=save_listener.requested)
+            chunk_audio = capture.collect_chunk(collect_seconds, interrupt_event=save_listener.requested)
             for err in capture.poll_errors():
                 print(c.error(f"Audio device error (auto-recovering, capture continues): {err}"))
 
+            if capture.fatal_error:
+                raise RuntimeError(f"Audio backup failed; recording stopped: {capture.fatal_error}")
             if chunk_audio is not None:
-                transcription_worker.submit(chunk_audio)
+                step = int(SILENCE_CHECK_SECONDS * audio.SAMPLE_RATE)
+                for start in range(0, len(chunk_audio), step):
+                    part = chunk_audio[start:start + step]
+                    silent_seconds = silent_seconds + len(part) / audio.SAMPLE_RATE if audio.is_silent(part) else 0.0
+                tel.update(silent_seconds=silent_seconds)
+                if silent_seconds >= SILENCE_WARNING_SECONDS and not silence_warned:
+                    message = f"No audio detected for ~{silent_seconds:.0f} seconds - check your audio source (muted? disconnected?)."
+                    print(c.warning(message))
+                    tel.add_event("warning", message)
+                    silence_warned = True
+                elif silent_seconds == 0:
+                    silence_warned = False
+                window_parts.append(chunk_audio)
+                if sum(len(p) for p in window_parts) >= int(args.chunk * audio.SAMPLE_RATE):
+                    _flush_window()
+
+            if stop_requested.is_set():
+                raise KeyboardInterrupt
 
             # The diagnostics dashboard's buttons land here - same two actions the
             # terminal offers ('s' and Ctrl+C), just arriving from another process.
@@ -1301,12 +1488,15 @@ def run():
 
             if save_listener.requested.is_set():
                 save_listener.requested.clear()
-                if session.has_pending():
-                    print(c.autosave(f"\n'{SAVE_NOW_KEY.decode()}' pressed - saving now..."))
-                    _save(cls, session, session_date, formatting_mode, note="(manual save)",
-                          save_worker=save_worker, telemetry=tel)
-                else:
-                    print(c.dim(f"\n'{SAVE_NOW_KEY.decode()}' pressed, but nothing new to save yet."))
+                if stop_requested.is_set():
+                    raise KeyboardInterrupt  # Ctrl+C just woke collection; not a save request
+                _flush_window()  # a manual save cuts the window short
+                print(c.autosave("\nSave requested - transcribing the latest audio, then saving..."))
+                def save_requested_audio():
+                    if session.has_pending():
+                        _save(cls, session, session_date, formatting_mode, note="(manual save)",
+                              save_worker=save_worker, telemetry=tel)
+                transcription_worker.after_pending(save_requested_audio)
                 last_autosave = time.time()  # reset either way - that's what was asked for
                 continue
 
@@ -1326,101 +1516,97 @@ def run():
     except KeyboardInterrupt:
         print(c.autosave("\nStopping - wrapping up your notes now, this can take a moment..."))
     finally:
-        shutdown_start = time.time()
+        try:
+            shutdown_start = time.time()
 
-        def _step(msg):
-            print(c.heading(f"[{time.time() - shutdown_start:5.1f}s] ") + c.info(msg))
+            def _step(msg):
+                print(c.heading(f"[{time.time() - shutdown_start:5.1f}s] ") + c.info(msg))
 
-        keep_awake.allow_sleep()
-        save_listener.stop()
+            keep_awake.allow_sleep()
+            save_listener.stop()
 
-        _step("Stopping audio capture...")
-        capture.stop()
-        print(c.dim("  capture thread stopped."))
+            _step("Stopping audio capture...")
+            capture.stop()
+            print(c.dim("  capture thread stopped."))
 
-        # Drain any chunks still queued for background transcription before touching
-        # `transcriber` directly below (tail-audio processing) or reading
-        # session.all_segments further down - RollingTranscriber's rolling state
-        # (overlap audio, recent text) only makes sense processed in capture order, and
-        # a still-in-flight chunk's segments wouldn't be in the session yet otherwise.
-        if transcription_worker.has_pending():
-            _step("Waiting for background transcription to catch up...")
-        transcription_worker.wait_idle()
+            # Drain any chunks still queued for background transcription before touching
+            # `transcriber` directly below (tail-audio processing) or reading
+            # session.all_segments further down - RollingTranscriber's rolling state
+            # (overlap audio, recent text) only makes sense processed in capture order, and
+            # a still-in-flight chunk's segments wouldn't be in the session yet otherwise.
+            if transcription_worker.has_pending():
+                _step("Waiting for background transcription to catch up...")
+            tail_audio = capture.drain_available()
+            if tail_audio is not None and len(tail_audio) > 0:
+                window_parts.append(tail_audio)
+            _flush_window()  # the partly filled last window plus the tail, as one accurate pass
+            transcription_worker.wait_idle()
+            if transcription_worker.failures:
+                message = f'{len(transcription_worker.failures)} audio window(s) need recovery. Run --resume "{wav_path}" after this session.'
+                print(c.error(message))
+                tel.add_event('error', message)
 
-        tail_audio = capture.drain_available()
-        if tail_audio is not None and len(tail_audio) > 0:
-            tail_seconds = len(tail_audio) / audio.SAMPLE_RATE
-            _step(f"Transcribing final {tail_seconds:.1f}s of buffered audio...")
-            whisper_segments = transcriber.process(tail_audio)
-            session.write_chunk(tail_audio, whisper_segments)
-            for seg in whisper_segments:
-                stamp = time.strftime("%H:%M:%S")
-                print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
-                with open(raw_log_path, "a", encoding="utf-8") as f:
-                    f.write(f"[{stamp}] {seg['text']}\n")
-            print(c.dim(f"  {len(whisper_segments)} segment(s) transcribed from the tail."))
+            if save_worker.has_pending():
+                _step("Waiting for a still-in-flight background autosave to finish...")
+            save_worker.wait_idle()  # nothing below this point may run against the notes file
+                                      # until every prior background autosave has actually written it
 
-        if save_worker.has_pending():
-            _step("Waiting for a still-in-flight background autosave to finish...")
-        save_worker.wait_idle()  # nothing below this point may run against the notes file
-                                  # until every prior background autosave has actually written it
+            used_full_diarization = False
+            if diarize.available() and session.all_segments:
+                used_full_diarization = try_full_session_diarization(
+                    cls, session, session_date, session_start_offset, formatting_mode)
 
-        used_full_diarization = False
-        if diarize.available() and session.all_segments:
-            used_full_diarization = try_full_session_diarization(
-                cls, session, session_date, session_start_offset, formatting_mode)
+            if not used_full_diarization:
+                if session.pending_segments:
+                    n_pending = len(session.pending_segments)
+                    _step(f"Formatting and saving the final segment ({n_pending} transcribed chunk(s))...")
+                    save_start = time.time()
+                    _save(cls, session, session_date, formatting_mode, is_final=False, telemetry=tel)
+                    print(c.dim(f"  final save completed in {time.time() - save_start:.1f}s."))
+                else:
+                    _step("Nothing pending to save (already flushed by the last autosave).")
+            session.close()
 
-        if not used_full_diarization:
-            if session.pending_segments:
-                n_pending = len(session.pending_segments)
-                _step(f"Formatting and saving the final segment ({n_pending} transcribed chunk(s))...")
-                save_start = time.time()
-                _save(cls, session, session_date, formatting_mode, is_final=False, telemetry=tel)
-                print(c.dim(f"  final save completed in {time.time() - save_start:.1f}s."))
+            elapsed_min = session.elapsed() / 60
+            print(c.success(f"\nRecording done - captured ~{elapsed_min:.1f} minutes of lecture."))
+
+            if used_full_diarization:
+                print(c.dim("Skipped condense pass: full-session diarization already wrote one clean "
+                             "section covering the whole lecture - nothing left to merge."))
+            elif formatting_mode != "auto":
+                print(c.dim(f"Skipped condense pass: formatting mode is '{formatting_mode}' (no CLI/API calls)."))
+            elif notes.cli_available():
+                _step("Reviewing this session's notes with Claude CLI (condensing duplicate autosave "
+                      "sections, cleaning up formatting)...")
+                condense_start = time.time()
+                # Condense only this session; keep earlier same-day recordings intact.
+                ok, reason = notes.condense_session(cls["code"], cls["title"], 0, mode=formatting_mode,
+                                                    session_id=session.session_id)
+                if ok:
+                    print(c.success(f"  Notes condensed and cleaned up ({time.time() - condense_start:.1f}s)."))
+                else:
+                    print(c.warning(f"  Skipped condense pass: {reason}"))
             else:
-                _step("Nothing pending to save (already flushed by the last autosave).")
-        session.close()
+                print(c.dim("Skipped condense pass: Claude CLI not available."))
 
-        elapsed_min = session.elapsed() / 60
-        print(c.success(f"\nRecording done - captured ~{elapsed_min:.1f} minutes of lecture."))
+            total_shutdown = time.time() - shutdown_start
+            print(c.heading(f"\nAll done ({total_shutdown:.1f}s from Ctrl+C to finish)."))
+            print(c.info(f"Notes (markdown): {notes.notes_path(cls['code'])}"))
+            print(c.info(f"Notes (Word): {docx_export.docx_path(cls['code'])}"))
+            print(c.dim(f"Raw transcript backup: {raw_log_path}"))
+            print(c.dim(f"Audio backup: {wav_path}"))
 
-        if used_full_diarization:
-            print(c.dim("Skipped condense pass: full-session diarization already wrote one clean "
-                         "section covering the whole lecture - nothing left to merge."))
-        elif formatting_mode != "auto":
-            print(c.dim(f"Skipped condense pass: formatting mode is '{formatting_mode}' (no CLI/API calls)."))
-        elif notes.cli_available():
-            _step("Reviewing this session's notes with Claude CLI (condensing duplicate autosave "
-                  "sections, cleaning up formatting)...")
-            condense_start = time.time()
-            # Use the boundary of TODAY's date heading, not just this session's own
-            # start - if the app was run more than once today for this class (e.g.
-            # recording paused and resumed in a fresh process), an earlier run's
-            # session_start_offset wouldn't know about a still-earlier run's section
-            # for the same date, leaving duplicate "## <date>" headers that never get
-            # merged. Finding the date heading fresh at condense time sweeps in
-            # everything for today regardless of how many separate runs wrote it.
-            current_notes_content = notes.notes_path(cls["code"]).read_text(encoding="utf-8")
-            condense_boundary = _find_date_section_boundary(current_notes_content, session_date)
-            ok, reason = notes.condense_session(cls["code"], cls["title"], condense_boundary, mode=formatting_mode)
-            if ok:
-                print(c.success(f"  Notes condensed and cleaned up ({time.time() - condense_start:.1f}s)."))
-            else:
-                print(c.warning(f"  Skipped condense pass: {reason}"))
-        else:
-            print(c.dim("Skipped condense pass: Claude CLI not available."))
+            tel.add_event("info", f"Session ended after {session.elapsed()/60:.1f} min")
+            tel.end_session()  # dashboard flips to "idle" and disables its controls
 
-        total_shutdown = time.time() - shutdown_start
-        print(c.heading(f"\nAll done ({total_shutdown:.1f}s from Ctrl+C to finish)."))
-        print(c.info(f"Notes (markdown): {notes.notes_path(cls['code'])}"))
-        print(c.info(f"Notes (Word): {docx_export.docx_path(cls['code'])}"))
-        print(c.dim(f"Raw transcript backup: {raw_log_path}"))
-        print(c.dim(f"Audio backup: {wav_path}"))
-
-        tel.add_event("info", f"Session ended after {session.elapsed()/60:.1f} min")
-        tel.end_session()  # dashboard flips to "idle" and disables its controls
-
-        auto_prune_audio()  # last, so it can never delay or endanger saving the notes
+            auto_prune_audio()  # last, so it can never delay or endanger saving the notes
+        finally:
+            capture.stop()
+            session.close()
+            keep_awake.allow_sleep()
+            tel.end_session()
+            signal.signal(signal.SIGINT, previous_sigint)
+            stop_request.close()
 
 
 def _save(cls, session: Session, session_date, mode, note="", is_final=False,
@@ -1432,11 +1618,10 @@ def _save(cls, session: Session, session_date, mode, note="", is_final=False,
     Pass save_worker=None (the final Ctrl+C save does this) to run it synchronously
     instead - at that point there's no more live output to keep flowing anyway, and the
     caller needs it to have actually finished before moving on to condensing."""
-    full_text = session.pop_pending_text(run_diarization=is_final)
-
     def do_save():
         save_started = time.time()
-        path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date, mode=mode)
+        path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date, mode=mode,
+                                             session_id=session.session_id)
         if telemetry is not None:
             telemetry.record_save(method, time.time() - save_started)
             telemetry.add_event("success" if method in ("cli", "api") else "warning",
@@ -1455,10 +1640,18 @@ def _save(cls, session: Session, session_date, mode, note="", is_final=False,
         note_colored = c.autosave(note) if note else ""
         print(colorize(f"Saved notes to {path}{tag}") + (f" {note_colored}" if note_colored else ""))
 
-    if save_worker is not None:
-        save_worker.submit(do_save)
-    else:
-        do_save()
+    # Taking the pending text and queueing its save is one step. Autosave runs on the main
+    # loop and a manual save on the transcription worker; if one were preempted between
+    # the two, a later snapshot could be queued first and write newer notes above older.
+    with _SAVE_ORDER_LOCK:
+        full_text = session.pop_pending_text(run_diarization=is_final)
+        if save_worker is not None:
+            save_worker.submit(do_save)
+            return
+    do_save()
+
+
+_SAVE_ORDER_LOCK = threading.Lock()
 
 
 if __name__ == "__main__":
