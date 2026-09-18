@@ -2,7 +2,7 @@
 Lecture Notes App
 ==================
 Figures out what class you're in based on your schedule, records + transcribes
-the lecture locally (Whisper), and turns it into clean notes appended to that
+the lecture locally (Cohere Transcribe), and turns it into clean notes appended to that
 class's ongoing notes file (Claude Code CLI / API when available, local
 fallback otherwise). Optionally detects different speakers (Q&A) via
 pyannote.audio diarization if it's installed and configured.
@@ -17,10 +17,9 @@ Usage:
     python src/main.py                 # auto-detect class from schedule, prompt for audio source
     python src/main.py --class "BIOL 1440"   # override class selection
     python src/main.py --source mic    # skip the audio-source prompt (mic | system)
-    python src/main.py --chunk 20      # seconds of audio per transcription call (default: tuned
-                                        # per model - 120 for Cohere, 20 for the Whisper fallback;
-                                        # see transcribe.py. Lower it for more frequent live
-                                        # output at a real accuracy cost)
+    python src/main.py --chunk 20      # seconds of audio per transcription call (default: 120,
+                                        # tuned for Cohere - see transcribe.py. Lower it for more
+                                        # frequent live output at a real accuracy cost)
     python src/main.py --list          # list all classes in the schedule and exit
 
 Stop recording any time with Ctrl+C. Notes are saved (with a safety autosave
@@ -55,7 +54,6 @@ from storage import atomic_write
 import docx_export
 import diarize
 import gpu_formatter
-import vocab as vocab_module
 import soundfile as sf
 import console_colors as c
 import keep_awake
@@ -81,40 +79,15 @@ STATE_DIR.mkdir(exist_ok=True)
 
 AUTOSAVE_EVERY_SECONDS = 5 * 60  # flush partial notes periodically, not just at the end
 
-# Chosen by measurement, not feel. tools/chunk_size_sweep.py, 5 min each of two real
-# lectures (different speakers and rooms), WER against a single-pass reference that has
-# no chunk boundaries at all:
-#
-#                    15s      20s      25s      30s
-#     PSYC 1300    15.30%   11.75%   11.20%   12.57%
-#     BIOL 1440    26.69%   22.74%   31.39%   24.81%
-#     average      21.00%   17.25%   21.30%   18.69%
-#
-# 20s is both the best average and the only size that beat the old 15s default on BOTH
-# lectures (-3.55 and -3.95 points) - 25s wins on one clip but is the worst of all four
-# on the other, so it isn't a safe default. It was also no slower: fewer chunks means
-# less per-chunk overhead, so the extra context is effectively free.
-#
-# The tradeoff is live-view latency - the terminal now prints a batch roughly every 20s
-# instead of 15s. That buys a real accuracy gain on the notes, which is what actually
-# gets studied from.
-#
-# That sweep was Whisper's. The default model is now Cohere Transcribe, tuned separately
-# (transcribe.COHERE_WINDOW_SECONDS), so --chunk defaults to whatever the loaded model
-# prefers; this constant is only the Whisper value and the fallback if that can't be read.
-DEFAULT_CHUNK_SECONDS = 20.0
 # Silence gate granularity: a long window is only skipped if every slice of this length is
 # silent, so 110s of dead air around 10s of speech still gets transcribed.
 SILENCE_CHECK_SECONDS = 20.0
 
 
 def resolve_chunk_seconds(args) -> float:
-    """--chunk if given, else the loaded transcription model's tuned window."""
+    """--chunk if given, else the window Cohere was tuned for."""
     if args.chunk is None:
-        try:
-            args.chunk = transcribe.preferred_chunk_seconds()
-        except Exception:
-            args.chunk = DEFAULT_CHUNK_SECONDS
+        args.chunk = transcribe.COHERE_WINDOW_SECONDS
     return args.chunk
 
 # Automatic retention for state/ backups, applied once at the end of each session.
@@ -222,73 +195,25 @@ def choose_formatting_mode(args):
 
 
 class RollingTranscriber:
-    """Wraps chunked transcription with two accuracy improvements over transcribing
-    each chunk in total isolation:
-      - a small audio overlap between chunks, so a word split across a chunk
-        boundary doesn't get clipped/mis-heard (segments fully inside the overlap
-        window are dropped as already-emitted, since they were transcribed last call)
-      - a rolling text prompt (recent transcript + class vocab) fed back in as
-        Whisper's initial_prompt, giving it continuity across chunks instead of
-        transcribing each one cold
-    """
+    """Transcribes back-to-back windows, skipping the model on silence, and counts
+    consecutive silent windows for the "check the mic" warning."""
 
-    OVERLAP_SECONDS = 1.5
-    CONTEXT_CHARS = 200
-
-    def __init__(self, vocab_prompt: str | None):
-        self.vocab_prompt = vocab_prompt
-        self.overlap_audio = np.zeros(0, dtype=np.float32)
-        self.recent_text = ""
+    def __init__(self):
         self.consecutive_silent_chunks = 0
 
     def process(self, new_chunk: np.ndarray) -> list[dict]:
         """Returns segments (start/end/text) with timestamps relative to `new_chunk`,
         ready to pass to Session.write_chunk alongside it."""
-        # The overlap trick needs per-segment timestamps to drop the words that came from
-        # the repeated audio. Cohere Transcribe returns only text, so prepending the overlap
-        # would duplicate ~1.5s of speech at every chunk boundary. Timestamp-less backends
-        # run on plain back-to-back chunks instead - the exact setup that was measured as
-        # most accurate in tools/model_ab_test.py.
-        overlap_seconds = self.OVERLAP_SECONDS if transcribe.supports_timestamps() else 0.0
-        if overlap_seconds == 0.0:
-            self.overlap_audio = np.zeros(0, dtype=np.float32)
-        overlap_frames = int(overlap_seconds * audio.SAMPLE_RATE)
-        overlap_duration = len(self.overlap_audio) / audio.SAMPLE_RATE
-        combined = np.concatenate([self.overlap_audio, new_chunk])
-
         step = int(SILENCE_CHECK_SECONDS * audio.SAMPLE_RATE)
-        if all(audio.is_silent(combined[i:i + step]) for i in range(0, max(len(combined), 1), step)):
+        if all(audio.is_silent(new_chunk[i:i + step]) for i in range(0, max(len(new_chunk), 1), step)):
             # Skip the model entirely on (near-)silence - otherwise it tends to hallucinate
-            # repeated punctuation/filler ("...", "you") rather than emitting nothing,
-            # which is what happens if the mic gets muted/disconnected or the "system
-            # audio" source goes quiet while the app keeps running unattended.
+            # filler rather than emitting nothing, which is what happens if the mic gets
+            # muted/disconnected or the "system audio" source goes quiet while the app
+            # keeps running unattended.
             self.consecutive_silent_chunks += 1
-            if overlap_frames:
-                self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
             return []
         self.consecutive_silent_chunks = 0
-
-        prompt = " ".join(p for p in (self.vocab_prompt, self.recent_text) if p) or None
-        segments = transcribe.transcribe_chunk_segments(combined, initial_prompt=prompt)
-
-        kept = []
-        for seg in segments:
-            if seg["end"] <= overlap_duration:
-                continue  # entirely inside the overlap window - already emitted last call
-            kept.append({
-                "start": max(0.0, seg["start"] - overlap_duration),
-                "end": seg["end"] - overlap_duration,
-                "text": seg["text"],
-            })
-
-        if kept:
-            new_text = " ".join(s["text"] for s in kept)
-            self.recent_text = (self.recent_text + " " + new_text)[-self.CONTEXT_CHARS:]
-
-        if overlap_frames:
-            self.overlap_audio = new_chunk[-overlap_frames:].copy() if len(new_chunk) > overlap_frames else new_chunk.copy()
-
-        return kept
+        return transcribe.transcribe_chunk_segments(new_chunk)
 
 
 class SaveWorker:
@@ -337,7 +262,7 @@ class SaveWorker:
 
 
 class TranscriptionWorker:
-    """Runs RollingTranscriber.process() (the blocking Whisper inference call) on a
+    """Runs RollingTranscriber.process() (the blocking model inference call) on a
     background thread, so the main loop is never stuck inside it - it can immediately go
     back to the interruptible capture.collect_chunk() wait, instead of only checking for
     a Ctrl+C/save-now keypress once the current chunk's transcription happens to finish.
@@ -346,11 +271,11 @@ class TranscriptionWorker:
 
     Chunks are processed strictly one at a time, in submission order (single worker
     thread + ordered queue, not a thread pool) - RollingTranscriber keeps rolling state
-    (overlap audio, recent text, silence counter) across calls that only makes sense if
+    (the silence counter) across calls that only makes sense if
     calls happen in the same order the audio was captured; two chunks processed out of
     order, or concurrently, would corrupt that state.
 
-    `on_result(chunk_audio, whisper_segments)` runs on the worker thread for each chunk,
+    `on_result(chunk_audio, segments)` runs on the worker thread for each chunk,
     in order - the caller is expected to do its printing/session-writing/silence-check
     there. Since only this one thread ever calls it, none of that needs its own lock."""
 
@@ -379,7 +304,7 @@ class TranscriptionWorker:
                 started = time.time()
                 # Restore rolling context on inference failure; never retry result writes.
                 snapshot = {key: copy.deepcopy(getattr(self._transcriber, key))
-                            for key in ('overlap_audio', 'recent_text', 'consecutive_silent_chunks')
+                            for key in ('consecutive_silent_chunks',)
                             if hasattr(self._transcriber, key)}
                 for attempt in range(2):
                     try:
@@ -509,6 +434,119 @@ class StopRequest:
         self._thread.join(timeout=2)
 
 
+class DropoutMonitor:
+    """Warns within seconds when the input signal disappears.
+
+    A live microphone never produces exact zeros, even in a silent room: there is always
+    some noise floor. Exact zeros mean the signal itself is gone - the mic was muted or the
+    device dropped out. In CHEM 1450 on 2026-09-14 that happened twice for about a minute
+    each, and those minutes were simply not recorded. The general silence warning (tuned
+    for a dead or quiet source) takes 45s; this checks for the specific no-signal case
+    every half second and also says when audio comes back."""
+
+    ZERO_LEVEL = 1e-6          # at or below this in every sample of a block = no signal
+    WARN_AFTER_SECONDS = 3.0
+    BLOCK_SECONDS = 0.5
+
+    def __init__(self, sample_rate: int, muted_check=None):
+        self.sample_rate = sample_rate
+        self.dropout_seconds = 0.0
+        self._warned = False
+        self._muted_check = muted_check  # optional read-only "is the OS mic muted?" probe
+
+    def feed(self, samples) -> list[tuple[str, str]]:
+        """Returns (level, message) pairs to show, in order."""
+        messages = []
+        block = max(1, int(self.BLOCK_SECONDS * self.sample_rate))
+        for i in range(0, len(samples), block):
+            part = samples[i:i + block]
+            if not len(part):
+                continue
+            if float(np.max(np.abs(part))) <= self.ZERO_LEVEL:
+                self.dropout_seconds += len(part) / self.sample_rate
+                if not self._warned and self.dropout_seconds >= self.WARN_AFTER_SECONDS:
+                    self._warned = True
+                    messages.append(("error", self._lost_message()))
+            else:
+                if self._warned:
+                    messages.append(("success", f"Microphone signal is back after {self.dropout_seconds:.0f}s "
+                                                f"- that stretch wasn't recorded."))
+                self.dropout_seconds = 0.0
+                self._warned = False
+        return messages
+
+    def _lost_message(self) -> str:
+        muted = None
+        if self._muted_check is not None:
+            try:
+                muted = self._muted_check()
+            except Exception:
+                muted = None
+        cause = ("Windows has the microphone muted" if muted
+                 else "the audio is exactly zero, so it's muted or disconnected")
+        return f"Microphone signal lost - {cause}. Nothing is being recorded until it comes back."
+
+
+class CaptureWatchdog:
+    """Keeps audio capture alive through a laptop sleeping or a device freezing.
+
+    Seen live in HLTH 1320 on 2026-09-16: the laptop slept at 2:49 PM, and after it woke
+    the Windows audio call inside the capture thread never returned - no error, no audio.
+    The recorder kept running (and its dashboard heartbeat kept updating) for four hours
+    while recording nothing, and neither silence warning fired, because both only look at
+    audio that arrives. This watches for audio not arriving at all:
+      - no audio for STALL_SECONDS: warn, abandon the frozen capture (keeping any audio it
+        had already delivered) and open a fresh one; retry every RESTART_INTERVAL_SECONDS
+        while it stays silent, and say so once audio is flowing again
+      - a gap of SLEEP_GAP_SECONDS between checks means the computer itself was asleep or
+        frozen: say when, since that stretch of the lecture wasn't recorded
+    """
+
+    STALL_SECONDS = 10.0
+    RESTART_INTERVAL_SECONDS = 30.0
+    SLEEP_GAP_SECONDS = 45.0
+    POLL_SECONDS = 3.0  # longest the recording loop waits for audio before checking in
+
+    def __init__(self, make_capture, source_label: str = "microphone", clock=time.time):
+        self._make_capture = make_capture
+        self._clock = clock
+        self._source_label = source_label
+        self.capture = make_capture()
+        self.capture.start()
+        self.restarts = 0
+        self._last_check = clock()
+        self._last_restart = None
+        self._reconnecting = False
+
+    def check(self) -> tuple[list[tuple[str, str]], "np.ndarray | None"]:
+        """(messages to show as (level, text), audio recovered from an abandoned capture)."""
+        now = self._clock()
+        messages, recovered = [], None
+        if now - self._last_check >= self.SLEEP_GAP_SECONDS:
+            start, end = (time.strftime("%I:%M %p", time.localtime(t)).lstrip("0") for t in (self._last_check, now))
+            messages.append(("warning", f"The computer was asleep or unresponsive from {start} to {end} "
+                                        f"(about {max(1, round((now - self._last_check) / 60))} min) - "
+                                        f"audio from that time wasn't recorded."))
+        self._last_check = now
+
+        stalled = self.capture.seconds_since_audio(now)
+        if self._reconnecting and stalled < self.STALL_SECONDS and self.capture.last_audio_at:
+            self._reconnecting = False
+            messages.append(("success", f"Audio from the {self._source_label} is coming in again - recording resumed."))
+        if stalled >= self.STALL_SECONDS and (self._last_restart is None
+                                              or now - self._last_restart >= self.RESTART_INTERVAL_SECONDS):
+            messages.append(("error", f"No audio has arrived from the {self._source_label} for {stalled:.0f}s - "
+                                      f"the audio device stopped responding (this can happen after sleep). "
+                                      f"Reconnecting..."))
+            recovered = self.capture.abandon()
+            self.capture = self._make_capture()
+            self.capture.start()
+            self.restarts += 1
+            self._last_restart = now
+            self._reconnecting = True
+        return messages, recovered
+
+
 class Session:
     """Tracks the running WAV recording + transcript segments for one lecture. Autosaves
     just flush plain transcript text (no diarization - see pop_pending_text for why);
@@ -561,11 +599,11 @@ class Session:
             raise IOError("Audio backup is shorter than the queued chunk")
         return result
 
-    def record_segments(self, whisper_segments, chunk_offset):
+    def record_segments(self, segments, chunk_offset):
         with self._lock:
             entries = [{"start": chunk_offset + seg["start"],
                         "end": chunk_offset + seg["end"], "text": seg["text"]}
-                       for seg in whisper_segments]
+                       for seg in segments]
             with self.segments_path.open("a", encoding="utf-8") as handle:
                 for entry in entries:
                     handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -573,12 +611,12 @@ class Session:
             self.pending_segments.extend(entries)
             self.all_segments.extend(entries)
 
-    def write_chunk(self, chunk_audio, whisper_segments):
+    def write_chunk(self, chunk_audio, segments):
         """Compatibility helper for offline callers; live capture persists independently."""
         with self._lock:
             offset = self.total_frames / audio.SAMPLE_RATE
             self.persist_audio(chunk_audio)
-            self.record_segments(whisper_segments, offset)
+            self.record_segments(segments, offset)
 
     def pop_pending_text(self, run_diarization: bool = False) -> str:
         """Returns speaker-labeled (if diarization succeeds and run_diarization=True) or
@@ -652,7 +690,7 @@ PREFLIGHT_AUDIO_SAMPLE_SECONDS = 3.0  # long enough that a natural pause between
 def _check_audio_device(source: str) -> tuple[bool, str]:
     """Returns (blocks_startup, message). Runs concurrently with the other preflight
     checks - safe because it only touches the audio subsystem (WASAPI), no shared
-    state with the GPU/Whisper or filesystem checks."""
+    state with the GPU/model or filesystem checks."""
     try:
         test_recorder = audio.get_recorder(source)
         with test_recorder:
@@ -690,23 +728,18 @@ def _check_disk_space() -> str | None:
         return None  # non-critical, skip silently if the check itself fails
 
 
-def _check_whisper_model() -> tuple[bool, str]:
-    """Loads the transcription model (Cohere Transcribe, falling back to Whisper). Says so
-    plainly when the fallback kicked in, rather than quietly recording on a different model."""
+def _check_transcription_model() -> tuple[bool, str]:
+    """Loads Cohere Transcribe. Recording is blocked if it can't load - there's no fallback."""
     try:
         transcribe.get_model()
-        message = c.success(f"  Transcription model OK ({transcribe.backend_name()}, "
-                            f"{transcribe.device_info()})")
-        if transcribe.fallback_reason():
-            message += "\n" + c.warning(f"  Preferred model unavailable, using fallback - "
-                                        f"{transcribe.fallback_reason()}")
-        return False, message
+        return False, c.success(f"  Transcription model OK ({transcribe.backend_name()}, "
+                                f"{transcribe.device_info()})")
     except Exception as e:
         return True, c.error(f"  Transcription model FAILED to load: {e}")
 
 
 class PreflightRunner:
-    """Same sanity checks as before (audio device, disk space, Whisper model load, and -
+    """Same sanity checks as before (audio device, disk space, transcription model load, and -
     "local" mode only - the local GPU formatter's warm-up), but started as early as
     possible instead of all at once right before recording. The interactive prompts
     between "record a lecture" and actually starting (which class, which audio source,
@@ -715,7 +748,7 @@ class PreflightRunner:
     used to start until every prompt had already been answered.
 
     __init__ kicks off the two checks that don't depend on any user choice (disk space,
-    and Whisper model load - the slowest of the four, especially cold) immediately.
+    and transcription model load - the slowest of the four, especially cold) immediately.
     start_audio_check()/start_gpu_warmup() kick off the other two as soon as their own
     answer (source / formatting_mode) is known, rather than waiting for every remaining
     prompt too. finish() is the only thing that prints anything - it starts any check
@@ -727,7 +760,7 @@ class PreflightRunner:
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._disk_future = self._executor.submit(_check_disk_space)
-        self._whisper_future = self._executor.submit(_check_whisper_model)
+        self._model_future = self._executor.submit(_check_transcription_model)
         self._audio_future = None
         self._gpu_future = None
 
@@ -768,7 +801,7 @@ class PreflightRunner:
         if disk_msg is not None:
             print(disk_msg)
 
-        blocks, msg = self._whisper_future.result()
+        blocks, msg = self._model_future.result()
         print(msg)
         ok = ok and not blocks
 
@@ -1116,7 +1149,7 @@ def run_resume(target: str, args):
     transcript_text = None
     correction_path = wav_path.with_name(wav_path.stem + "_corrections.json")
     if correction_path.exists():
-        # User-reviewed corrections take precedence over a fresh Whisper guess.
+        # User-reviewed corrections take precedence over a fresh transcription.
         from transcripts import load_transcript
         reviewed = load_transcript(wav_path.parent, wav_path.stem)
         transcript_text = " ".join(s["text"] for s in reviewed["segments"])
@@ -1130,8 +1163,7 @@ def run_resume(target: str, args):
         print(c.info(f"Found audio backup ({wav_path.name}) - re-transcribing so diarization "
                       f"can run on it (safe now: recording has already stopped)..."))
         transcribe.get_model()
-        initial_prompt = vocab_module.initial_prompt_for_class(class_code)
-        transcriber = RollingTranscriber(initial_prompt)
+        transcriber = RollingTranscriber()
 
         chunk_frames = max(1, int(resolve_chunk_seconds(args) * audio.SAMPLE_RATE))
         all_segments = []
@@ -1250,8 +1282,7 @@ def run():
     parser.add_argument("--class", dest="klass", help="Override class code, e.g. 'BIOL 1440'")
     parser.add_argument("--source", choices=["mic", "system"], help="Audio source, skips the prompt")
     parser.add_argument("--chunk", type=float, default=None,
-                         help="Seconds of audio per transcription call (default: tuned per model - "
-                              "120 for Cohere, 20 for the Whisper fallback)")
+                         help="Seconds of audio per transcription call (default: 120, tuned for Cohere)")
     parser.add_argument("--formatting", choices=notes.FORMATTING_MODES,
                          help="Note formatting mode, skips the prompt (auto/local/heuristic)")
     parser.add_argument("--list", action="store_true", help="List classes from schedule.json and exit")
@@ -1339,7 +1370,7 @@ def run():
         dashboard.serve()
         return
 
-    # Starts the checks that don't depend on any answer below (disk space, Whisper model
+    # Starts the checks that don't depend on any answer below (disk space, transcription model
     # load - the slowest of the four) right now, so they run during the wall-clock time
     # spent waiting on the user to answer the prompts below instead of only starting
     # once every prompt is already answered.
@@ -1350,7 +1381,6 @@ def run():
     preflight.start_audio_check(source)  # don't wait for the formatting-mode prompt too
     formatting_mode = choose_formatting_mode(args)
     preflight.start_gpu_warmup(formatting_mode)
-    initial_prompt = vocab_module.initial_prompt_for_class(cls["code"])
 
     print()
     if not preflight.finish(source, formatting_mode):
@@ -1383,7 +1413,7 @@ def run():
     raw_log_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}_raw.txt"
     wav_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}.wav"
     session = Session(wav_path)
-    transcriber = RollingTranscriber(initial_prompt)
+    transcriber = RollingTranscriber()
     silence_warned = False
     SILENCE_WARNING_SECONDS = 45  # warn once if this much continuous silence is seen
 
@@ -1396,8 +1426,9 @@ def run():
     # processing step takes (a slow API call, diarization, anything), capture itself
     # never stalls and the OS buffer never gets a chance to silently overflow and drop
     # audio. See capture.py for the full story (this was a real, confirmed bug).
-    capture = capture_module.CaptureThread(source, on_block=session.persist_audio)
-    capture.start()
+    watchdog = CaptureWatchdog(lambda: capture_module.CaptureThread(source, on_block=session.persist_audio),
+                               source_label="microphone" if source == "mic" else "system audio")
+    capture = watchdog.capture
 
     save_listener = SaveNowListener()
     save_listener.start()
@@ -1407,17 +1438,21 @@ def run():
     # a telemetry failure must never affect the recording itself (see telemetry.py).
     tel = telemetry_module.Telemetry()
     tel.start_session(class_code=cls["code"], class_title=cls["title"], source=source,
-                       formatting_mode=formatting_mode, whisper_device=transcribe.device_info(),
+                       formatting_mode=formatting_mode, model_device=transcribe.device_info(),
                        notes_path=str(notes.notes_path(cls["code"])), wav_path=str(wav_path))
     tel.add_event("info", f"Recording started: {cls['code']} ({source})")
 
     # Collect short slices for controls and silence checks; transcribe only full windows.
     collect_seconds = min(5.0, args.chunk)
     window_parts = []
+    # Failure-guard counters live on the loaded backend; report this session's share.
+    _model = transcribe.get_model()
+    guard = {"repaired": getattr(_model, "repaired_pieces", 0), "silent": getattr(_model, "silent_pieces", 0)}
+    guard_base = dict(guard)
 
-    def _handle_transcription_result(chunk_audio, whisper_segments, transcribe_seconds=0.0, chunk_offset=0.0):
-        session.record_segments(whisper_segments, chunk_offset)
-        for seg in whisper_segments:
+    def _handle_transcription_result(chunk_audio, segments, transcribe_seconds=0.0, chunk_offset=0.0):
+        session.record_segments(segments, chunk_offset)
+        for seg in segments:
             stamp = time.strftime("%H:%M:%S", time.localtime(session.session_start + chunk_offset + seg["start"]))
             print(f"{c.timestamp('[' + stamp + ']')} {c.transcript(seg['text'])}")
             tel.add_transcript(stamp, seg["text"])
@@ -1425,7 +1460,18 @@ def run():
                 f.write(f"[{stamp}] {seg['text']}\n")
 
         tel.record_chunk(len(chunk_audio) / audio.SAMPLE_RATE, transcribe_seconds,
-                          len(whisper_segments))
+                          len(segments))
+        model = transcribe.get_model()
+        repaired, silent = getattr(model, "repaired_pieces", 0), getattr(model, "silent_pieces", 0)
+        window_start = time.strftime("%H:%M", time.localtime(session.session_start + chunk_offset))
+        if repaired > guard["repaired"]:
+            tel.add_event("warning", f"Transcript guard: re-transcribed {repaired - guard['repaired']} "
+                                     f"looping piece(s) in the audio from {window_start}")
+        if silent > guard["silent"]:
+            tel.add_event("warning", f"Transcript guard: discarded invented text for {silent - guard['silent']} "
+                                     f"silent piece(s) in the audio from {window_start}")
+        guard.update(repaired=repaired, silent=silent)
+        tel.update(guard_repaired=repaired - guard_base["repaired"], guard_silent=silent - guard_base["silent"])
         tel.update(consecutive_silent_chunks=transcriber.consecutive_silent_chunks,
                     queue_transcription=transcription_worker.pending_count(),
                     queue_saves=save_worker.pending_count())
@@ -1446,20 +1492,34 @@ def run():
     stop_requested = stop_request.requested
     previous_sigint = signal.signal(signal.SIGINT, stop_request.handle)
     silent_seconds = 0.0
+    dropout = DropoutMonitor(audio.SAMPLE_RATE,
+                             muted_check=getattr(mic_mute, "is_muted", None) if source == "mic" else None)
     try:
         while True:
-            chunk_audio = capture.collect_chunk(collect_seconds, interrupt_event=save_listener.requested)
+            chunk_audio = capture.collect_chunk(collect_seconds, interrupt_event=save_listener.requested,
+                                                max_wait_seconds=CaptureWatchdog.POLL_SECONDS)
             for err in capture.poll_errors():
                 print(c.error(f"Audio device error (auto-recovering, capture continues): {err}"))
 
             if capture.fatal_error:
                 raise RuntimeError(f"Audio backup failed; recording stopped: {capture.fatal_error}")
+            watchdog_messages, recovered = watchdog.check()
+            if recovered is not None and len(recovered):
+                chunk_audio = recovered if chunk_audio is None else np.concatenate([chunk_audio, recovered])
+            capture = watchdog.capture
+            for level, message in watchdog_messages:
+                print({"error": c.error, "warning": c.warning}.get(level, c.success)(message))
+                tel.add_event(level, message)
+            tel.update(audio_stalled_seconds=round(capture.seconds_since_audio(), 1))
             if chunk_audio is not None:
                 step = int(SILENCE_CHECK_SECONDS * audio.SAMPLE_RATE)
                 for start in range(0, len(chunk_audio), step):
                     part = chunk_audio[start:start + step]
                     silent_seconds = silent_seconds + len(part) / audio.SAMPLE_RATE if audio.is_silent(part) else 0.0
-                tel.update(silent_seconds=silent_seconds)
+                for level, message in dropout.feed(chunk_audio):
+                    print((c.error if level == "error" else c.success)(message))
+                    tel.add_event(level, message)
+                tel.update(silent_seconds=silent_seconds, dropout_seconds=dropout.dropout_seconds)
                 if silent_seconds >= SILENCE_WARNING_SECONDS and not silence_warned:
                     message = f"No audio detected for ~{silent_seconds:.0f} seconds - check your audio source (muted? disconnected?)."
                     print(c.warning(message))

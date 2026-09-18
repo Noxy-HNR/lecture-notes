@@ -13,9 +13,11 @@
   <nav class="tabs" aria-label="Lecture tools">
     <a href="/" class="active" aria-current="page">Notes</a>
     <a href="/corrections">Corrections</a>
+    <a href="/lessons">Lessons</a>
     <a href="/diagnostics">Diagnostics</a>
   </nav>
   <div class="search-wrap">
+    <select id="search-mode" aria-label="Search mode"><option value="keyword">Keyword search</option><option value="semantic">Meaning search</option></select>
     <input id="search" aria-label="Search notes and transcripts" class="search" type="search" autocomplete="off"
            placeholder="Search all notes and transcripts…  (/ to focus)">
   </div>
@@ -48,7 +50,7 @@ const fmtDate = ts => new Date(ts * 1000).toLocaleDateString(undefined, { month:
 let viewVersion = 0;
 async function api(path) {
   const r = await fetch(path);
-  if (!r.ok) throw new Error(`Request failed (${r.status})`);
+  if (!r.ok) { const error = await r.json().catch(()=>({})); throw new Error(error.error || `Request failed (${r.status})`); }
   return r.json();
 }
 function player(file, seconds = null) {
@@ -198,10 +200,13 @@ async function openSessions() {
 // ---------- search ----------
 
 let searchTimer = null;
+document.getElementById("search-mode").onchange = runSearch;
 searchBox.addEventListener('input', () => {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(runSearch, 180);  // debounce: search hits disk on every keystroke
+  if (document.getElementById('search-mode').value === 'semantic') return;
+  searchTimer = setTimeout(runSearch, document.getElementById("search-mode").value === "semantic" ? 900 : 180);  // debounce: search hits disk on every keystroke
 });
+searchBox.addEventListener('keydown', e => { if(e.key === 'Enter') runSearch(); });
 
 async function runSearch() {
   const version = ++viewVersion;
@@ -209,7 +214,10 @@ async function runSearch() {
   state.query = q;
   if (!q) { if (state.activeClass) openClass(state.activeClass, state.kind); return; }
   state.view = 'search';
-  const hits = await api(`/api/search?q=${encodeURIComponent(q)}`);
+  main.innerHTML = '<p class="muted">Searching… First meaning search also indexes new passages.</p>';
+  let hits;
+  try { hits = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${document.getElementById('search-mode').value}`); }
+  catch (e) { if(version === viewVersion) main.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
 
   if (version !== viewVersion || q !== searchBox.value.trim()) return;
   const notes = hits.filter(h => h.source === 'notes');

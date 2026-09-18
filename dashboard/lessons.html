@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lessons · Lecture Notes</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+.lessons-main{max-width:1280px;margin:auto;padding:28px}
+.layout{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:24px;align-items:start;margin-top:22px}
+.panel{padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);min-width:0}
+.panel h2{font-size:17px;margin:0 0 14px}
+.field{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--text-dim);margin-bottom:14px}
+select{font:inherit;color:var(--text);background:var(--bg-inset);border:1px solid var(--border);border-radius:7px;padding:9px 10px;width:100%}
+select:focus{outline:2px solid var(--accent)}
+.range{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.quick{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 16px}
+.quick button{font:inherit;font-size:12px;padding:5px 10px;border-radius:999px;border:1px solid var(--border);background:var(--bg-inset);color:var(--text-dim);cursor:pointer}
+.quick button:hover{border-color:var(--accent);color:var(--text)}
+.summary{font-size:13px;color:var(--text-dim);margin:0 0 14px;min-height:1.4em}
+.progress{margin-top:16px}
+.bar{height:8px;border-radius:99px;background:var(--bg-inset);overflow:hidden;border:1px solid var(--border)}
+.bar>div{height:100%;width:0;background:var(--accent);transition:width .4s ease}
+.stage-text{font-size:13px;margin-top:8px;color:var(--text-dim);display:flex;justify-content:space-between;gap:10px}
+.notice{padding:10px 12px;border-radius:8px;border:1px solid var(--border);font-size:13px;margin-top:14px;white-space:pre-wrap}
+.notice.error{border-color:var(--bad);color:var(--bad)}.notice.good{border-color:var(--good)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px}
+.lesson-card{display:flex;flex-direction:column;gap:8px;padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);color:inherit;text-decoration:none;transition:border-color .15s,transform .15s}
+.lesson-card:hover{border-color:var(--accent);transform:translateY(-1px)}
+.lesson-card h3{margin:0;font-size:16px;line-height:1.3}
+.lesson-card .meta{font-size:12px;color:var(--text-faint);display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center}
+.lesson-card p{margin:0;font-size:13px;color:var(--text-dim);display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.pill{font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;background:var(--accent-dim);color:var(--accent)}
+.empty-state{padding:36px;text-align:center;color:var(--text-dim);border:1px dashed var(--border);border-radius:12px}
+button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
+@media(max-width:860px){.layout{grid-template-columns:1fr}.lessons-main{padding:16px}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span>Lecture Notes</div>
+  <nav class="tabs" aria-label="Lecture tools">
+    <a href="/">Notes</a>
+    <a href="/corrections">Corrections</a>
+    <a href="/lessons" class="active" aria-current="page">Lessons</a>
+    <a href="/diagnostics">Diagnostics</a>
+  </nav>
+</header>
+
+<main class="lessons-main">
+  <div class="page-heading">
+    <div class="eyebrow">Study lessons</div>
+    <h1 class="page-title">Re-learn it the easy way.</h1>
+    <p class="page-sub">Pick a stretch of lectures and get a short narrated slideshow that explains it all in plain language, with pictures and diagrams.</p>
+  </div>
+
+  <div class="layout">
+    <section class="panel" aria-labelledby="build-title">
+      <h2 id="build-title">Build a lesson</h2>
+      <label class="field">Class<select id="class"></select></label>
+      <div class="range">
+        <label class="field">From<select id="start"></select></label>
+        <label class="field">To<select id="end"></select></label>
+      </div>
+      <div class="quick" aria-label="Quick ranges">
+        <button data-quick="1">Last lecture</button>
+        <button data-quick="2">Last 2</button>
+        <button data-quick="week">Past week</button>
+        <button data-quick="all">Everything</button>
+      </div>
+      <p class="summary" id="summary"></p>
+      <label class="field">Narrator voice<select id="voice"></select></label>
+      <button class="btn primary" id="build" style="width:100%">Build lesson</button>
+      <div class="progress" id="progress" hidden>
+        <div class="bar"><div id="bar"></div></div>
+        <div class="stage-text"><span id="stage">Starting…</span><span id="elapsed"></span></div>
+      </div>
+      <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+    </section>
+
+    <section aria-labelledby="library-title">
+      <div class="row-between" style="margin-bottom:12px">
+        <div class="section-label" id="library-title" style="margin:0">Your lessons</div>
+      </div>
+      <div class="grid" id="lessons"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const pretty = iso => new Date(iso + 'T12:00:00').toLocaleDateString(undefined, {weekday:'short', month:'short', day:'numeric'});
+const minutes = s => !s ? 'no narration' : s < 60 ? `${Math.round(s)}s` : `${Math.round(s / 60)} min`;
+let classes = [], jobTimer = null, jobStarted = 0;
+
+function store(key, value) { try { value == null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch {} }
+function recall(key) { try { return localStorage.getItem(key); } catch { return null; } }
+
+function notice(text, kind = '') {
+  $('notice').hidden = !text; $('notice').className = 'notice ' + kind; $('notice').textContent = text || '';
+}
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+
+function currentClass() { return classes.find(c => c.code === $('class').value); }
+
+function fillDates() {
+  const cls = currentClass(), dates = cls ? cls.dates : [];
+  const options = dates.map(d => `<option value="${d}">${esc(pretty(d))}</option>`).join('');
+  $('start').innerHTML = options; $('end').innerHTML = options;
+  if (dates.length) { $('start').value = dates[dates.length - 1]; $('end').value = dates[dates.length - 1]; }
+  updateSummary();
+}
+
+function updateSummary() {
+  const cls = currentClass();
+  if (!cls || !cls.dates.length) { $('summary').textContent = 'No dated lectures for this class yet.'; $('build').disabled = true; return; }
+  let [a, b] = [$('start').value, $('end').value]; if (a > b) [a, b] = [b, a];
+  const count = cls.dates.filter(d => d >= a && d <= b).length;
+  $('summary').textContent = `${count} lecture${count === 1 ? '' : 's'}: ${pretty(a)}${a === b ? '' : ' – ' + pretty(b)}`;
+  $('build').disabled = !!jobTimer;
+}
+
+function quick(kind) {
+  const dates = currentClass()?.dates || []; if (!dates.length) return;
+  const last = dates[dates.length - 1];
+  let first = last;
+  if (kind === 'all') first = dates[0];
+  else if (kind === 'week') {
+    const cutoff = new Date(last + 'T12:00:00'); cutoff.setDate(cutoff.getDate() - 6);
+    first = dates.find(d => new Date(d + 'T12:00:00') >= cutoff) || last;
+  } else first = dates[Math.max(0, dates.length - Number(kind))];
+  $('start').value = first; $('end').value = last; updateSummary();
+}
+
+async function loadLessons() {
+  const lessons = await api('/api/lessons');
+  $('lessons').innerHTML = lessons.length ? lessons.map(l => `
+    <a class="lesson-card" href="/lesson?id=${encodeURIComponent(l.id)}">
+      <div class="meta"><span class="pill">${esc(l.class_code)}</span>
+        <span>${esc(pretty(l.start))}${l.start === l.end ? '' : ' – ' + esc(pretty(l.end))}</span></div>
+      <h3>${esc(l.title)}</h3>
+      <p>${esc(l.tldr)}</p>
+      <div class="meta"><span>${l.slides} slides</span><span>${minutes(l.duration_seconds)}</span></div>
+    </a>`).join('')
+    : '<div class="empty-state">No lessons yet. Build one from a lecture on the left.</div>';
+}
+
+function track(jobId) {
+  store('lessonJob', jobId);
+  $('progress').hidden = false; $('build').disabled = true; jobStarted = jobStarted || Date.now();
+  clearInterval(jobTimer);
+  const tick = async () => {
+    let job;
+    try { job = await api('/api/lessons/job?id=' + encodeURIComponent(jobId)); }
+    catch (error) { stop(); notice(error.message, 'error'); return; }
+    $('bar').style.width = Math.round((job.progress || 0) * 100) + '%';
+    $('stage').textContent = job.stage || '';
+    const secs = Math.round((Date.now() - (job.created_at * 1000 || jobStarted)) / 1000);
+    $('elapsed').textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+    if (job.status === 'ready') {
+      stop(); await loadLessons();
+      notice('Lesson ready.', 'good');
+      $('notice').innerHTML = `Lesson ready. <a href="/lesson?id=${encodeURIComponent(job.lesson_id)}">Play it now →</a>`;
+    } else if (job.status === 'failed') {
+      stop(); notice('The lesson could not be built: ' + (job.error || 'unknown error'), 'error');
+    }
+  };
+  tick(); jobTimer = setInterval(tick, 1500);
+}
+
+function stop() {
+  clearInterval(jobTimer); jobTimer = null; jobStarted = 0; store('lessonJob', null);
+  $('progress').hidden = true; updateSummary();
+}
+
+$('class').onchange = () => { store('lessonClass', $('class').value); fillDates(); };
+$('start').onchange = updateSummary; $('end').onchange = updateSummary;
+$('voice').onchange = () => store('lessonVoice', $('voice').value);
+document.querySelectorAll('[data-quick]').forEach(b => b.onclick = () => quick(b.dataset.quick));
+$('build').onclick = async () => {
+  notice('');
+  try {
+    const { job_id } = await api('/api/lessons/create', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ class_code: $('class').value, start: $('start').value, end: $('end').value, voice: $('voice').value }),
+    });
+    jobStarted = Date.now(); track(job_id);
+  } catch (error) { notice(error.message, 'error'); }
+};
+
+(async () => {
+  try {
+    const info = await api('/api/lessons/classes');
+    classes = info.classes.filter(c => c.dates.length);
+    $('class').innerHTML = classes.map(c => `<option value="${esc(c.code)}">${esc(c.code)} · ${esc(c.title)}</option>`).join('');
+    const savedClass = recall('lessonClass'); if (classes.some(c => c.code === savedClass)) $('class').value = savedClass;
+    $('voice').innerHTML = Object.entries(info.voices).map(([id, label]) => `<option value="${id}">${esc(label)}</option>`).join('');
+    $('voice').value = info.voices[recall('lessonVoice')] ? recall('lessonVoice') : info.default_voice;
+    if (!info.narration) notice('Narration is unavailable (' + info.narration_reason + '). Lessons will still be built, without audio.');
+    fillDates();
+    await loadLessons();
+    const running = recall('lessonJob'); if (running) track(running);
+  } catch (error) { notice(error.message, 'error'); }
+})();
+</script>
+</body>
+</html>

@@ -1,7 +1,7 @@
-"""Detects and clears an OS-level microphone mute before a recording session starts.
-Uses pycaw (a Python wrapper around the Windows Core Audio API) to query and toggle the
-mute flag on the default capture device - the same flag Windows' own volume mixer/tray
-icon controls.
+"""Detects and clears an OS-level microphone mute before a recording session starts, and
+reads (without changing) the mute state during one. Uses pycaw (a Python wrapper around
+the Windows Core Audio API) to query and toggle the mute flag on the default capture
+device - the same flag Windows' own volume mixer/tray icon controls.
 
 Deliberately narrow in scope: this only sees the OS-level mute toggle on the default
 input device. It can't see (and can't do anything about):
@@ -15,11 +15,8 @@ callers get None back and should treat it the same as "couldn't determine, skip 
 import sys
 
 
-def check_and_unmute() -> str | None:
-    """Checks the default microphone's mute state and clears it if muted. Returns a
-    human-readable status line to print, or None if the check couldn't run at all
-    (non-Windows, pycaw not installed, no default mic, COM failure, etc.) - callers
-    should treat None as "nothing to report" rather than an error."""
+def _default_mic_volume():
+    """The default microphone's IAudioEndpointVolume interface, or None if unavailable."""
     if sys.platform != "win32":
         return None
     try:
@@ -41,12 +38,36 @@ def check_and_unmute() -> str | None:
         if mic is None:
             return None
         endpoint = mic.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
-        volume = endpoint.QueryInterface(IAudioEndpointVolume)
+        return endpoint.QueryInterface(IAudioEndpointVolume)
+    except Exception:
+        return None
 
+
+def check_and_unmute() -> str | None:
+    """Checks the default microphone's mute state and clears it if muted. Returns a
+    human-readable status line to print, or None if the check couldn't run at all
+    (non-Windows, pycaw not installed, no default mic, COM failure, etc.) - callers
+    should treat None as "nothing to report" rather than an error."""
+    volume = _default_mic_volume()
+    if volume is None:
+        return None
+    try:
         if not volume.GetMute():
             return None  # already unmuted - nothing worth printing
-
         volume.SetMute(0, None)
         return "unmuted"
+    except Exception:
+        return None
+
+
+def is_muted() -> bool | None:
+    """Read-only: whether Windows has the default microphone muted, or None if that can't be
+    determined. Never changes the setting - it's used mid-recording to explain a lost
+    signal, where silently unmuting a mic someone muted on purpose would be wrong."""
+    volume = _default_mic_volume()
+    if volume is None:
+        return None
+    try:
+        return bool(volume.GetMute())
     except Exception:
         return None

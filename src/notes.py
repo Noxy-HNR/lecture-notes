@@ -193,8 +193,9 @@ def _looks_like_assistant_chatter(text: str) -> bool:
     return not has_structure
 
 
-def _try_claude_cli_format(prompt: str) -> str | None:
-    """Returns clean markdown via the Claude Code CLI (subscription usage), or None if unusable."""
+def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> str | None:
+    """Returns clean markdown via the Claude Code CLI (subscription usage), or None if unusable.
+    `timeout` is only raised by long one-off jobs (lessons); note saves keep the default."""
     cli = _find_claude_cli()
     if not cli:
         return None
@@ -205,7 +206,7 @@ def _try_claude_cli_format(prompt: str) -> str | None:
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=CLI_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
         if result.returncode != 0:
             return None
@@ -218,7 +219,7 @@ def _try_claude_cli_format(prompt: str) -> str | None:
         return None
 
 
-def _try_claude_api_format(prompt: str) -> str | None:
+def _try_claude_api_format(prompt: str, max_tokens: int = 4000) -> str | None:
     """Returns clean markdown via the Anthropic API, or None if the API isn't usable right now."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -232,7 +233,7 @@ def _try_claude_api_format(prompt: str) -> str | None:
         client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=4000,
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(block.text for block in resp.content if hasattr(block, "text")).strip()

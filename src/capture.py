@@ -33,7 +33,8 @@ RECORDER_RETRY_SECONDS = 2
 # so boundaries don't land mid-word. Implemented, measured, and left OFF by default -
 # it made transcription measurably WORSE on this app's real workload.
 #
-#   tools/vad_ab_test.py, 5 min per clip, WER against a single-pass reference
+#   Measured with the since-removed Whisper model (tools/vad_ab_test.py, also removed),
+#   5 min per clip, WER against a single-pass reference
 #   (no chunk boundaries at all, so it isolates boundary damage):
 #
 #     PSYC 1300 (lecturer A):  fixed 15.30%  ->  pause-aware 16.67%   (+1.37 worse)
@@ -43,14 +44,11 @@ RECORDER_RETRY_SECONDS = 2
 # more per-chunk overhead). The likely reason is that an energy-based detector doesn't
 # actually find sentence boundaries - it finds any brief dip, including breaths and
 # mid-clause gaps - so it cuts mid-thought more often than a fixed timer does, while
-# also handing Whisper shorter chunks (mean 12-13s vs 15s) with less context to work
-# with. Whisper already gets the relevant protection elsewhere: vad_filter=True strips
-# silence inside each chunk, and RollingTranscriber's overlap window plus rolling
-# context prompt cover words split across a boundary.
+# also handing the model shorter chunks (mean 12-13s vs 15s) with less context to work
+# with. Cohere now cuts its own 120s windows at quiet points (see transcribe.py).
 #
-# Kept (rather than deleted) so the finding stays reproducible and the harness keeps
-# working - flip pause_aware=True in collect_chunk() to re-test if the thresholds or
-# the model ever change. The tail-silence test is RELATIVE to surrounding loudness, not
+# Kept (rather than deleted) so the finding stays reproducible - flip pause_aware=True in
+# collect_chunk() to re-test if the thresholds or the model ever change. The tail-silence test is RELATIVE to surrounding loudness, not
 # an absolute level: audio.is_silent()'s threshold is tuned to detect a dead/muted mic
 # (RMS < 0.002), and a real lecture hall's noise floor measured ~0.013, so an absolute
 # test would essentially never fire.
@@ -66,9 +64,9 @@ PAUSE_CONTEXT_SECONDS = 6.0  # what it's compared against. MUST be much longer t
                               # cover the tail, which made the comparison window and the
                               # tail the same samples, reducing the test to
                               # rms < 0.25*rms - never true, so pause detection silently
-                              # never fired at all. Caught by tools/vad_ab_test.py
-                              # reporting byte-identical chunking for both strategies.
-MIN_CHUNK_SECONDS = 8.0      # never cut this early even on a pause - Whisper accuracy
+                              # never fired at all. Caught by the A/B harness reporting
+                              # byte-identical chunking for both strategies.
+MIN_CHUNK_SECONDS = 8.0      # never cut this early even on a pause - accuracy
                               # degrades on very short fragments with little context
 
 
@@ -123,6 +121,9 @@ class CaptureThread:
         self.audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
         self.error_queue: "queue.Queue[Exception]" = queue.Queue()
         self._stop_event = threading.Event()
+        self._abandoned = False
+        self.started_at = None
+        self.last_audio_at = None  # wall-clock time the device last delivered a block
         self._thread = threading.Thread(target=self._run, name="audio-capture", daemon=True)
         # Blocks already pulled off audio_queue by collect_chunk() but not yet returned
         # (because it's still accumulating toward target_seconds). Kept on self, not a
@@ -132,15 +133,33 @@ class CaptureThread:
         self._accumulating: list[np.ndarray] = []
 
     def start(self):
+        self.started_at = time.time()
         self._thread.start()
 
     def stop(self, timeout: float = 5.0):
         self._stop_event.set()
         self._thread.join(timeout=timeout)
 
+    def seconds_since_audio(self, now: float | None = None) -> float:
+        """Wall-clock seconds since the device last delivered audio (or since start)."""
+        now = time.time() if now is None else now
+        last = self.last_audio_at or self.started_at or now
+        return max(0.0, now - last)
+
+    def abandon(self) -> np.ndarray | None:
+        """Gives up on a capture whose device stopped responding. After a laptop sleeps, the
+        Windows audio call inside the capture thread can block forever without raising, so
+        the thread can't be stopped or joined - it's told to exit without writing anything
+        more if the driver ever returns, and the audio it had already delivered is handed
+        back so none of it is lost."""
+        self._abandoned = True
+        self._stop_event.set()
+        return self.drain_available()
+
     def collect_chunk(self, target_seconds: float, poll_seconds: float = 0.5,
                        interrupt_event: "threading.Event | None" = None,
-                       pause_aware: bool = False) -> np.ndarray | None:
+                       pause_aware: bool = False,
+                       max_wait_seconds: float | None = None) -> np.ndarray | None:
         """Blocks (checking `self._stop_event` periodically so it stays interruptible)
         until `target_seconds` worth of audio has been pulled from the queue, or stop
         was requested - in which case whatever partial audio is already queued (if any)
@@ -161,11 +180,17 @@ class CaptureThread:
         If a KeyboardInterrupt fires while this is blocked waiting for the next block,
         it propagates normally (the caller's Ctrl+C handling still works) - but whatever
         had already been pulled off the queue stays in self._accumulating rather than
-        being lost in a local variable, so a follow-up drain_available() call recovers it."""
+        being lost in a local variable, so a follow-up drain_available() call recovers it.
+
+        `max_wait_seconds`, if given, returns early (with whatever has accumulated, possibly
+        None) once no new audio has arrived for that long, so a device that stopped
+        delivering can't hold the caller here forever - the recording loop relies on this to
+        notice a frozen capture and reconnect."""
         target_frames = int(target_seconds * audio.SAMPLE_RATE)
         min_frames = int(min(MIN_CHUNK_SECONDS, target_seconds) * audio.SAMPLE_RATE)
         tail_frames = int(PAUSE_TAIL_SECONDS * audio.SAMPLE_RATE)
         total_frames = sum(len(b) for b in self._accumulating)
+        last_progress = time.monotonic()
         while total_frames < target_frames:
             if interrupt_event is not None and interrupt_event.is_set():
                 break
@@ -174,7 +199,10 @@ class CaptureThread:
             except queue.Empty:
                 if self._stop_event.is_set():
                     break
+                if max_wait_seconds is not None and time.monotonic() - last_progress >= max_wait_seconds:
+                    break
                 continue
+            last_progress = time.monotonic()
             self._accumulating.append(block)
             total_frames += len(block)
             if (pause_aware and total_frames >= min_frames
@@ -226,6 +254,9 @@ class CaptureThread:
                 with recorder:
                     while not self._stop_event.is_set():
                         block = audio.record_chunk(recorder, READ_SECONDS)
+                        if self._abandoned:
+                            return  # replaced while blocked in the driver: its successor owns the WAV now
+                        self.last_audio_at = time.time()
                         if self.on_block is not None:
                             try:
                                 self.on_block(block)  # persist before any inference queue

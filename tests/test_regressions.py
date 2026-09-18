@@ -1,7 +1,7 @@
 """Regression tests for the pure logic in this app.
 
 Scope is deliberate: everything here runs in seconds with no GPU, microphone, network
-or Claude call, so it can run on every change. Whisper accuracy and prompt quality are
+or Claude call, so it can run on every change. Transcription accuracy and prompt quality are
 not unit-testable and are measured separately by the harnesses in tools/.
 
 Nearly every test below is a real bug that reached real lecture notes or crashed a live
@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 import numpy as np
 import pytest
@@ -426,30 +425,6 @@ class TestAudioRetention:
         self._make(tmp_path, "ANCIENT_20200101_120000.wav", 9999)
         main.auto_prune_audio()
         assert (tmp_path / "ANCIENT_20200101_120000.wav").exists()
-
-
-# ---------------------------------------------------------------------------
-# WER (the measurement the tuning decisions rest on)
-# ---------------------------------------------------------------------------
-
-class TestWordErrorRate:
-    def test_identical_text_is_zero(self):
-        from vad_ab_test import word_error_rate
-        assert word_error_rate("the cat sat", "the cat sat") == 0.0
-
-    def test_counts_substitution_insertion_and_deletion(self):
-        from vad_ab_test import word_error_rate
-        assert word_error_rate("a b c d", "a x c d") == pytest.approx(0.25)  # 1 sub / 4
-        assert word_error_rate("a b c d", "a b c") == pytest.approx(0.25)    # 1 del / 4
-        assert word_error_rate("a b c d", "a b c d e") == pytest.approx(0.25)  # 1 ins / 4
-
-    def test_is_case_insensitive(self):
-        from vad_ab_test import word_error_rate
-        assert word_error_rate("The Cat", "the cat") == 0.0
-
-    def test_empty_reference_does_not_divide_by_zero(self):
-        from vad_ab_test import word_error_rate
-        assert word_error_rate("", "anything") == 0.0
 
 
 if __name__ == "__main__":

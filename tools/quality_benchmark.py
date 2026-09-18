@@ -68,7 +68,7 @@ def main():
             padding = int(case.get('quiet_padding', 0)*audio.SAMPLE_RATE)
             samples = np.pad(samples, (padding, padding))
             start = time.perf_counter()
-            segments = recorder.RollingTranscriber(None).process(samples)
+            segments = recorder.RollingTranscriber().process(samples)
             hypothesis = ' '.join(s['text'] for s in segments)
             results.append({'case': case, 'hypothesis': hypothesis, 'segments': segments,
                             'wer': wer(case['reference'], hypothesis), 'seconds': time.perf_counter()-start})

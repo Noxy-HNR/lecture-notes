@@ -45,6 +45,42 @@ a conflict. Unsaved transcript edits have a **Discard edit** control.
 Restart the dashboard server after updating to load the new API routes. Generation
 runs in the background; previews expire after one hour or a dashboard restart.
 
+## Lessons: narrated TL;DR slideshows
+
+Open **Lessons** in the dashboard, pick a class and a range of lecture dates (or a quick
+range like "Last lecture" / "Past week"), choose a narrator voice and select **Build
+lesson**. A lesson takes a few minutes to build in the background and then replays
+instantly from **Your lessons**.
+
+- **What it teaches**: the notes in that date range decide what's covered - everything
+  testable in them is taught - but the explanations go well beyond them: plain-language
+  re-explanations, analogies, worked examples, context and common mistakes, written by
+  Claude (CLI/API, same model as note formatting). The notes come from speech
+  transcription, so where they look garbled or wrong the slide teaches the correct version
+  and shows a **Heads up** saying what the notes said. Lessons end with a recap and quick
+  check questions (answers hidden until you reveal them).
+- **Visuals**: diagrams (processes, cycles, comparisons, timelines) are drawn with Mermaid,
+  bundled in `dashboard/vendor/` so the player works offline. Pictures are searched on
+  Wikipedia (article images), Wikimedia Commons and Openverse, and Claude picks the best
+  candidate for each slide from their descriptions - or none, if nothing fits. Molecules
+  are drawn as sharp vector images with RDKit from PubChem's structure data (every
+  hydrogen shown for small molecules like H₂O), falling back to PubChem's own drawing.
+  Transparent textbook figures are placed on white so they stay readable on the dark
+  theme. Anything that fails validation is left out rather than shown wrong.
+- **Narration**: generated offline on the CPU with Kokoro-82M (`src/speech.py`), one clip
+  per slide - about half a second of work per second of speech on this laptop, so a
+  12-minute lesson narrates in about 6 minutes. The player auto-advances with
+  the narration, and has speed control (0.85-1.5x), captions, a clickable slide bar,
+  fullscreen, and keys: ←/→ slides, Space play/pause, C captions, A auto-advance, F
+  fullscreen.
+- **Storage**: `lessons/<id>/` holds `lesson.json`, the pictures and the narration. Builds
+  happen in a `.partial` folder that's only renamed into place when complete, so a failed
+  build never leaves a broken lesson. One lesson builds at a time.
+- **Setup**: `pip install -r requirements.txt` (adds `kokoro-onnx` and `pillow`), then
+  download the two voice model files listed at the top of `src/speech.py` into
+  `state/kokoro/`. Without them, lessons are built without narration. Restart the
+  dashboard after updating to load the Lessons page.
+
 ## Recording, recovery, and playback improvements
 
 - Each captured audio block is flushed to the WAV **before** entering the
@@ -79,8 +115,7 @@ deleted. Run offline regressions with `venv\Scripts\python.exe -m pytest tests -
 Physical microphone/GPU behavior should still be smoke-tested before a lecture.
 
 Auto-detects which class you're in (from `schedule.json`, based on the day/time),
-records + transcribes the lecture fully locally (Cohere Transcribe by default, with
-Whisper large-v3 as an automatic fallback), and turns the transcript into clean notes
+records + transcribes the lecture fully locally (Cohere Transcribe), and turns the transcript into clean notes
 appended to that class's ongoing notes file.
 
 Note formatting is tried in this order, each falling back to the next if unavailable:
@@ -155,10 +190,9 @@ python -m venv venv
 Its repo is gated, so accept the terms on that page with the Hugging Face account
 behind `HUGGINGFACE_TOKEN`, then run the download command in `requirements.txt`. It
 goes into this project's `state/cohere_transcribe/` rather than the shared Hugging Face
-cache, so a general cache cleanup can't delete it. If it's missing, or there's no CUDA
-GPU, the app falls back to Whisper large-v3 automatically (which faster-whisper
-downloads, ~3GB, on first use) and says so during preflight. After that everything
-runs fully offline.
+cache, so a general cache cleanup can't delete it. It's the only transcription model
+(the Whisper fallback was removed): if it's missing or there's no CUDA GPU, preflight
+says why and won't start the recording. After that everything runs fully offline.
 
 **Recommended:** the Claude Code CLI is already installed
 (`C:\Users\braxt\.local\bin\claude.exe`, on PATH as `claude`). Log in once with
@@ -232,8 +266,7 @@ to fix, not something to ignore.
 
 - Before anything else, it runs **preflight checks**: opens your audio device
   and confirms it's actually picking up sound (not silent/muted), checks disk
-  space, and confirms the transcription model loads (saying so plainly if it had to
-  fall back from Cohere to Whisper) - so a broken mic or a dead GPU shows up now, not
+  space, and confirms the transcription model loads - so a broken mic or a dead GPU shows up now, not
   silently mid-lecture. A genuinely broken audio device or a transcription model that
   can't load at all stops the app here rather than starting a doomed session;
   other issues are just warnings and don't block starting.
@@ -280,7 +313,7 @@ python src/main.py --source system         # capture system audio (loopback)
 python src/main.py --formatting auto       # skip the formatting-mode prompt
 python src/main.py --formatting local      # local only - no CLI/API calls this session
 python src/main.py --formatting heuristic  # heuristic only - no LLM anywhere
-python src/main.py --chunk 30              # transcribe in 30s chunks for more frequent output (default: 120 Cohere / 20 Whisper)
+python src/main.py --chunk 30              # transcribe in 30s chunks for more frequent output (default: 120)
 python src/main.py --list                  # show all classes from schedule.json
 python src/main.py --list-sessions         # list recoverable session backups (see below)
 python src/main.py --resume PATH           # recover a crashed session (see below)
@@ -365,9 +398,8 @@ freed; nothing is actually removed until you add `--confirm`.
 
 - `schedule.json` — your class schedule (edit this each semester; see format
   in the file — day, start/end time in 24h, location, type).
-- `vocab.json` — per-class vocabulary hints (Latin/technical terms) used both
-  to bias Whisper's recognition and to fuzzy-correct mis-transcriptions during
-  proofreading/local formatting. Add your own terms per class code - or let it
+- `vocab.json` — per-class vocabulary hints (Latin/technical terms) used to
+  fuzzy-correct mis-transcriptions during proofreading/local formatting. Add your own terms per class code - or let it
   grow on its own: whenever the CLI/API proofreading pass fixes a mis-heard
   term (e.g. "amigdala" → "amygdala"), that correction is automatically
   detected and saved into `vocab.json` for that class, so the heuristic/local
@@ -387,16 +419,51 @@ Edit `schedule.json`. Each class has a `sessions` list; each session has
 `day` (full weekday name), `start`/`end` (24h `HH:MM`), `location`, and `type`.
 Add/remove classes or sessions as your schedule changes each term.
 
+## Meaning search
+
+The dashboard's search box has two modes. **Keyword search** needs the words you type to appear
+in the line. **Meaning search** matches by meaning, so "why does sweating cool you down" finds
+the evaporative-cooling notes even though they never use those words.
+
+It runs offline on all-MiniLM-L6-v2 through the shared service in `C:\AI\Tools
+pu-services`,
+on the **Intel iGPU**. Your notes and transcripts are embedded once and cached, so the first
+search after new lectures takes a while (~50s for a semester's worth) and later ones take a
+second or two.
+
+Measured on 6155 passages of real notes and transcripts (2026-09-18), all four devices returned
+identical answers, so the device choice is only about speed and CPU load:
+
+| | index | CPU time | per passage |
+|---|---|---|---|
+| Intel iGPU, batches of 32 | 35.2s | 11.1s | 5.7 ms |
+| NPU, one at a time | 55.6s | 13.8s | 9.0 ms |
+| CPU, dynamic shapes, batches of 16 | 28.4s | 153.6s | 4.6 ms |
+| CPU, one at a time | 199.5s | 1022.3s | 32.4 ms |
+
+Quality, on 32 paraphrased study questions written before any results were seen
+(`tests/test_semantic_search.py`): the right section came first for 23 of 32, was in the top 5
+for 30, and the top 10 for all 32. Keyword search found none of them, since it needs every word
+to match; a generous word-overlap ranking got 14 first and 23 in the top 10.
+
+```bash
+python tools/semantic_search_benchmark.py --freeze-corpus   # refresh the test copy of your notes
+python tools/semantic_search_benchmark.py                   # re-run the device comparison
+```
+
+The frozen copy of your notes that the test uses is not committed, for the same reason `notes/`
+isn't. The benchmark skips the discrete GPU while a recording is live.
+
 ## Improving accuracy
 
 The app is currently tuned for accuracy over live-update frequency:
 
-- **Model**: Cohere Transcribe 03-2026 by default, chosen by measurement. In a
-  three-way test on real PSYC 1300 and BIOL 1440 lectures (`tools/model_ab_test.py`)
-  it disagreed least with the other two models on both clips, ran several times
-  faster than Whisper large-v3 or Qwen3-ASR, and got technical terms right with no
-  vocabulary prompt. Whisper large-v3 is the automatic fallback (`BACKEND_PREFERENCE`
-  in `src/transcribe.py`). Cohere returns no word timings; each piece it decodes (up
+- **Model**: Cohere Transcribe 03-2026, chosen by measurement. In a three-way test on
+  real PSYC 1300 and BIOL 1440 lectures it disagreed least with the other two models
+  on both clips, ran several times faster than Whisper large-v3 or Qwen3-ASR, and got
+  technical terms right with no vocabulary prompt. It's the only model - the Whisper
+  fallback and its tuning tools were removed after Cohere ran every lecture without
+  failing (results kept in `state/model_ab/`). Cohere returns no word timings; each piece it decodes (up
   to 35s) is one timed segment, so search jumps to the right half-minute of a
   recording, not the exact word.
 - **Cohere settings** (`COHERE_*` in `src/transcribe.py`): tuned by
@@ -416,23 +483,34 @@ The app is currently tuned for accuracy over live-update frequency:
   anyone can say in that time, is re-decoded in 10s sub-pieces and anything still
   looping is dropped. Pieces that pass both checks keep exactly the normal output:
   re-running that session changed only its 6 failed pieces out of 63. A repetition
-  penalty was tried first and rejected because it also changed correct words.
-- **Chunk size** (`--chunk`): defaults to the loaded model's tuned window - 120s for
-  Cohere, 20s for the Whisper fallback (the most accurate of 15/20/25/30s in
-  `tools/chunk_size_sweep.py`). Accurate text arrives in 2-minute batches,
+  penalty was tried first and rejected because it also changed correct words. The
+  diagnostics dashboard's **Transcript guard** tile counts both kinds for the session,
+  and each time the guard acts it logs an event naming the minute of audio affected.
+- **Frozen-audio watchdog** (`CaptureWatchdog` in `src/main.py`): after the laptop slept
+  during HLTH 1320 (2026-09-16), the Windows audio call never returned and the recorder
+  ran for four hours capturing nothing, with no warning. Now, if no audio arrives for 10
+  seconds it warns (terminal and dashboard), keeps whatever audio was already captured,
+  and reconnects the microphone - retrying every 30 seconds while it stays silent and
+  saying when audio is flowing again. A gap of 45+ seconds between checks is reported as
+  "the computer was asleep or unresponsive from X to Y", so a missing stretch of lecture
+  is explained. Note that recording only prevents *idle* sleep: closing the lid or a dead
+  battery still sleeps the laptop.
+- **Mic signal-loss warning** (`DropoutMonitor` in `src/main.py`): a live mic never
+  produces exact zeros, even in a silent room, so 3 seconds of exact zeros means the
+  signal is gone (muted or disconnected) and nothing is being recorded. It warns in
+  the terminal and dashboard within seconds, says whether Windows has the mic muted
+  (a read-only check; it never unmutes mid-recording), and reports when the signal
+  returns and for how long it was lost. The dashboard's **Mic signal** tile turns
+  red while it's out.
+- **Chunk size** (`--chunk`): defaults to Cohere's tuned 120s window. Accurate text arrives in 2-minute batches,
   without an additional preview pass. A window is only
   skipped as silent if every 20s slice of it is silent.
-- **Chunk overlap** (Whisper fallback only): consecutive chunks overlap by 1.5s
-  (`RollingTranscriber` in `src/main.py`) so a word split across a boundary isn't
-  clipped, with the repeated text dropped using Whisper's segment timings. Cohere
-  has no timings to drop repeats with, so it runs on back-to-back chunks - which is
-  also exactly how it was tested.
-- **Whisper-only settings**: a rolling context prompt (the previous chunk's text fed
-  back in as `initial_prompt`) and `BEAM_SIZE = 8` in `src/transcribe.py`. Cohere
-  has no prompt input and ignores both.
+- **No chunk overlap**: Cohere has no word timings to drop repeated words with, so
+  windows run back to back - exactly how it was tested - and its splitter cuts each
+  window at quiet points.
 - **Latin/technical vocabulary**: add terms to `vocab.json` under your class's code
-  (or `"_global"` for terms that apply everywhere). They prime the Whisper fallback,
-  and the proofreading pass fuzzy-corrects toward them. Terms are no longer learned
+  (or `"_global"` for terms that apply everywhere). The proofreading pass
+  fuzzy-corrects toward them (Cohere has no prompt input to prime). Terms are no longer learned
   automatically - that filled the list with ordinary words and mis-corrections that
   steered transcription toward words nobody said - so add them by hand or through the
   corrections review.
@@ -443,24 +521,14 @@ The app is currently tuned for accuracy over live-update frequency:
 
 ## GPU acceleration
 
-This machine has an RTX 5070 Ti, so both Whisper transcription and (if
-enabled) speaker diarization are already set up to use it automatically -
-`transcribe.get_model()` uses `device="auto"`, which picks CUDA when available
-and falls back to CPU otherwise; no code changes needed. Confirmed working:
-transcribing an 8s audio chunk takes ~0.3s on GPU (vs. several seconds on CPU).
-
-What's installed for this:
+This machine has an RTX 5070 Ti. Cohere Transcribe needs it (it's too slow on CPU),
+and speaker diarization uses it too if enabled. The CUDA build of PyTorch ships its
+own CUDA/cuDNN libraries, so it's the only GPU install needed:
 ```bash
-# CUDA-enabled PyTorch (also used by diarization if you set that up)
 ./venv/Scripts/python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-# NVIDIA runtime libs faster-whisper/ctranslate2 needs for GPU execution
-./venv/Scripts/python.exe -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
-If you ever reinstall from `requirements.txt` on a machine without a
-CUDA-capable GPU, skip those two commands - the app still runs fine on CPU,
-just slower. Check what Whisper picked with the "Whisper running on: ..."
-line printed at startup (`cuda/float16` = GPU, `cpu/int8` = CPU).
+Preflight prints the device the model loaded on (`cuda/bfloat16`).
 
 ## Local GPU note formatting
 
@@ -572,10 +640,10 @@ theoretical hardening:
   flags a real audio-source problem instead of silently producing garbage.
 - **Repetition collapse** (`transcribe._collapse_repeated_segments`): on
   ambiguous/overlapping audio (several people answering quietly at once,
-  seen live in an actual lecture), Whisper can get stuck emitting the same
+  seen live in an actual lecture), a model can get stuck emitting the same
   short segment over and over as separate consecutive segments - caught and
-  capped, since Whisper's own anti-hallucination heuristics only look within
-  one segment's text and don't catch repetition spread across many.
+  capped, since per-segment checks only look within one segment's text and
+  don't catch repetition spread across many.
 - The capture thread also **auto-recovers from audio-device errors** (a
   dropout after a resume, a USB mic hiccup): it logs the error (surfaced in
   the console) and reopens the recorder instead of capture dying silently.

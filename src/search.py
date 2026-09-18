@@ -46,6 +46,8 @@ def _class_codes() -> list[str]:
 
 
 def _matches(line: str, terms: list[str], match_all: bool) -> bool:
+    if terms == ["*"]:
+        return True
     lowered = line.lower()
     if match_all:
         return all(t in lowered for t in terms)
@@ -158,3 +160,19 @@ def search(query: str, class_code: str | None = None, include_transcripts: bool 
     if include_transcripts:
         hits += search_transcripts(query, class_code, match_all)
     return hits
+
+
+def semantic_search(query, class_code=None, include_transcripts=True):
+    import sys
+    from dataclasses import asdict
+    shared = str(PROJECT_ROOT.parents[1] / 'Tools' / 'npu-services')
+    if shared not in sys.path: sys.path.insert(0, shared)
+    from npu_client import request
+    hits = search_notes('*', class_code)
+    if include_transcripts: hits += search_transcripts('*', class_code)
+    rows = []
+    for hit in hits:
+        row = asdict(hit)
+        row['line'] = row.pop('line_number')
+        rows.append(row)
+    return request('search', {'query':query, 'rows':rows}, timeout=180)['results']

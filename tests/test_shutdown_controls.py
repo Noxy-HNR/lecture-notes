@@ -30,13 +30,14 @@ SR = audio.SAMPLE_RATE
 
 class FakeModel:
     name = "cohere-transcribe"
-    timestamps = False
     device_desc = "fake/bf16"
+    repaired_pieces = 0
+    silent_pieces = 0
 
     def __init__(self):
         self.calls = []
 
-    def transcribe(self, samples, sample_rate, initial_prompt=None):
+    def transcribe(self, samples, sample_rate):
         seconds = len(samples) / sample_rate
         self.calls.append(round(seconds, 2))
         return [{"text": f"window {len(self.calls)}", "start": 0.0, "end": seconds}]
@@ -87,6 +88,14 @@ class FakeCapture:
     def stop(self):
         pass
 
+    last_audio_at = 1.0
+
+    def seconds_since_audio(self, now=None):
+        return 0.0
+
+    def abandon(self):
+        return self.drain_available()
+
     def poll_errors(self):
         return []
 
@@ -128,8 +137,8 @@ def recorder(tmp_path, monkeypatch):
                                       "--chunk", "1"])
 
     model = FakeModel()
-    transcribe.use_backend(None)
-    monkeypatch.setitem(transcribe._LOADERS, "cohere", lambda: model)
+    transcribe.unload_model()
+    monkeypatch.setattr(transcribe, "_load_backend", lambda: model)
     captures = []
 
     def make_capture(source, on_block=None):
@@ -138,7 +147,7 @@ def recorder(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main.capture_module, "CaptureThread", make_capture)
     yield SimpleNamespace(model=model, captures=captures, saves=[], state=state)
-    transcribe.use_backend(None)
+    transcribe.unload_model()
 
 
 def test_ctrl_c_stops_gracefully_and_keeps_every_captured_frame(recorder, monkeypatch):
@@ -198,6 +207,140 @@ def test_stop_request_handler_never_prints_itself(capsys):
         assert threading.main_thread().name not in calls
     finally:
         stop.close()
+
+
+def _speech(seconds):
+    return np.full(int(seconds * SR), 0.1, dtype=np.float32)
+
+
+class DropoutCapture(FakeCapture):
+    """4s of exact zeros (a muted or disconnected mic), then speech, then Ctrl+C."""
+
+    def collect_chunk(self, target_seconds, interrupt_event=None, **kwargs):
+        self.collections += 1
+        if self.collections <= 8:
+            block = np.zeros(int(0.5 * SR), dtype=np.float32)
+            self.on_block(block)
+            self.persisted_frames += len(block)
+            return block
+        if self.collections == 9:
+            return self._speech(0.5)
+        partial = self._speech(0.3)
+        signal.raise_signal(signal.SIGINT)
+        assert _eventually(interrupt_event.is_set)
+        return partial
+
+
+def test_mic_dropout_is_announced_within_seconds_and_when_it_returns(recorder, monkeypatch, capsys):
+    monkeypatch.setattr(main.notes, "format_and_save", lambda *a, **k: (recorder.state / "notes.md", "none"))
+    monkeypatch.setattr(main.mic_mute, "is_muted", lambda: False)
+    monkeypatch.setattr(main.capture_module, "CaptureThread",
+                        lambda source, on_block=None: DropoutCapture(source, on_block))
+    main.run()
+
+    out = capsys.readouterr().out
+    assert out.count("Microphone signal lost") == 1
+    assert "Microphone signal is back after 4s" in out
+    messages = [e["message"] for e in telemetry.read_status()["events"]]
+    assert any("signal lost" in m for m in messages) and any("is back" in m for m in messages)
+
+
+class FreezingCapture(FakeCapture):
+    """The first capture delivers 1s of speech, then its device freezes after sleep: no
+    audio and no error, so collection just times out. The replacement works normally."""
+    made = []
+
+    def __init__(self, source, on_block=None):
+        super().__init__(source, on_block)
+        self.number = len(FreezingCapture.made) + 1
+        self.frozen = False
+        FreezingCapture.made.append(self)
+
+    def seconds_since_audio(self, now=None):
+        return 999.0 if self.frozen else 0.0
+
+    def collect_chunk(self, target_seconds, interrupt_event=None, **kwargs):
+        if self.number != 1:
+            return super().collect_chunk(target_seconds, interrupt_event, **kwargs)
+        self.collections += 1
+        if self.collections <= 2:
+            return self._speech(0.5)
+        self.frozen = True
+        return None
+
+
+def test_frozen_audio_device_is_reconnected_without_losing_audio(recorder, monkeypatch, capsys):
+    FreezingCapture.made = []
+    saves = []
+    monkeypatch.setattr(main.notes, "format_and_save",
+                        lambda code, title, text, *a, **k: saves.append(text) or (recorder.state / "notes.md", "none"))
+    monkeypatch.setattr(main.capture_module, "CaptureThread",
+                        lambda source, on_block=None: FreezingCapture(source, on_block))
+    main.run()
+
+    out = capsys.readouterr().out
+    first, second = FreezingCapture.made
+    assert len(FreezingCapture.made) == 2 and out.count("Reconnecting") == 1
+    assert "coming in again" in out
+    wav = next(recorder.state.glob("TEST_1000_*.wav"))
+    assert sf.info(str(wav)).frames == first.persisted_frames + second.persisted_frames
+    # Nothing captured before the freeze or after the reconnect is missing from the notes.
+    assert sum(recorder.model.calls) == pytest.approx((first.persisted_frames + second.persisted_frames) / SR)
+    # The frozen capture still had 0.2s queued; it's recovered into the next window (0.2 + 1.0).
+    assert recorder.model.calls == [1.0, 1.2, 0.5] and saves == ["window 1 window 2 window 3"]
+    messages = [e["message"] for e in telemetry.read_status()["events"]]
+    assert any("stopped responding" in m for m in messages)
+
+
+def test_transcript_guard_activity_reaches_the_dashboard(recorder, monkeypatch):
+    model, original = recorder.model, recorder.model.transcribe
+
+    def guarded(samples, sample_rate):
+        result = original(samples, sample_rate)
+        if len(model.calls) == 1:
+            model.silent_pieces += 1
+        else:
+            model.repaired_pieces += 1
+        return result
+
+    model.transcribe = guarded
+    monkeypatch.setattr(main.notes, "format_and_save", lambda *a, **k: (recorder.state / "notes.md", "none"))
+    main.run()
+
+    status = telemetry.read_status()
+    assert (status["guard_repaired"], status["guard_silent"]) == (1, 1)
+    messages = [e["message"] for e in status["events"]]
+    assert sum("looping piece" in m for m in messages) == 1
+    assert sum("silent piece" in m for m in messages) == 1
+
+
+class TestDropoutMonitor:
+    def test_quiet_room_is_not_a_dropout(self):
+        monitor = main.DropoutMonitor(SR)
+        room = np.random.default_rng(0).normal(0, 0.0005, 60 * SR).astype(np.float32)
+        assert monitor.feed(room) == [] and monitor.dropout_seconds == 0
+
+    def test_warns_once_after_three_seconds_across_slices_then_reports_return(self):
+        monitor = main.DropoutMonitor(SR, muted_check=lambda: True)
+        zeros = np.zeros(int(2.5 * SR), dtype=np.float32)
+        assert monitor.feed(zeros) == []  # 2.5s: not yet
+        lost = monitor.feed(zeros)        # 5s, spanning two collected slices
+        assert [level for level, _ in lost] == ["error"]
+        assert "Windows has the microphone muted" in lost[0][1]
+        assert monitor.feed(zeros) == []  # still out: no repeated warning
+        assert monitor.feed(_speech(1.0)) == [
+            ("success", "Microphone signal is back after 8s - that stretch wasn't recorded.")]
+        assert monitor.dropout_seconds == 0
+
+    def test_brief_glitch_is_ignored(self):
+        monitor = main.DropoutMonitor(SR)
+        assert monitor.feed(np.concatenate([np.zeros(2 * SR, dtype=np.float32), _speech(1.0)])) == []
+
+    def test_unreadable_mute_state_gives_the_generic_message(self):
+        def broken():
+            raise OSError("COM unavailable")
+        lost = main.DropoutMonitor(SR, muted_check=broken).feed(np.zeros(4 * SR, dtype=np.float32))
+        assert "muted or disconnected" in lost[0][1]
 
 
 def test_autosave_and_manual_save_keep_snapshot_order(monkeypatch):

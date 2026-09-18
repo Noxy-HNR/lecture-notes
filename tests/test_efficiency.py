@@ -7,12 +7,12 @@ import performance
 def test_retry_restores_context_and_emits_once(tmp_path, monkeypatch):
     monkeypatch.setattr(performance, 'PATH', tmp_path/'timings.jsonl')
     class Flaky:
-        recent_text = 'original'
+        consecutive_silent_chunks = 0
         calls = 0
         def process(self, samples):
-            assert self.recent_text == 'original'
+            assert self.consecutive_silent_chunks == 0
             self.calls += 1
-            self.recent_text = 'changed'
+            self.consecutive_silent_chunks = 5
             if self.calls == 1:
                 raise RuntimeError('temporary')
             return []

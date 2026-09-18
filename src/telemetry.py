@@ -66,7 +66,7 @@ class Telemetry:
             "claude_api": "unknown",
             "gpu_model": "unknown",
             "diarization": "unknown",
-            "whisper_device": "",
+            "model_device": "",
             "notes_path": "",
             "wav_path": "",
         }

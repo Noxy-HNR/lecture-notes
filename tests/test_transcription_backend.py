@@ -1,6 +1,6 @@
-"""Tests for the transcription backend switch and the vocabulary auto-learning shutoff.
+"""Tests for the transcription model wiring and the vocabulary auto-learning shutoff.
 
-No GPU, model files or network: backends are replaced with fakes, so these run in
+No GPU, model files or network: the model is replaced with a fake, so these run in
 milliseconds and test the wiring rather than a model.
 """
 import sys
@@ -16,87 +16,56 @@ import transcribe
 
 
 class FakeBackend:
-    def __init__(self, name="fake", timestamps=True):
+    def __init__(self, name="cohere-transcribe"):
         self.name = name
-        self.timestamps = timestamps
         self.device_desc = "fake/float16"
         self.calls = []
 
-    def transcribe(self, samples, sample_rate, initial_prompt=None):
+    def transcribe(self, samples, sample_rate):
         seconds = len(samples) / sample_rate
         self.calls.append(seconds)
         return [{"text": f"chunk {len(self.calls)}", "start": 0.0, "end": seconds}]
 
 
 @pytest.fixture(autouse=True)
-def reset_backend():
-    transcribe.use_backend(None)
+def reset_model():
+    transcribe.unload_model()
     yield
-    transcribe.use_backend(None)
+    transcribe.unload_model()
 
 
 def _speech(seconds):
     return np.full(int(seconds * audio.SAMPLE_RATE), 0.1, dtype=np.float32)
 
 
-class TestBackendSelection:
-    def test_prefers_cohere_when_it_loads(self, monkeypatch):
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", lambda: FakeBackend("cohere-transcribe", False))
-        monkeypatch.setitem(transcribe._LOADERS, "whisper", lambda: FakeBackend("whisper-large-v3"))
+class TestModelLoading:
+    def test_loads_cohere_once(self, monkeypatch):
+        loads = []
+        monkeypatch.setattr(transcribe, "_load_backend", lambda: loads.append(1) or FakeBackend())
         assert transcribe.backend_name() == "cohere-transcribe"
-        assert transcribe.fallback_reason() == ""
+        transcribe.get_model()
+        assert len(loads) == 1
 
-    def test_falls_back_to_whisper_and_says_why(self, monkeypatch):
-        """A deleted or broken default model must never stop a recording from starting -
-        which is what happened when a cache cleanup removed the Whisper weights mid-week."""
+    def test_clear_error_when_the_model_cannot_load(self, monkeypatch):
+        """No fallback model any more: a missing or broken Cohere must say exactly why, so
+        preflight blocks the recording instead of capturing audio nobody transcribes."""
         def broken():
             raise FileNotFoundError("model files not found")
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", broken)
-        monkeypatch.setitem(transcribe._LOADERS, "whisper", lambda: FakeBackend("whisper-large-v3"))
-        assert transcribe.backend_name() == "whisper-large-v3"
-        assert "cohere" in transcribe.fallback_reason()
-        assert "model files not found" in transcribe.fallback_reason()
-
-    def test_clear_error_when_nothing_loads(self, monkeypatch):
-        def broken():
-            raise RuntimeError("nope")
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", broken)
-        monkeypatch.setitem(transcribe._LOADERS, "whisper", broken)
-        with pytest.raises(RuntimeError, match="no transcription model could load"):
+        monkeypatch.setattr(transcribe, "_load_backend", broken)
+        with pytest.raises(RuntimeError, match="could not load - FileNotFoundError: model files not found"):
             transcribe.get_model()
+        assert transcribe.device_info() == "unknown"
 
-    def test_use_backend_pins_a_single_model(self, monkeypatch):
-        """tools/ that tune Whisper settings must not silently measure Cohere instead."""
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", lambda: FakeBackend("cohere-transcribe", False))
-        monkeypatch.setitem(transcribe._LOADERS, "whisper", lambda: FakeBackend("whisper-large-v3"))
-        transcribe.use_backend("whisper")
-        assert transcribe.backend_name() == "whisper-large-v3"
-
-    def test_timestampless_backend_returns_one_segment_spanning_the_chunk(self, monkeypatch):
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", lambda: FakeBackend("cohere-transcribe", False))
-        segments = transcribe.transcribe_chunk_segments(_speech(20.0))
-        assert len(segments) == 1 and segments[0]["start"] == 0.0 and segments[0]["end"] == 20.0
-
-
-class TestRollingOverlap:
-    def _run_two_chunks(self, monkeypatch, timestamps):
+    def test_windows_are_transcribed_back_to_back(self, monkeypatch):
+        """Segments are whole pieces with no word timings, so there is no audio overlap to
+        de-duplicate: each window goes to the model exactly as captured."""
         import main
-        fake = FakeBackend(timestamps=timestamps)
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", lambda: fake)
-        rolling = main.RollingTranscriber(vocab_prompt=None)
+        fake = FakeBackend()
+        monkeypatch.setattr(transcribe, "_load_backend", lambda: fake)
+        rolling = main.RollingTranscriber()
         rolling.process(_speech(20.0))
         rolling.process(_speech(20.0))
-        return fake.calls
-
-    def test_no_overlap_without_timestamps(self, monkeypatch):
-        """Without timestamps there's no way to drop the words that came from the repeated
-        1.5s, so it would duplicate speech at every boundary."""
-        assert self._run_two_chunks(monkeypatch, timestamps=False) == [20.0, 20.0]
-
-    def test_overlap_kept_for_timestamped_backends(self, monkeypatch):
-        calls = self._run_two_chunks(monkeypatch, timestamps=True)
-        assert calls[0] == 20.0
-        assert calls[1] == pytest.approx(20.0 + main_overlap())
+        assert fake.calls == [20.0, 20.0]
 
 
 class TestLongWindows:
@@ -108,12 +77,9 @@ class TestLongWindows:
         assert [(s["text"], s["start"], s["end"]) for s in segs] == [
             ("one", 0.0, 30.0), ("three", 65.0, 85.0)]
 
-    def test_chunk_defaults_to_the_models_window(self, monkeypatch):
+    def test_chunk_defaults_to_the_tuned_window(self):
         import argparse
         import main
-        fake = FakeBackend("cohere-transcribe", False)
-        fake.preferred_chunk_seconds = 120.0
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", lambda: fake)
         assert main.resolve_chunk_seconds(argparse.Namespace(chunk=None)) == 120.0
         assert main.resolve_chunk_seconds(argparse.Namespace(chunk=15.0)) == 15.0
 
@@ -121,12 +87,11 @@ class TestLongWindows:
         """The whole-window RMS of 10s of speech in 120s of quiet falls under the silence
         threshold; the gate must look at slices, not the average."""
         import main
-        fake = FakeBackend("cohere-transcribe", False)
-        monkeypatch.setitem(transcribe._LOADERS, "cohere", lambda: fake)
+        monkeypatch.setattr(transcribe, "_load_backend", FakeBackend)
         window = np.zeros(120 * audio.SAMPLE_RATE, dtype=np.float32)
         window[50 * audio.SAMPLE_RATE:60 * audio.SAMPLE_RATE] = 0.005
         assert audio.is_silent(window)  # the old whole-window check would have skipped it
-        rolling = main.RollingTranscriber(vocab_prompt=None)
+        rolling = main.RollingTranscriber()
         assert rolling.process(window) and rolling.consecutive_silent_chunks == 0
         assert rolling.process(np.zeros(120 * audio.SAMPLE_RATE, dtype=np.float32)) == []
 
@@ -156,6 +121,7 @@ class TestCohereFailureGuards:
         segments = backend.transcribe(window, self.SR)
         assert [(s["text"], s["start"], s["end"]) for s in segments] == [("Carbon tends to be black.", 0.0, 30.0)]
         assert backend.decode_calls == [60.0]  # nothing re-decoded
+        assert backend.silent_pieces == 1 and backend.repaired_pieces == 0
 
     def test_looping_piece_is_redecoded_in_sub_pieces(self):
         quiet_room = np.full(30 * self.SR, 0.01, dtype=np.float32)  # quiet, but above the silence gate
@@ -195,11 +161,6 @@ class TestCohereFailureGuards:
         mostly_zero[10 * self.SR:12 * self.SR] = 0.1  # 2s of sound inside 30s of zeros
         assert transcribe.is_silent_audio(np.zeros(30 * self.SR, dtype=np.float32), self.SR)
         assert not transcribe.is_silent_audio(mostly_zero, self.SR)
-
-
-def main_overlap():
-    import main
-    return main.RollingTranscriber.OVERLAP_SECONDS
 
 
 class TestVocabAutoLearningOff:

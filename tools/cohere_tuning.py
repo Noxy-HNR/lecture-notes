@@ -38,7 +38,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "tools"))
 
 import jiwer
 import numpy as np
@@ -52,6 +51,7 @@ AMI_DIR = EVAL / "ami" / "ami"
 NORMALIZER = EVAL / "normalizer.json"
 RESULTS = EVAL / "cohere_tuning_results.json"
 HYPS = EVAL / "hyps"
+STATUS_PATH = ROOT / "state" / "status.json"
 
 DEV_TALKS = ["AimeeMullins", "DanBarber", "DanielKahneman", "EricMead_2009P_EricMead",
              "GaryFlake", "RobertGupta"]
@@ -76,6 +76,14 @@ STAGES = {
 
 MAX_BATCH = 4          # chunks decoded together; keeps beam search inside 12GB of VRAM
 SAMPLE_RATE = 16000
+
+
+def recording_in_progress() -> bool:
+    try:
+        s = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+        return bool(s.get("active")) and (time.time() - s.get("updated_at", 0)) < 90
+    except Exception:
+        return False
 
 
 def full_config(overrides: dict) -> dict:
@@ -243,7 +251,6 @@ def main():
     parser.add_argument("--tag", default="", help="suffix for the results key, e.g. 'smoke'")
     args = parser.parse_args()
 
-    from model_ab_test import recording_in_progress
     if recording_in_progress():
         print("A recording is live - not loading models onto the GPU. Stop the recorder first.")
         sys.exit(2)

@@ -13,6 +13,7 @@
   <nav class="tabs" aria-label="Lecture tools">
     <a href="/">Notes</a>
     <a href="/corrections">Corrections</a>
+    <a href="/lessons">Lessons</a>
     <a href="/diagnostics" class="active" aria-current="page">Diagnostics</a>
   </nav>
   <div class="search-wrap"></div>
@@ -146,7 +147,7 @@ async function poll() {
     : [active ? duration(data.elapsed) : `ended ${ago(data.updated_at)}`,
        data.source === 'mic' ? 'microphone' : data.source === 'system' ? 'system audio' : '',
        data.formatting_mode ? `${data.formatting_mode} formatting` : '',
-       data.whisper_device].filter(Boolean).join(' · ');
+       data.model_device].filter(Boolean).join(' · ');
   if (recorderOpen && (!active || stale)) {
     document.getElementById('banner-title').textContent = 'Notes window open';
     document.getElementById('banner-sub').textContent = 'Complete setup in the recorder window. Preflight may take a moment before recording begins.';
@@ -163,7 +164,18 @@ async function poll() {
            data.last_save_method ? `last: ${data.last_save_method} · ${ago(data.last_save_at)}` : 'none yet') +
     metric('Silent audio', duration(data.silent_seconds ?? 0),
            (data.silent_seconds ?? 0) >= 45 ? 'check the mic' : 'since last sound',
-           (data.silent_seconds ?? 0) >= 45 ? 'warn' : '');
+           (data.silent_seconds ?? 0) >= 45 ? 'warn' : '') +
+    // No audio arriving at all (device frozen, e.g. after sleep - the recorder reconnects),
+    // or exact-zero input (muted or disconnected). Either way nothing is being recorded.
+    metric('Mic signal', !active ? '—'
+             : (data.audio_stalled_seconds ?? 0) >= 10 ? 'no audio'
+             : (data.dropout_seconds ?? 0) >= 3 ? `lost ${duration(data.dropout_seconds)}` : 'OK',
+           !active ? '' : (data.audio_stalled_seconds ?? 0) >= 10 ? 'device not responding - reconnecting'
+             : (data.dropout_seconds ?? 0) >= 3 ? 'muted or disconnected - not recording' : 'live input',
+           !active ? '' : ((data.audio_stalled_seconds ?? 0) >= 10 || (data.dropout_seconds ?? 0) >= 3) ? 'bad' : 'good') +
+    metric('Transcript guard', (data.guard_repaired ?? 0) + (data.guard_silent ?? 0),
+           `${data.guard_repaired ?? 0} loops fixed · ${data.guard_silent ?? 0} silent pieces blanked`,
+           (data.guard_repaired || data.guard_silent) ? 'warn' : '');
 
   const rtf = data.realtime_factor ?? 0;
   document.getElementById('perf-metrics').innerHTML =

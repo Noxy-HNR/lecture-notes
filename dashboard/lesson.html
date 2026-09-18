@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson · Lecture Notes</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+html,body{height:100%}
+body{display:flex;flex-direction:column}
+.player{flex:1;display:flex;flex-direction:column;min-height:0;max-width:1400px;width:100%;margin:0 auto;padding:18px 24px 0}
+.lesson-head{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:12px}
+.lesson-head h1{font-size:15px;font-weight:600;margin:0;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lesson-head a{font-size:13px;color:var(--text-dim);text-decoration:none;white-space:nowrap}
+.lesson-head a:hover{color:var(--accent)}
+.stage{flex:1;min-height:0;position:relative;border:1px solid var(--border);border-radius:16px;background:var(--bg-raised);overflow:hidden;box-shadow:var(--shadow)}
+.slide{position:absolute;inset:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);grid-template-rows:minmax(0,1fr);gap:34px;padding:42px 48px;overflow:auto;animation:enter .35s ease}
+.slide.text-only{grid-template-columns:minmax(0,820px);justify-content:center}
+@keyframes enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.slide-text{display:flex;flex-direction:column;gap:16px;min-width:0;align-self:center;max-height:100%;overflow:auto}
+.kind{font-size:12px;font-weight:650;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+.slide h2{font-size:clamp(24px,3vw,38px);line-height:1.15;margin:0;letter-spacing:-.01em}
+.bullets{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:11px}
+.bullets li{position:relative;padding-left:24px;font-size:clamp(16px,1.45vw,20px);line-height:1.45}
+.bullets li::before{content:"";position:absolute;left:4px;top:.62em;width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.terms{display:flex;flex-wrap:wrap;gap:8px}
+.term{font-size:13px;padding:8px 11px;border-radius:9px;background:var(--bg-inset);border:1px solid var(--border);max-width:100%}
+.term b{color:var(--accent);font-weight:650}
+.heads-up{border:1px solid var(--warn);border-left-width:4px;border-radius:9px;padding:11px 14px;font-size:14px;background:color-mix(in srgb,var(--warn) 8%,transparent)}
+.heads-up b{color:var(--warn)}
+.question{font-size:clamp(20px,2.2vw,28px);line-height:1.35;font-weight:600}
+.answer{font-size:17px;line-height:1.5;padding:14px 16px;border-radius:10px;background:var(--accent-dim);border:1px solid var(--accent)}
+.visual{margin:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;min-width:0;min-height:0;height:100%}
+/* The frame takes the slide's full height, and pictures and diagrams scale down to fit it -
+   a tall flowchart used to overflow and get its first and last steps clipped. */
+.visual .frame{width:100%;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;border-radius:12px;background:var(--bg-inset);border:1px solid var(--border);padding:14px;overflow:hidden}
+.visual .frame.light{background:#fff}
+.visual img{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px}
+.visual svg{width:100%;height:100%}
+.visual figcaption{font-size:13px;color:var(--text-dim);text-align:center}
+.cover{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;gap:18px;padding:56px clamp(24px,7vw,110px);animation:enter .35s ease;overflow:auto}
+.cover h2{font-size:clamp(30px,4.2vw,54px);line-height:1.08;margin:0;letter-spacing:-.02em}
+.cover p{font-size:clamp(16px,1.6vw,21px);line-height:1.55;color:var(--text-dim);max-width:900px;margin:0}
+.cover .start{align-self:flex-start;font-size:16px;padding:12px 20px}
+.captions{border-top:1px solid var(--border);padding:12px 24px;font-size:15px;line-height:1.55;color:var(--text-dim);max-height:22vh;overflow:auto}
+.controls{display:flex;align-items:center;gap:10px;padding:14px 0 18px;flex-wrap:wrap}
+.icon{font:inherit;font-size:14px;min-width:40px;height:38px;padding:0 12px;border-radius:9px;border:1px solid var(--border);background:var(--bg-raised);color:var(--text);cursor:pointer}
+.icon:hover:not(:disabled){border-color:var(--accent)}
+.icon.primary{background:var(--accent);color:#06231c;border-color:var(--accent);font-weight:650;min-width:92px}
+.icon[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+.track{flex:1;min-width:160px;display:flex;gap:3px;height:10px;cursor:pointer}
+.track div{flex:1;border-radius:3px;background:var(--bg-inset);border:1px solid var(--border);position:relative;overflow:hidden}
+.track div.done{background:var(--accent-dim)}
+.track div.current{border-color:var(--accent)}
+.track div span{position:absolute;inset:0 auto 0 0;width:0;background:var(--accent)}
+.time{font-size:13px;color:var(--text-dim);font-variant-numeric:tabular-nums;min-width:92px;text-align:right}
+select{font:inherit;font-size:13px;color:var(--text);background:var(--bg-raised);border:1px solid var(--border);border-radius:9px;height:38px;padding:0 8px}
+.error{margin:auto;color:var(--bad);padding:40px;text-align:center}
+button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
+.player:fullscreen{max-width:none;padding:18px 28px 0;background:var(--bg)}
+@media(max-width:900px){
+  .slide{grid-template-columns:1fr;grid-template-rows:auto minmax(260px,50vh);padding:24px 20px;gap:20px}
+  .slide-text{align-self:start}
+  .player{padding:12px 12px 0}
+  .time{display:none}
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span>Lecture Notes</div>
+  <nav class="tabs" aria-label="Lecture tools">
+    <a href="/">Notes</a>
+    <a href="/corrections">Corrections</a>
+    <a href="/lessons" class="active" aria-current="page">Lessons</a>
+    <a href="/diagnostics">Diagnostics</a>
+  </nav>
+</header>
+
+<main class="player" id="player">
+  <div class="lesson-head">
+    <h1 id="lesson-name">Loading lesson…</h1>
+    <a href="/lessons">← All lessons</a>
+  </div>
+  <div class="stage" id="stage" aria-live="polite"></div>
+  <div class="captions" id="captions" hidden></div>
+  <div class="controls">
+    <button class="icon" id="prev" aria-label="Previous slide" title="Previous (←)">‹</button>
+    <button class="icon primary" id="play" title="Play / pause (space)">▶ Play</button>
+    <button class="icon" id="next" aria-label="Next slide" title="Next (→)">›</button>
+    <div class="track" id="track" role="group" aria-label="Slides"></div>
+    <span class="time" id="time"></span>
+    <select id="speed" aria-label="Narration speed" title="Narration speed">
+      <option value="0.85">0.85×</option><option value="1">1×</option><option value="1.15">1.15×</option>
+      <option value="1.3">1.3×</option><option value="1.5">1.5×</option>
+    </select>
+    <button class="icon" id="auto" aria-pressed="true" title="Advance automatically (a)">Auto</button>
+    <button class="icon" id="cc" aria-pressed="false" title="Show narration text (c)">CC</button>
+    <button class="icon" id="full" aria-label="Fullscreen" title="Fullscreen (f)">⤢</button>
+  </div>
+  <audio id="audio" preload="auto"></audio>
+</main>
+
+<script src="/vendor/mermaid.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const clock = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const params = new URLSearchParams(location.search);
+const lessonId = params.get('id');
+const audio = $('audio');
+const KIND = {overview: "What you'll learn", concept: 'Concept', example: 'Worked example', recap: 'Recap', check: 'Quick check'};
+let lesson = null, index = 0, playing = false, advanceTimer = null, renderToken = 0;
+
+function store(key, value) { try { localStorage.setItem(key, value); } catch {} }
+function recall(key) { try { return localStorage.getItem(key); } catch { return null; } }
+
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+if (window.mermaid) mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default',
+  fontFamily: getComputedStyle(document.body).fontFamily, flowchart: { htmlLabels: false } });
+
+const asset = file => `/lesson-assets?id=${encodeURIComponent(lessonId)}&file=${encodeURIComponent(file)}`;
+const slides = () => lesson.slides;
+const total = () => slides().length + 1;               // slide 0 is the title card
+const slideAt = i => i === 0 ? null : slides()[i - 1];
+
+function coverHtml() {
+  const range = lesson.dates.length > 1 ? `${lesson.dates.length} lectures` : '1 lecture';
+  return `<div class="cover">
+    <div class="kind">${esc(lesson.class_code)} · ${esc(lesson.class_title)} · ${range}</div>
+    <h2>${esc(lesson.title)}</h2>
+    <p>${esc(lesson.tldr)}</p>
+    <button class="btn primary start" id="start-lesson">▶ Start lesson${lesson.duration_seconds ? ' · ' + clock(lesson.duration_seconds) : ''}</button>
+    ${lesson.warnings?.length ? `<p style="font-size:13px">${esc(lesson.warnings.join(' · '))}</p>` : ''}
+  </div>`;
+}
+
+function slideHtml(slide, number) {
+  const visual = slide.visual || { type: 'none' };
+  const hasVisual = visual.type !== 'none';
+  const text = `<div class="slide-text">
+    <div class="kind">${esc(KIND[slide.kind] || 'Concept')} · ${number} of ${slides().length}</div>
+    <h2>${esc(slide.title)}</h2>
+    ${slide.kind === 'check'
+      ? `<div class="question">${esc(slide.question)}</div>
+         <button class="btn" id="reveal" style="align-self:flex-start">Reveal answer</button>
+         <div class="answer" id="answer" hidden>${esc(slide.answer)}</div>`
+      : (slide.bullets.length ? `<ul class="bullets">${slide.bullets.map(b => `<li>${esc(b)}</li>`).join('')}</ul>` : '')}
+    ${slide.key_terms?.length ? `<div class="terms">${slide.key_terms.map(t => `<div class="term"><b>${esc(t.term)}</b> — ${esc(t.meaning)}</div>`).join('')}</div>` : ''}
+    ${slide.heads_up ? `<div class="heads-up"><b>Heads up:</b> ${esc(slide.heads_up)}</div>` : ''}
+  </div>`;
+  let figure = '';
+  if (visual.type === 'image' || visual.type === 'molecule') {
+    figure = `<figure class="visual"><div class="frame light">
+      <img src="${asset(visual.file)}" alt="${esc(visual.caption || slide.title)}"></div>
+      ${visual.caption ? `<figcaption>${esc(visual.caption)}</figcaption>` : ''}</figure>`;
+  } else if (visual.type === 'diagram') {
+    figure = `<figure class="visual"><div class="frame" id="diagram"></div>
+      ${visual.caption ? `<figcaption>${esc(visual.caption)}</figcaption>` : ''}</figure>`;
+  }
+  return `<div class="slide ${hasVisual ? '' : 'text-only'}" id="slide">${text}${figure}</div>`;
+}
+
+async function render() {
+  const token = ++renderToken;
+  const slide = slideAt(index);
+  $('stage').innerHTML = slide ? slideHtml(slide, index) : coverHtml();
+  if (!slide) $('start-lesson').onclick = () => { go(1); setPlaying(true); };
+  if (slide?.kind === 'check') $('reveal').onclick = () => { $('answer').hidden = false; $('reveal').hidden = true; };
+  if (slide?.visual?.type === 'diagram') {
+    try {
+      if (!window.mermaid) throw new Error('diagram renderer missing');
+      const { svg } = await mermaid.render(`diagram-${index}-${token}`, slide.visual.mermaid);
+      if (token === renderToken) $('diagram').innerHTML = svg;
+    } catch {
+      if (token !== renderToken) return;
+      const figure = $('slide').querySelector('.visual');       // a diagram that won't render is left out
+      if (figure) figure.remove();
+      $('slide').classList.add('text-only');
+      document.querySelectorAll('[id^="ddiagram-"]').forEach(n => n.remove());
+    }
+  }
+  if (slide?.visual && slide.visual.type !== 'diagram' && slide.visual.type !== 'none') {
+    const img = $('stage').querySelector('img');
+    if (img) img.onerror = () => { img.closest('.visual').remove(); $('slide').classList.add('text-only'); };
+  }
+  $('captions').textContent = slide ? slide.narration : lesson.tldr;
+  $('prev').disabled = index === 0; $('next').disabled = index === total() - 1;
+  drawTrack(); updateTime();
+}
+
+function drawTrack() {
+  $('track').innerHTML = slides().map((s, i) =>
+    `<div class="${i + 1 < index ? 'done' : ''} ${i + 1 === index ? 'current' : ''}" data-i="${i + 1}" title="${esc(s.title)}"
+      style="flex:${Math.max(4, s.audio_seconds || 20)}"><span id="fill-${i + 1}"></span></div>`).join('');
+}
+
+function updateTime() {
+  const before = slides().slice(0, Math.max(0, index - 1)).reduce((sum, s) => sum + (s.audio_seconds || 0), 0);
+  const here = index > 0 && !audio.paused || (index > 0 && audio.currentTime) ? audio.currentTime : 0;
+  $('time').textContent = lesson.duration_seconds ? `${clock(before + here)} / ${clock(lesson.duration_seconds)}` : '';
+  const fill = $('fill-' + index), dur = slideAt(index)?.audio_seconds;
+  if (fill && dur) fill.style.width = Math.min(100, audio.currentTime / dur * 100) + '%';
+}
+
+function go(i) {
+  clearTimeout(advanceTimer);
+  index = Math.max(0, Math.min(total() - 1, i));
+  const slide = slideAt(index);
+  audio.pause();
+  if (slide?.audio) { audio.src = asset(slide.audio); audio.playbackRate = Number($('speed').value); }
+  else audio.removeAttribute('src');
+  render();
+  if (playing) startAudio();
+}
+
+function startAudio() {
+  const slide = slideAt(index);
+  if (!slide) { go(1); return; }
+  if (!slide.audio) { scheduleAdvance(Math.max(6000, slide.narration.split(/\s+/).length * 330)); return; }
+  audio.playbackRate = Number($('speed').value);
+  audio.play().catch(() => setPlaying(false));
+}
+
+function scheduleAdvance(ms) {
+  clearTimeout(advanceTimer);
+  if ($('auto').getAttribute('aria-pressed') !== 'true') return;
+  advanceTimer = setTimeout(() => { if (playing && index < total() - 1) go(index + 1); else setPlaying(false); }, ms);
+}
+
+function setPlaying(on) {
+  playing = on;
+  $('play').textContent = on ? '❚❚ Pause' : '▶ Play';
+  if (on) startAudio(); else { audio.pause(); clearTimeout(advanceTimer); }
+}
+
+audio.addEventListener('timeupdate', updateTime);
+audio.addEventListener('ended', () => {
+  const slide = slideAt(index);
+  if (slide?.kind === 'check') scheduleAdvance(5000);  // a moment to think before moving on
+  else if (index < total() - 1) scheduleAdvance(700);
+  else setPlaying(false);
+});
+
+$('play').onclick = () => setPlaying(!playing);
+$('prev').onclick = () => go(index - 1);
+$('next').onclick = () => go(index + 1);
+$('track').onclick = e => { const i = e.target.closest('[data-i]')?.dataset.i; if (i) go(Number(i)); };
+$('speed').onchange = () => { audio.playbackRate = Number($('speed').value); store('lessonSpeed', $('speed').value); };
+$('auto').onclick = () => { const on = $('auto').getAttribute('aria-pressed') !== 'true'; $('auto').setAttribute('aria-pressed', on); store('lessonAuto', on); };
+$('cc').onclick = () => { const on = $('cc').getAttribute('aria-pressed') !== 'true'; $('cc').setAttribute('aria-pressed', on); $('captions').hidden = !on; store('lessonCaptions', on); };
+$('full').onclick = () => document.fullscreenElement ? document.exitFullscreen() : $('player').requestFullscreen?.();
+document.addEventListener('keydown', e => {
+  if (e.target.closest('select, input, textarea') || e.metaKey || e.ctrlKey || e.altKey || !lesson) return;
+  if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); go(index + 1); }
+  else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); go(index - 1); }
+  else if (e.key === ' ') { e.preventDefault(); setPlaying(!playing); }
+  else if (e.key === 'c') $('cc').click();
+  else if (e.key === 'a') $('auto').click();
+  else if (e.key === 'f') $('full').click();
+});
+
+(async () => {
+  if (recall('lessonSpeed')) $('speed').value = recall('lessonSpeed'); else $('speed').value = '1';
+  if (recall('lessonAuto') === 'false') $('auto').setAttribute('aria-pressed', 'false');
+  if (recall('lessonCaptions') === 'true') { $('cc').setAttribute('aria-pressed', 'true'); $('captions').hidden = false; }
+  try {
+    const response = await fetch('/api/lessons/lesson?id=' + encodeURIComponent(lessonId || ''));
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Lesson not found');
+    lesson = await response.json();
+    document.title = lesson.title + ' · Lessons';
+    $('lesson-name').textContent = `${lesson.class_code} · ${lesson.title}`;
+    if (!slides().some(s => s.audio)) $('play').title = 'No narration - slides advance on a timer';
+    go(0);
+  } catch (error) {
+    $('stage').innerHTML = `<div class="error">${esc(error.message)}. <a href="/lessons">Back to lessons</a></div>`;
+    $('lesson-name').textContent = 'Lesson unavailable';
+  }
+})();
+</script>
+</body>
+</html>

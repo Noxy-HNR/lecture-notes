@@ -4,7 +4,7 @@ import warnings
 import numpy as np
 import soundcard as sc
 
-SAMPLE_RATE = 16000  # what faster-whisper wants
+SAMPLE_RATE = 16000  # what Cohere Transcribe wants
 BLOCKSIZE = 4096      # smaller WASAPI buffer periods -> fewer discontinuity warnings
 
 # soundcard/WASAPI occasionally reports "data discontinuity" (a few dropped ms of audio)
@@ -53,8 +53,7 @@ SILENCE_RMS_THRESHOLD = 0.002  # below this, treat the chunk as silence, don't t
 
 def is_silent(chunk_audio: np.ndarray, threshold: float = SILENCE_RMS_THRESHOLD) -> bool:
     """True if `chunk_audio` is at/near total silence (RMS amplitude below threshold).
-    Whisper hallucinates repeated punctuation/filler ("...", "you", "thank you") when
-    fed silence - this catches a muted mic, a suspended/disconnected audio device, or
+    Speech models hallucinate filler or whole sentences when fed silence - this catches a muted mic, a suspended/disconnected audio device, or
     dead air on the "system audio" source before it ever reaches the model, rather than
     relying on VAD alone (which doesn't always fully suppress a whole silent chunk)."""
     if chunk_audio.size == 0:

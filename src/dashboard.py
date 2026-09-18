@@ -279,6 +279,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.parent != STATE_DIR.resolve() or not path.is_file():
             self._send(b"recording not found", "text/plain", 404)
             return
+        self._send_file_range(path, "audio/wav")
+
+    def _send_file_range(self, path: Path, content_type: str):
+        """Streams a file with HTTP Range support, so audio players can seek."""
         with path.open("rb") as handle:
             size = path.stat().st_size
             start, end, status = 0, size - 1, 200
@@ -304,7 +308,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 status = 206
             self.send_response(status)
-            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Type", content_type)
+            if content_type == "image/svg+xml":
+                # Drawings are generated locally and shown via <img>, but an SVG opened on
+                # its own could run script in the dashboard's origin - forbid that outright.
+                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(end - start + 1))
             if status == 206:
@@ -353,6 +361,40 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error":str(error)},404)
             except ValueError as error:
                 self._json({"error":str(error)},409)
+        elif route == "/lessons":
+            self._static("lessons.html", "text/html; charset=utf-8")
+        elif route == "/lesson":
+            self._static("lesson.html", "text/html; charset=utf-8")
+        elif route == "/vendor/mermaid.min.js":
+            self._static("vendor/mermaid.min.js", "text/javascript; charset=utf-8")
+        elif route == "/lesson-assets":
+            import lessons
+            try:
+                path = lessons.lesson_asset(one("id", ""), one("file", ""))
+            except FileNotFoundError:
+                self._send(b"not found", "text/plain", 404)
+                return
+            content_type = {".ogg": "audio/ogg", ".svg": "image/svg+xml"}.get(path.suffix, "image/webp")
+            self._send_file_range(path, content_type)
+        elif route.startswith("/api/lessons"):
+            import lessons
+            import speech
+            try:
+                if route == "/api/lessons":
+                    self._json(lessons.list_lessons())
+                elif route == "/api/lessons/classes":
+                    narration, reason = speech.available()
+                    self._json({"classes": lessons.list_classes(), "voices": speech.VOICES,
+                                "default_voice": speech.DEFAULT_VOICE,
+                                "narration": narration, "narration_reason": reason})
+                elif route == "/api/lessons/lesson":
+                    self._json(lessons.get_lesson(one("id", "")))
+                elif route == "/api/lessons/job":
+                    self._json(lessons.get_job(one("id", "")))
+                else:
+                    self._json({"error": "Unknown lesson route"}, 404)
+            except FileNotFoundError as error:
+                self._json({"error": str(error)}, 404)
         elif route == "/style.css":
             self._static("style.css", "text/css; charset=utf-8")
         elif route == "/api/classes":
@@ -363,6 +405,13 @@ class Handler(BaseHTTPRequestHandler):
             query = one("q", "") or ""
             if not query.strip():
                 self._json([])
+                return
+            if one('mode') == 'semantic':
+                try:
+                    self._json(search_module.semantic_search(query, one('class') or None,
+                                                             one('transcripts', '1') == '1'))
+                except RuntimeError as exc:
+                    self._json({'error': str(exc)}, 503)
                 return
             hits = search_module.search(
                 query,
@@ -399,6 +448,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/corrections/"):
             self._correction_post(parsed.path)
             return
+        if parsed.path == "/api/lessons/create":
+            self._lesson_post()
+            return
         if parsed.path != "/api/command":
             self._send(b"not found", "text/plain", 404)
             return
@@ -426,6 +478,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "unknown action"}, 400)
             return
         self._json({"ok": telemetry.send_command(action)})
+
+    def _lesson_post(self):
+        """Starts a lesson build. Same request rules as correction writes: local address,
+        same-origin, JSON body."""
+        import lessons
+        origin = self.headers.get("Origin")
+        if not self._local_host() or (origin is not None and origin != "http://" + self.headers.get("Host", "")):
+            self._json({"error": "Lessons can only be started from this dashboard"}, 403)
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._json({"error": "JSON request required"}, 415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 10_000:
+                raise ValueError("Request is empty or too large")
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a JSON object")
+            self._json(lessons.start_lesson(payload))
+        except lessons.LessonBusy as error:
+            self._json({"error": str(error)}, 409)
+        except (ValueError, TypeError) as error:
+            self._json({"error": str(error)}, 400)
 
     def _correction_post(self, route):
         from storage import RevisionConflict

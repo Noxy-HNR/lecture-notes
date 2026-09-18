@@ -8,7 +8,7 @@ format than a wall of paragraphs by:
     "next let's discuss Y", ...) and turning them into subheadings
   - bolding terms that recur often enough to likely be key vocabulary
   - fuzzy-correcting words against the class's vocab.json glossary (helps with
-    Latin/technical terms Whisper mangled)
+    Latin/technical terms transcription mangled)
   - if given a diarized, speaker-tagged transcript ("[Speaker 1] ...", one
     speaker per line), detecting back-and-forth as Q&A and setting it apart
     from continuous lecture content
@@ -50,7 +50,7 @@ _SPEAKER_LINE_RE = re.compile(r"^\[(Speaker \d+)\]\s*(.*)$")
 
 def correct_with_glossary(text: str, class_code: str | None) -> str:
     """Fuzzy-matches individual words against the class's vocab.json glossary
-    and fixes near-misses (e.g. Whisper hearing "amigdala" for "amygdala")."""
+    and fixes near-misses (e.g. "amigdala" transcribed for "amygdala")."""
     if not class_code:
         return text
     terms = vocab_module.terms_for_class(class_code)

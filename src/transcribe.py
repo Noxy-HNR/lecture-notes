@@ -1,29 +1,17 @@
-"""Local speech-to-text, fully offline.
+"""Local speech-to-text, fully offline, with Cohere Transcribe 03-2026 (2B, Apache 2.0).
 
-Two backends, tried in order:
+In a three-way test on real lectures from this app (PSYC 1300 and BIOL 1440) it disagreed
+least with Whisper large-v3 and Qwen3-ASR on both clips, ran several times faster, and got
+technical terms right with no vocabulary prompt at all - including "an anion or a cation",
+where Whisper wrote "cadmium". It is the only model: the Whisper fallback was removed once
+Cohere had run every lecture without failing. Loaded from state/cohere_transcribe/, never
+the shared Hugging Face cache (a general cache cleanup has already wiped a model from there
+once and stalled a live lecture).
 
-  1. Cohere Transcribe 03-2026 (2B, Apache 2.0) - the default. In a three-way test on real
-     lectures from this app (tools/model_ab_test.py, PSYC 1300 and BIOL 1440) it disagreed
-     least with the other two models on both clips, ran several times faster, and got
-     technical terms right with no vocabulary prompt at all - including "an anion or a
-     cation", where Whisper wrote "cadmium". Loaded from state/cohere_transcribe/, never the
-     shared Hugging Face cache (a general cache cleanup has already wiped a model from
-     there once and stalled a live lecture).
-  2. Whisper large-v3 via faster-whisper - the fallback. Used automatically if Cohere can't
-     load (model folder missing, no CUDA GPU, transformers not installed), so a missing or
-     broken model can never stop a recording from starting.
-
-Cohere settings below were tuned against human-verified transcripts (TED-LIUM talks) with
+Settings below were tuned against human-verified transcripts (TED-LIUM talks) with
 tools/cohere_tuning.py, not against other models' output - see the constants' comments.
-
-Backend differences callers need to know about:
-  - preferred_chunk_seconds(): how much audio to hand over per call. Cohere does best with
-    long windows it splits itself at quiet points; Whisper with 20s back-to-back chunks.
-  - supports_timestamps(): whether segment timings are fine enough to de-duplicate an audio
-    overlap between chunks. Whisper's are; Cohere's segments are whole pieces (up to 35s),
-    which is fine for search but not for overlap de-duplication.
-  - initial_prompt (the class vocabulary) is used by Whisper and ignored by Cohere, which
-    has no prompt or hotword input.
+Segments are whole pieces (up to 35s): fine for search, too coarse to de-duplicate audio
+overlapping between windows, so windows are handed over back to back.
 """
 import gc
 import re
@@ -34,9 +22,6 @@ import numpy as np
 from performance import stage
 
 COHERE_PATH = Path(__file__).resolve().parent.parent / "state" / "cohere_transcribe"
-
-DEFAULT_PREFERENCE = ("cohere", "whisper")
-BACKEND_PREFERENCE = DEFAULT_PREFERENCE
 
 # --- Cohere Transcribe, tuned with tools/cohere_tuning.py on TED-LIUM ground truth -------
 # Audio handed over per call. Cohere's own splitter then cuts it at the quietest point near
@@ -50,17 +35,7 @@ COHERE_NUM_BEAMS = 1            # greedy; beams 2/4/8 no better on tuning talks,
 COHERE_DITHER = 1e-5            # feature-extractor dither (deterministic, seeded by length)
 COHERE_MAX_BATCH = 4            # pieces decoded together - keeps VRAM bounded on long windows
 
-# --- Whisper large-v3 fallback --------------------------------------------------------
-MODEL_SIZE = "large-v3"
-BEAM_SIZE = 8
-WHISPER_CHUNK_SECONDS = 20.0    # measured best of 15/20/25/30s for Whisper (chunk_size_sweep)
-# Whether Whisper carries its own previous output forward as context within a chunk. Off:
-# prevents one mis-transcription from propagating. Module-level so tools/ can A/B it.
-CONDITION_ON_PREVIOUS_TEXT = False
-
 _model = None
-_backend = None
-_fallback_reason = ""
 _inference_lock = threading.Lock()
 
 # --- Cohere failure guards -------------------------------------------------------------
@@ -140,8 +115,6 @@ def segments_from_pieces(texts: list[str], piece_samples: list[int], sample_rate
 
 class _CohereBackend:
     name = "cohere-transcribe"
-    timestamps = False
-    preferred_chunk_seconds = COHERE_WINDOW_SECONDS
 
     def __init__(self):
         import torch
@@ -171,8 +144,9 @@ class _CohereBackend:
         return [int(p.shape[0]) for p in pieces]
 
     repaired_pieces = 0  # pieces re-decoded by the loop guard, for tools and diagnostics
+    silent_pieces = 0    # silent pieces whose invented text the silence guard discarded
 
-    def transcribe(self, audio, sample_rate, initial_prompt=None):
+    def transcribe(self, audio, sample_rate):
         try:
             piece_samples = self._piece_lengths(audio)
         except Exception:
@@ -191,6 +165,8 @@ class _CohereBackend:
         for text, n in zip(texts, piece_samples):
             piece, cursor = audio[cursor:cursor + n], cursor + n
             if is_silent_audio(piece, sample_rate):
+                if text.strip():
+                    self.silent_pieces += 1
                 text = ""
             elif looks_degenerate(text, n / sample_rate):
                 self.repaired_pieces += 1
@@ -232,68 +208,25 @@ class _CohereBackend:
         return texts
 
 
-class _WhisperBackend:
-    name = "whisper-large-v3"
-    timestamps = True
-    preferred_chunk_seconds = WHISPER_CHUNK_SECONDS
-
-    def __init__(self):
-        from faster_whisper import WhisperModel
-        try:
-            # device="auto" picks the GPU when CUDA + cuDNN are available; compute_type
-            # "default" picks float16 on GPU, int8 on CPU.
-            self.model = WhisperModel(MODEL_SIZE, device="auto", compute_type="default")
-        except Exception:
-            self.model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-        try:
-            self.device_desc = f"{self.model.model.device}/{self.model.model.compute_type}"
-        except Exception:
-            self.device_desc = "unknown"
-
-    def transcribe(self, audio, sample_rate, initial_prompt=None):
-        segments, _info = self.model.transcribe(
-            audio,
-            language="en",
-            vad_filter=True,          # skip silence instead of hallucinating text
-            condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-            initial_prompt=initial_prompt,
-            beam_size=BEAM_SIZE,
-            repetition_penalty=1.1,   # mild nudge against the decoder looping on short phrases
-        )
-        return [{"text": seg.text.strip(), "start": seg.start, "end": seg.end}
-                for seg in segments if seg.text.strip()]
-
-
-_LOADERS = {"cohere": _CohereBackend, "whisper": _WhisperBackend}
+_load_backend = _CohereBackend  # replaced with a fake in tests
 
 
 def get_model():
-    """Loads the first backend in BACKEND_PREFERENCE that works, once. If a preferred one
-    fails, the reason is kept for fallback_reason() so the app can say so rather than
-    silently running on a different model."""
-    global _model, _backend, _fallback_reason
-    if _model is not None:
-        return _model
-    failures = []
-    for name in BACKEND_PREFERENCE:
-        try:
-            _model = _LOADERS[name]()
-            _backend = name
-            break
-        except Exception as e:
-            failures.append(f"{name}: {type(e).__name__}: {e}")
+    """Loads the model once. A failure raises with the reason, so the startup check can say
+    exactly why instead of recording nothing."""
+    global _model
     if _model is None:
-        raise RuntimeError("no transcription model could load - " + "; ".join(failures))
-    _fallback_reason = "; ".join(failures)
+        try:
+            _model = _load_backend()
+        except Exception as e:
+            raise RuntimeError(f"the transcription model could not load - {type(e).__name__}: {e}") from e
     return _model
 
 
-def use_backend(name: str | None) -> None:
-    """Pins one backend (or restores the default order with None) and unloads whatever is
-    loaded. For tools/ that tune one specific model and must not silently test another."""
-    global _model, _backend, _fallback_reason, BACKEND_PREFERENCE
-    _model, _backend, _fallback_reason = None, None, ""
-    BACKEND_PREFERENCE = (name,) if name else DEFAULT_PREFERENCE
+def unload_model() -> None:
+    """Frees the loaded model (and its VRAM) so the next call loads it fresh."""
+    global _model
+    _model = None
     gc.collect()
     try:
         import torch
@@ -306,21 +239,6 @@ def backend_name() -> str:
     return get_model().name
 
 
-def fallback_reason() -> str:
-    """Non-empty when a preferred backend failed to load and a fallback is in use."""
-    get_model()
-    return _fallback_reason
-
-
-def supports_timestamps() -> bool:
-    return get_model().timestamps
-
-
-def preferred_chunk_seconds() -> float:
-    """Seconds of audio to hand the loaded backend per call (each was tuned separately)."""
-    return float(getattr(get_model(), "preferred_chunk_seconds", WHISPER_CHUNK_SECONDS))
-
-
 def device_info() -> str:
     """Best-effort description of what device/precision the model ended up running on."""
     try:
@@ -329,9 +247,9 @@ def device_info() -> str:
         return "unknown"
 
 
-def transcribe_chunk(audio, sample_rate=16000, initial_prompt: str | None = None) -> str:
+def transcribe_chunk(audio, sample_rate=16000) -> str:
     """audio: 1-D float32 numpy array. Returns transcribed text (may be empty)."""
-    segments = transcribe_chunk_segments(audio, sample_rate, initial_prompt)
+    segments = transcribe_chunk_segments(audio, sample_rate)
     return " ".join(seg["text"] for seg in segments).strip()
 
 
@@ -360,10 +278,10 @@ def _collapse_repeated_segments(segments: list[dict]) -> list[dict]:
     return result
 
 
-def transcribe_chunk_segments(audio, sample_rate=16000, initial_prompt: str | None = None) -> list[dict]:
+def transcribe_chunk_segments(audio, sample_rate=16000) -> list[dict]:
     """Returns a list of {"text", "start", "end"} dicts, start/end in seconds relative to the
     start of `audio` (not the session) - the caller offsets them if needed."""
     model = get_model()
     with _inference_lock:  # one caller on the model at a time (recorder, resume and tools share it)
-        segments = model.transcribe(audio, sample_rate, initial_prompt)
+        segments = model.transcribe(audio, sample_rate)
     return _collapse_repeated_segments(segments)
