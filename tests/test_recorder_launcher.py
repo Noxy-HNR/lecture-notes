@@ -86,3 +86,45 @@ def test_command_api_success_error_and_origin_protection(clean,monkeypatch):
         start.side_effect=OSError('Could not start Python')
         assert post({'action':'start'},headers)==(500,{'ok':False,'error':'Could not start Python'})
     finally:server.shutdown();server.server_close();thread.join()
+
+def test_stop_button_shuts_the_dashboard_down_only_from_its_own_page(clean,monkeypatch):
+    """The top-bar Stop button frees the dashboard's memory. Like the recording commands, it must
+    ignore other sites (including DNS rebinding) and requests without the dashboard's header."""
+    server=ThreadingHTTPServer(('127.0.0.1',0),dashboard.Handler)
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    port=server.server_port
+    def post(headers):
+        conn=http.client.HTTPConnection('127.0.0.1',port)
+        conn.request('POST','/api/dashboard/stop','',headers)
+        response=conn.getresponse();result=response.status,json.loads(response.read());conn.close();return result
+    rebound=f'attacker.example:{port}'
+    try:
+        assert post({})[0]==403
+        assert post({'X-Notes-Dashboard':'1','Origin':'https://example.com'})[0]==403
+        assert post({'X-Notes-Dashboard':'1','Host':rebound,'Origin':'http://'+rebound})[0]==403
+        thread.join(0.3);assert thread.is_alive()
+        assert post({'X-Notes-Dashboard':'1','Origin':f'http://127.0.0.1:{port}'})==(200,{'ok':True,'message':'Dashboard stopped.'})
+        thread.join(5)
+        assert not thread.is_alive()  # serve_forever returned, so the script exits
+    finally:
+        if thread.is_alive():server.shutdown()
+        server.server_close()
+
+def test_stop_waits_for_a_correction_preview_running_in_the_dashboard(clean,monkeypatch):
+    """Previews run on the dashboard's own threads; stopping mid-way would silently lose one."""
+    import corrections
+    monkeypatch.setitem(corrections._jobs,'job',{'status':'running','created_at':0})
+    server=ThreadingHTTPServer(('127.0.0.1',0),dashboard.Handler)
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    try:
+        conn=http.client.HTTPConnection('127.0.0.1',server.server_port)
+        conn.request('POST','/api/dashboard/stop','',{'X-Notes-Dashboard':'1'})
+        response=conn.getresponse();body=json.loads(response.read());conn.close()
+        assert response.status==409 and 'correction preview' in body['error']
+        thread.join(0.3);assert thread.is_alive()
+    finally:server.shutdown();server.server_close();thread.join()
+
+def test_every_page_has_the_stop_button():
+    pages=launcher.ROOT/'dashboard'
+    for page in ('notes','corrections','lessons','lesson','diagnostics'):
+        assert '<script src="/stop.js" defer></script>' in (pages/f'{page}.html').read_text(encoding='utf-8'),page

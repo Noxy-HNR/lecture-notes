@@ -96,6 +96,12 @@ class TestLongWindows:
         assert rolling.process(np.zeros(120 * audio.SAMPLE_RATE, dtype=np.float32)) == []
 
 
+def test_generated_token_count_excludes_only_batch_padding():
+    ids = np.array([[1, 8, 9, 2], [1, 7, 0, 0]])
+    assert transcribe.generated_token_count(ids, pad_token_id=0) == 6
+    assert transcribe.generated_token_count(ids) == 8
+
+
 class TestCohereFailureGuards:
     """Two failures from CHEM 1450 on 2026-09-14: invented sentences for digital silence, and
     a greedy-decoding loop on very quiet room audio. The normal decode is faked; the guard is real."""

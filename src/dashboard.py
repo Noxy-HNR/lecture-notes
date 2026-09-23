@@ -40,6 +40,14 @@ STATIC_DIR = PROJECT_ROOT / "dashboard"
 
 DEFAULT_PORT = 8770
 
+# A POST body the handler never read (it refused the request from its headers) is read and
+# dropped before the reply, up to this size and waiting at most this long. See _discard_body.
+DISCARD_BODY_LIMIT = 1024 * 1024
+DISCARD_BODY_TIMEOUT_SECONDS = 2.0
+
+# Background Jev scan of finished recordings (highlights.py); started by serve().
+SCANNER = None
+
 
 # ---------------------------------------------------------------------------
 # Markdown rendering
@@ -186,6 +194,34 @@ def class_document(code: str, kind: str = "notes") -> dict:
     }
 
 
+def lecture_headings(code: str) -> list[tuple[str, str]]:
+    """[(date heading, anchor)] for a class's notes, matching the anchors the page renders."""
+    path = _class_files(code).get("notes")
+    if not path or not path.exists():
+        return []
+    dates = re.findall(r"^## (.+)$", path.read_text(encoding="utf-8", errors="replace"), re.MULTILINE)
+    return list(zip(dates, lecture_anchors(dates)))
+
+
+def jev_overview() -> dict:
+    """Jev's switch, key source, scan progress and what it has cost so far."""
+    import highlights
+    import jev
+    calls, cost = 0, 0.0
+    for path in STATE_DIR.glob("*_highlights.json"):
+        try:
+            usage = json.loads(path.read_text(encoding="utf-8")).get("usage") or {}
+            calls += int(usage.get("calls", 0))
+            cost += float(usage.get("est_cost_usd", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    pending = SCANNER.pending() if SCANNER else []
+    return {"status": jev.status(), "label": jev.label(),
+            "scanner": SCANNER.snapshot() if SCANNER else None,
+            "waiting": len(pending), "scanned_calls": calls, "scanned_cost_usd": round(cost, 4),
+            "thresholds": highlights.THRESHOLDS}
+
+
 def list_sessions() -> list[dict]:
     """Recorded sessions from state/, newest first - the raw audio + transcript backups
     behind each lecture."""
@@ -237,6 +273,11 @@ def service_status() -> dict:
     except Exception as e:
         status["gpu_model"] = f"error: {type(e).__name__}"
     try:
+        import jev
+        status["jev"] = jev.label()
+    except Exception as e:
+        status["jev"] = f"error: {type(e).__name__}"
+    try:
         import diarize
         status["diarization"] = "enabled" if diarize.available() else "off (no HF token)"
     except Exception as e:
@@ -253,12 +294,49 @@ class Handler(BaseHTTPRequestHandler):
         pass  # the default logger spams a line per poll; the dashboard polls constantly
 
     def _send(self, body: bytes, content_type: str, status: int = 200):
+        if self.command == "POST":
+            self._discard_body()  # a refusal decided from the headers alone
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_body(self, length: int) -> bytes:
+        self._body_read = True
+        return self.rfile.read(length)
+
+    def _discard_body(self):
+        """Reads and drops a POST body the handler didn't read, before the reply goes out.
+
+        http.client sends a request's headers and its body in separate send() calls, so a
+        refusal decided from the headers can be sent before the body arrives. Closing the socket
+        with body bytes unread, or arriving afterwards, makes Windows reset the connection, and
+        the client gets WinError 10053/10054 instead of the status code. Bounded by
+        Content-Length, DISCARD_BODY_LIMIT and DISCARD_BODY_TIMEOUT_SECONDS; a body without a
+        usable Content-Length, or over the limit, is left alone."""
+        if getattr(self, "_body_read", False) or getattr(self, "headers", None) is None:
+            return
+        self._body_read = True
+        try:
+            remaining = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return
+        if not 0 < remaining <= DISCARD_BODY_LIMIT:
+            return
+        previous = self.connection.gettimeout()
+        self.connection.settimeout(DISCARD_BODY_TIMEOUT_SECONDS)
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass  # the client stopped sending; it still gets its reply
+        finally:
+            self.connection.settimeout(previous)
 
     def _json(self, payload, status: int = 200):
         self._send(json.dumps(payload).encode("utf-8"), "application/json", status)
@@ -397,8 +475,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(error)}, 404)
         elif route == "/style.css":
             self._static("style.css", "text/css; charset=utf-8")
+        elif route == "/stop.js":
+            self._static("stop.js", "text/javascript; charset=utf-8")
         elif route == "/api/classes":
             self._json(list_classes())
+        elif route == "/api/highlights":
+            import highlights
+            code = one("class", "") or ""
+            if SCANNER:
+                SCANNER.wake()
+            self._json(highlights.for_class(code, lecture_headings(code), SCANNER))
+        elif route == "/api/highlights/session":
+            import highlights
+            try:
+                self._json(highlights.mishearings(one("session", "") or ""))
+            except ValueError as error:
+                self._json({"error": str(error)}, 400)
+        elif route == "/api/jev":
+            self._json(jev_overview())
         elif route == "/api/document":
             self._json(class_document(one("class", ""), one("kind", "notes")))
         elif route == "/api/search":
@@ -408,10 +502,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if one('mode') == 'semantic':
                 try:
-                    self._json(search_module.semantic_search(query, one('class') or None,
-                                                             one('transcripts', '1') == '1'))
+                    results = search_module.semantic_search(query, one('class') or None,
+                                                            one('transcripts', '1') == '1')
                 except RuntimeError as exc:
                     self._json({'error': str(exc)}, 503)
+                    return
+                if one('rank') != '1':
+                    self._json(results)  # the page before Jev ranking asked for a bare list
+                    return
+                import jev
+                if jev.status()['ready']:
+                    ranked, note = search_module.jev_rank(query, results)
+                else:
+                    ranked, note = results, jev.label()
+                self._json({'results': ranked, 'ranked_by': 'meaning' if note else 'jev', 'note': note})
                 return
             hits = search_module.search(
                 query,
@@ -443,28 +547,57 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _from_this_dashboard(self) -> bool:
+        """A button press on one of this dashboard's own pages: local address, same origin,
+        and the custom header a cross-site form can't send."""
+        origin = self.headers.get('Origin')
+        # Host check first: under DNS rebinding a hostile page is same-origin with itself,
+        # so Origin == Host alone would still let it stop or start a recording.
+        return (self._local_host() and (not origin or origin == 'http://'+self.headers.get('Host',''))
+                and self.headers.get('X-Notes-Dashboard') == '1')
+
+    def _stop_dashboard(self):
+        """Shuts this server down to free its memory. Recordings and lesson builds run in their
+        own processes and keep going; an in-progress correction preview runs inside this one,
+        so it's the only thing that blocks stopping."""
+        if not self._from_this_dashboard():
+            self._json({'ok': False, 'error': 'The dashboard can only be stopped from its own page.'}, 403)
+            return
+        corrections = sys.modules.get('corrections')
+        if corrections is not None and corrections.previews_running():
+            self._json({'ok': False, 'error': 'A correction preview is still being generated. '
+                                              'Stop the dashboard after it finishes.'}, 409)
+            return
+        self._json({'ok': True, 'message': 'Dashboard stopped.'})
+        # shutdown() waits for serve_forever() to return, so it can't run on this handler's
+        # own thread; the reply above has already been sent by the time it lands.
+        threading.Thread(target=self.server.shutdown, daemon=True, name='dashboard-stop').start()
+
     def do_POST(self):
+        self._body_read = False
         parsed = urlparse(self.path)
+        if parsed.path == "/api/dashboard/stop":
+            self._stop_dashboard()
+            return
         if parsed.path.startswith("/api/corrections/"):
             self._correction_post(parsed.path)
             return
         if parsed.path == "/api/lessons/create":
             self._lesson_post()
             return
+        if parsed.path == "/api/jev/settings":
+            self._jev_settings_post()
+            return
         if parsed.path != "/api/command":
             self._send(b"not found", "text/plain", 404)
             return
-        origin=self.headers.get('Origin')
-        # Host check first: under DNS rebinding a hostile page is same-origin with itself,
-        # so Origin == Host alone would still let it stop or start a recording.
-        if (not self._local_host() or (origin and origin != 'http://'+self.headers.get('Host',''))
-                or self.headers.get('X-Notes-Dashboard')!='1'):
+        if not self._from_this_dashboard():
             self._json({'ok':False,'error':'Commands must come from this dashboard.'},403)
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
             if not 0<=length<=4096:raise ValueError('Invalid request size')
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(self._read_body(length) or b"{}")
             if not isinstance(body,dict):raise ValueError('Expected an object')
         except Exception:
             self._json({'ok':False,'error':'Invalid command request.'},400)
@@ -478,6 +611,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "unknown action"}, 400)
             return
         self._json({"ok": telemetry.send_command(action)})
+
+    def _jev_settings_post(self):
+        """Turns Jev on or off. Same rules as the recorder buttons: this dashboard's own page only."""
+        if not self._from_this_dashboard():
+            self._json({'ok': False, 'error': 'Jev settings can only be changed from this dashboard.'}, 403)
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._json({"ok": False, "error": "JSON request required"}, 415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 1000:
+                raise ValueError("Request is empty or too large")
+            body = json.loads(self._read_body(length))
+            if not isinstance(body, dict):
+                raise ValueError("Expected a JSON object")
+            import jev
+            jev.save_settings(body.get("enabled"))
+        except (ValueError, TypeError) as error:
+            self._json({"ok": False, "error": str(error)}, 400)
+            return
+        if SCANNER:
+            SCANNER.wake()
+        self._json({"ok": True, **jev_overview()})
 
     def _lesson_post(self):
         """Starts a lesson build. Same request rules as correction writes: local address,
@@ -494,7 +651,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 10_000:
                 raise ValueError("Request is empty or too large")
-            payload = json.loads(self.rfile.read(length))
+            payload = json.loads(self._read_body(length))
             if not isinstance(payload, dict):
                 raise ValueError("Expected a JSON object")
             self._json(lessons.start_lesson(payload))
@@ -521,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length <= 1_000_000:
                 self._json({"error":"Request is empty or too large"},413)
                 return
-            payload = json.loads(self.rfile.read(length))
+            payload = json.loads(self._read_body(length))
             if not isinstance(payload,dict):
                 raise ValueError("Expected a JSON object")
             import corrections
@@ -542,8 +699,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error":str(error)},500)
 
 
+def start_scanner():
+    """Starts the Jev highlights scan. A failure here only costs highlights, never the dashboard."""
+    global SCANNER
+    try:
+        import highlights
+        SCANNER = highlights.Scanner()
+        SCANNER.start()
+    except Exception as error:
+        SCANNER = None
+        print(f"Highlights scanner not started: {type(error).__name__}")
+
+
 def serve(port: int = DEFAULT_PORT, open_browser: bool = True):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    start_scanner()
     url = f"http://127.0.0.1:{port}"
     print(f"Lecture notes dashboard: {url}")
     print(f"Diagnostics:             {url}/diagnostics")
@@ -551,10 +721,14 @@ def serve(port: int = DEFAULT_PORT, open_browser: bool = True):
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
-        server.serve_forever()
+        server.serve_forever()  # also returns when the Stop button calls shutdown()
     except KeyboardInterrupt:
+        pass
+    finally:
+        if SCANNER:
+            SCANNER.stop()
+        server.server_close()
         print("\nDashboard stopped.")
-        server.shutdown()
 
 
 if __name__ == "__main__":

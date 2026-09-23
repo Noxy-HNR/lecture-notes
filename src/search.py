@@ -162,6 +162,66 @@ def search(query: str, class_code: str | None = None, include_transcripts: bool 
     return hits
 
 
+RANK_QUESTIONS = {
+    "answers": {
+        "type": "noul",
+        "instructions": ("A student is searching their own lecture notes and lecture transcripts for `search`. "
+                         "`passage` is one result, from `course`; `section` is the notes heading it sits under, "
+                         "when it has one. Does `passage` give the student what they are looking for?"),
+        "criteria": {
+            "true": ("`passage` explains, defines, lists or directly answers what `search` asks about, "
+                     "on its own or read as part of its `section`."),
+            "false": ("`passage` is about something else, only mentions a related word, or is too vague "
+                      "to help with `search`."),
+        },
+    },
+}
+_rank_cache: dict[str, float] = {}
+_RANK_CACHE_LIMIT = 20000
+
+
+def _rank_state(query: str, row: dict) -> dict:
+    import jev
+    from highlights import course_label
+    state = {"search": jev.clip(jev.redact(query), 300),
+             "course": course_label(row.get("class_code") or ""),
+             "passage": jev.clip(jev.redact(row.get("text") or ""), 1200)}
+    if row.get("section"):
+        state["section"] = jev.clip(jev.redact(row["section"]), 200)
+    return state
+
+
+def jev_rank(query: str, rows: list[dict]) -> tuple[list[dict], str | None]:
+    """Re-orders search results by Jev's probability that each one answers the query - one
+    small call per result, all at once (TypeSafe's re-ranking recipe). Each row gains "jev".
+    If Jev can't be asked, the rows come back in their original order with a reason."""
+    import hashlib
+    import jev
+    if not rows:
+        return rows, None
+    states = [_rank_state(query, row) for row in rows]
+    keys = [hashlib.sha256(json.dumps(s, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            for s in states]
+    todo = [i for i, key in enumerate(keys) if key not in _rank_cache]
+    failure = None
+    if todo:
+        answers = jev.ask_many([states[i] for i in todo], RANK_QUESTIONS, workers=10)
+        for i, answer in zip(todo, answers):
+            try:
+                if isinstance(answer, jev.JevError):
+                    raise answer
+                _rank_cache[keys[i]] = jev.noul(answer, "answers")
+            except jev.JevError as error:
+                failure = failure or error
+        while len(_rank_cache) > _RANK_CACHE_LIMIT:
+            _rank_cache.pop(next(iter(_rank_cache)))
+    if any(key not in _rank_cache for key in keys):
+        return rows, str(failure) if failure else "Jev did not answer"
+    ranked = [dict(row, jev=round(_rank_cache[key], 4)) for row, key in zip(rows, keys)]
+    order = sorted(range(len(ranked)), key=lambda i: (-ranked[i]["jev"], i))  # ties keep meaning order
+    return [ranked[i] for i in order], None
+
+
 def semantic_search(query, class_code=None, include_transcripts=True):
     import sys
     from dataclasses import asdict

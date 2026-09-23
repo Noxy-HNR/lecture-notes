@@ -113,6 +113,18 @@ def segments_from_pieces(texts: list[str], piece_samples: list[int], sample_rate
     return segments
 
 
+def generated_token_count(ids, pad_token_id=None) -> int:
+    """Count decoder token IDs, excluding batch padding but retaining real special tokens.
+
+    This measures the model's actual generation work rather than estimating tokens from
+    decoded words. Cohere is encoder-decoder, so ``generate()`` returns decoder output
+    only; audio/input tokens are not mixed into this count.
+    """
+    if pad_token_id is None:
+        return int(ids.numel() if hasattr(ids, "numel") else np.asarray(ids).size)
+    return int((ids != pad_token_id).sum().item())
+
+
 class _CohereBackend:
     name = "cohere-transcribe"
 
@@ -133,6 +145,7 @@ class _CohereBackend:
         self.model = CohereAsrForConditionalGeneration.from_pretrained(
             str(COHERE_PATH), device_map="cuda", dtype=torch.bfloat16)
         self.device_desc = f"cuda/{str(self.model.dtype).removeprefix('torch.')}"
+        self.generated_tokens = 0
 
     def _piece_lengths(self, audio) -> list[int]:
         """The exact split the processor is about to make, so each decoded piece can get its
@@ -203,6 +216,8 @@ class _CohereBackend:
             with stage("cohere_inference"), torch.inference_mode():
                 ids = self.model.generate(**batch, num_beams=COHERE_NUM_BEAMS,
                                           max_new_tokens=int(COHERE_CLIP_SECONDS * 22))
+            pad_token_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", None)
+            self.generated_tokens += generated_token_count(ids, pad_token_id)
             out = self.processor.decode(ids, skip_special_tokens=True)
             texts.extend(out if isinstance(out, list) else [out])
         return texts

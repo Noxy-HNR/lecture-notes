@@ -32,7 +32,9 @@ running on the actual discrete GPU (OpenVINO's "GPU" device only targets Intel
 integrated graphics, not NVIDIA - a separate discovery) has been reliable in testing.
 """
 import atexit
+import ctypes
 import json
+import os
 import subprocess
 import threading
 import time
@@ -69,8 +71,91 @@ _WATCHDOG_POLL_SECONDS = 60  # module-level so tests can shrink both this and th
                              # without waiting out the real 10-minute window
 
 _server_process = None
+_server_job = None
 _last_used = 0.0
 _watchdog_stop_event = None
+_atexit_registered = False
+_server_lock = threading.RLock()
+
+
+def _attach_windows_kill_job(process):
+    """Tie an owned server to this Python process at the Windows kernel level.
+
+    ``atexit`` is not guaranteed to run when somebody closes the recorder's console
+    window.  A Job Object with KILL_ON_JOB_CLOSE is: Windows closes our non-inherited
+    job handle when this process disappears and then terminates the llama-server child.
+    Only the exact ``Popen`` child created below is assigned, so a separately launched
+    server (including the user's server on port 10000) can never be affected.
+
+    Returns the job handle, or ``None`` when unavailable.  Explicit shutdown and the
+    atexit hook remain in place as the portable/graceful cleanup paths.
+    """
+    if os.name != "nt":
+        return None
+
+    from ctypes import wintypes
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    configured = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+    assigned = configured and kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(process._handle))
+    if not assigned:
+        kernel32.CloseHandle(job)
+        return None
+    return job
+
+
+def _close_windows_job(job):
+    if job is not None and os.name == "nt":
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
 
 
 def available() -> bool:
@@ -127,47 +212,71 @@ def _start_idle_watchdog():
 
 
 def _ensure_server_running() -> bool:
-    global _server_process
-    if _server_healthy():
-        return True
-    if not available():
-        return False
-    if _server_process is not None and _server_process.poll() is not None:
-        _server_process = None  # previous process died - allow restarting
-
-    if _server_process is None:
-        try:
-            _server_process = subprocess.Popen(
-                [str(LLAMA_SERVER_EXE), "-m", str(MODEL_PATH), "--port", str(PORT),
-                 "-ngl", "999", "-c", str(CONTEXT_SIZE), "--log-disable"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            atexit.register(stop_server)
-        except Exception:
-            return False
-
-    deadline = time.time() + STARTUP_TIMEOUT_SECONDS
-    while time.time() < deadline:
+    global _server_process, _server_job, _atexit_registered
+    with _server_lock:
         if _server_healthy():
             _touch()
-            _start_idle_watchdog()
             return True
-        time.sleep(0.5)
-    return False
+        if not available():
+            return False
+        if _server_process is not None and _server_process.poll() is not None:
+            _close_windows_job(_server_job)
+            _server_job = None
+            _server_process = None  # previous process died - allow restarting
+
+        if _server_process is None:
+            try:
+                _server_process = subprocess.Popen(
+                    [str(LLAMA_SERVER_EXE), "-m", str(MODEL_PATH), "--port", str(PORT),
+                     "-ngl", "999", "-c", str(CONTEXT_SIZE), "--log-disable"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                _server_job = _attach_windows_kill_job(_server_process)
+                if os.name == "nt" and _server_job is None:
+                    # Do not run an owned Windows server without the abrupt-close
+                    # guarantee. The caller can safely use the heuristic fallback.
+                    stop_server()
+                    return False
+                if not _atexit_registered:
+                    atexit.register(stop_server)
+                    _atexit_registered = True
+            except Exception:
+                stop_server()
+                return False
+
+        deadline = time.time() + STARTUP_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if _server_healthy():
+                _touch()
+                _start_idle_watchdog()
+                return True
+            time.sleep(0.5)
+        stop_server()  # failed startup must not leave a half-loaded model process
+        return False
 
 
 def stop_server():
-    global _server_process, _watchdog_stop_event
-    if _watchdog_stop_event is not None:
-        _watchdog_stop_event.set()
-        _watchdog_stop_event = None
-    if _server_process is not None and _server_process.poll() is None:
-        _server_process.terminate()
-        try:
-            _server_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _server_process.kill()
-    _server_process = None
+    """Stop only the server process this module launched; borrowed servers are untouched."""
+    global _server_process, _server_job, _watchdog_stop_event
+    with _server_lock:
+        if _watchdog_stop_event is not None:
+            _watchdog_stop_event.set()
+            _watchdog_stop_event = None
+        process = _server_process
+        job = _server_job
+        _server_process = None
+        _server_job = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        _close_windows_job(job)
 
 
 def _chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
