@@ -40,6 +40,11 @@ STATIC_DIR = PROJECT_ROOT / "dashboard"
 
 DEFAULT_PORT = 8770
 
+# A POST body the handler never read (it refused the request from its headers) is read and
+# dropped before the reply, up to this size and waiting at most this long. See _discard_body.
+DISCARD_BODY_LIMIT = 1024 * 1024
+DISCARD_BODY_TIMEOUT_SECONDS = 2.0
+
 # Background Jev scan of finished recordings (highlights.py); started by serve().
 SCANNER = None
 
@@ -289,12 +294,49 @@ class Handler(BaseHTTPRequestHandler):
         pass  # the default logger spams a line per poll; the dashboard polls constantly
 
     def _send(self, body: bytes, content_type: str, status: int = 200):
+        if self.command == "POST":
+            self._discard_body()  # a refusal decided from the headers alone
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_body(self, length: int) -> bytes:
+        self._body_read = True
+        return self.rfile.read(length)
+
+    def _discard_body(self):
+        """Reads and drops a POST body the handler didn't read, before the reply goes out.
+
+        http.client sends a request's headers and its body in separate send() calls, so a
+        refusal decided from the headers can be sent before the body arrives. Closing the socket
+        with body bytes unread, or arriving afterwards, makes Windows reset the connection, and
+        the client gets WinError 10053/10054 instead of the status code. Bounded by
+        Content-Length, DISCARD_BODY_LIMIT and DISCARD_BODY_TIMEOUT_SECONDS; a body without a
+        usable Content-Length, or over the limit, is left alone."""
+        if getattr(self, "_body_read", False) or getattr(self, "headers", None) is None:
+            return
+        self._body_read = True
+        try:
+            remaining = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return
+        if not 0 < remaining <= DISCARD_BODY_LIMIT:
+            return
+        previous = self.connection.gettimeout()
+        self.connection.settimeout(DISCARD_BODY_TIMEOUT_SECONDS)
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass  # the client stopped sending; it still gets its reply
+        finally:
+            self.connection.settimeout(previous)
 
     def _json(self, payload, status: int = 200):
         self._send(json.dumps(payload).encode("utf-8"), "application/json", status)
@@ -532,6 +574,7 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=self.server.shutdown, daemon=True, name='dashboard-stop').start()
 
     def do_POST(self):
+        self._body_read = False
         parsed = urlparse(self.path)
         if parsed.path == "/api/dashboard/stop":
             self._stop_dashboard()
@@ -554,7 +597,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             if not 0<=length<=4096:raise ValueError('Invalid request size')
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(self._read_body(length) or b"{}")
             if not isinstance(body,dict):raise ValueError('Expected an object')
         except Exception:
             self._json({'ok':False,'error':'Invalid command request.'},400)
@@ -581,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 1000:
                 raise ValueError("Request is empty or too large")
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(self._read_body(length))
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object")
             import jev
@@ -608,7 +651,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 10_000:
                 raise ValueError("Request is empty or too large")
-            payload = json.loads(self.rfile.read(length))
+            payload = json.loads(self._read_body(length))
             if not isinstance(payload, dict):
                 raise ValueError("Expected a JSON object")
             self._json(lessons.start_lesson(payload))
@@ -635,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length <= 1_000_000:
                 self._json({"error":"Request is empty or too large"},413)
                 return
-            payload = json.loads(self.rfile.read(length))
+            payload = json.loads(self._read_body(length))
             if not isinstance(payload,dict):
                 raise ValueError("Expected a JSON object")
             import corrections
