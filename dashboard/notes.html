@@ -159,12 +159,86 @@ async function openClass(code, kind = 'notes') {
 
   main.querySelectorAll('#kind-tabs button').forEach(b =>
     b.onclick = () => !b.disabled && openClass(code, b.dataset.kind));
+  if (kind === 'notes' && !doc.error) loadHighlights(code, version);
   main.querySelectorAll('.flashcard').forEach(card => {
     card.onclick = () => card.setAttribute('aria-expanded', String(card.classList.toggle('revealed')));
     card.onkeydown = event => {
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); card.click(); }
     };
   });
+}
+
+// ---------- lecture highlights (Jev) ----------
+// Exam hints, "not on the exam" remarks and announcements Jev found in each recording, shown
+// under that lecture's date heading. The notes file itself is never changed. Anything that
+// can't be loaded (an older dashboard server, Jev off or without a key) just leaves no box.
+
+const HIGHLIGHT_GROUPS = [
+  ['exam', 'On the exam'],
+  ['announcement', 'Deadlines & announcements'],
+  ['not_tested', 'Not needed for the exam'],
+];
+
+function highlightBox(box) {
+  const groups = HIGHLIGHT_GROUPS.filter(([kind]) => box[kind].length).map(([kind, title]) => `
+    <div class="hl-group">
+      <div class="hl-label">${esc(title)} <span class="hl-count">${box[kind].length}</span></div>
+      ${box[kind].map(item => {
+        const when = (item.part ? `part ${item.part} · ` : '') + (item.clock || '');
+        return `
+        <div class="hl-item">
+          ${item.audio_file && item.start != null
+            ? `<button class="hl-play" data-file="${esc(item.audio_file)}" data-start="${item.start}"
+                 aria-label="Play the recording from ${esc(when)}">▶ ${esc(when)}</button>`
+            : `<span class="hl-time">${esc(when)}</span>`}
+          <div class="hl-text" tabindex="0" title="Click to show all">${esc(item.text)}</div>
+        </div>`;
+      }).join('')}
+    </div>`).join('');
+  const waiting = box.pending.includes('recording') ? 'This lecture is still recording; it will be read when it ends.'
+    : box.pending.length ? 'Jev is still reading this lecture…' : '';
+  if (!groups && !waiting) return '';
+  return `<section class="highlights" aria-label="Highlights from this lecture's recording">
+    <div class="hl-head"><span class="hl-title">From the recording</span>
+      <span class="hl-note">found by Jev from the transcript, so it can miss or mislabel things</span></div>
+    ${groups}${waiting ? `<p class="hl-waiting">${esc(waiting)}</p>` : ''}
+  </section>`;
+}
+
+async function loadHighlights(code, version) {
+  let data;
+  try { data = await api(`/api/highlights?class=${encodeURIComponent(code)}`); } catch { return; }
+  if (version !== viewVersion || !data || !data.jev || !data.jev.ready) return;
+  for (const box of data.lectures || []) {
+    const heading = document.getElementById(box.anchor);
+    const html = highlightBox(box);
+    if (heading && html) heading.insertAdjacentHTML('afterend', html);
+  }
+  main.querySelectorAll('.hl-play').forEach(button => button.onclick = () => {
+    const item = button.closest('.hl-item');
+    const open = item.querySelector('audio');
+    if (open) { open.remove(); return; }
+    main.querySelectorAll('.hl-item audio').forEach(a => a.remove());
+    item.insertAdjacentHTML('beforeend', `<audio controls autoplay preload="auto" aria-label="Lecture recording"
+      src="/api/audio?file=${encodeURIComponent(button.dataset.file)}#t=${Math.max(0, Number(button.dataset.start)).toFixed(2)}"></audio>`);
+  });
+  main.querySelectorAll('.hl-text').forEach(text => {
+    const toggle = () => text.classList.toggle('open');
+    text.onclick = toggle;
+    text.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } };
+  });
+  // Still reading a lecture: look again shortly, as long as this class is still on screen.
+  if ((data.lectures || []).some(box => box.pending.some(p => p !== 'recording'))) refreshHighlightsLater(code, version);
+}
+
+function refreshHighlightsLater(code, version) {
+  setTimeout(() => {
+    if (version !== viewVersion || state.view !== 'class' || state.kind !== 'notes') return;
+    // Don't pull the rug out from under a clip that's playing or an expanded passage.
+    if (main.querySelector('.hl-item audio, .hl-text.open')) return refreshHighlightsLater(code, version);
+    main.querySelectorAll('.highlights').forEach(box => box.remove());
+    loadHighlights(code, version);
+  }, 15000);
 }
 
 // ---------- recordings ----------
@@ -215,10 +289,14 @@ async function runSearch() {
   state.query = q;
   if (!q) { if (state.activeClass) openClass(state.activeClass, state.kind); return; }
   state.view = 'search';
-  main.innerHTML = '<p class="muted">Searching… First meaning search also indexes new passages.</p>';
-  let hits;
-  try { hits = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${document.getElementById('search-mode').value}`); }
+  main.innerHTML = '<p class="muted">Searching… The first meaning search also indexes new passages.</p>';
+  let hits, ranking = null;
+  const mode = document.getElementById('search-mode').value;
+  try { hits = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}${mode === 'semantic' ? '&rank=1' : ''}`); }
   catch (e) { if(version === viewVersion) main.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
+  // Meaning search answers {results, ranked_by, note} when it can re-rank with Jev; an older
+  // dashboard server answers a bare list.
+  if (!Array.isArray(hits)) { ranking = hits; hits = hits.results || []; }
 
   if (version !== viewVersion || q !== searchBox.value.trim()) return;
   const notes = hits.filter(h => h.source === 'notes');
@@ -239,7 +317,9 @@ async function runSearch() {
 
   main.innerHTML = `
     <h1 class="page-title">Search</h1>
-    <div class="page-sub">${hits.length} result${hits.length === 1 ? '' : 's'} for “${esc(q)}”</div>
+    <div class="page-sub">${hits.length} result${hits.length === 1 ? '' : 's'} for “${esc(q)}”${
+      ranking?.ranked_by === 'jev' ? ' · best answers first, ranked by Jev'
+      : ranking?.note ? ` · closest in meaning first (Jev ranking unavailable: ${esc(ranking.note)})` : ''}</div>
     ${hits.length ? group('In your notes', notes) + group('In raw transcripts', transcripts)
                   : '<div class="empty">No matches.</div>'}`;
 }

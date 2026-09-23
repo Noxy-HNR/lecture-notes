@@ -37,6 +37,7 @@ audio{width:100%;margin:12px 0}button:disabled{opacity:.45;cursor:not-allowed}[h
 <section class="panel"><div class="eyebrow">01 / Listen &amp; correct</div><h2>Transcript &amp; audio</h2>
 <p id="audioHint" class="muted"></p><audio id="audio" controls preload="none" aria-label="Source recording"></audio>
 <label class="field">Find a segment<input id="filter" type="search" placeholder="Filter transcript text"></label>
+<div class="actions" id="flagRow" hidden><button class="btn" id="flaggedOnly" aria-pressed="false"></button><span id="flagHint" class="muted"></span></div>
 <div class="actions"><span id="selectionCount" class="muted">0 segments selected</span><button class="btn" id="clearSelection">Clear selection</button></div>
 <div id="segments" class="segment-list" aria-label="Transcript segments"></div>
 <label class="field">Corrected transcript segment<textarea id="segmentEdit" rows="4" disabled></textarea></label>
@@ -83,9 +84,23 @@ function controls(){
   $('apply').disabled=busy||!job||dirty();
   $('recording').disabled=busy;$('reload').disabled=busy;$('section').disabled=busy;
 }
+// Segments Jev thinks probably contain a mis-heard word (index -> probability). Loaded after
+// the workspace; empty when Jev is off, has no key, or hasn't read this recording yet.
+let flags=new Map(),flaggedOnly=false;
+async function loadFlags(sessionId,request){
+  flags=new Map();flaggedOnly=false;$('flagRow').hidden=true;
+  try{const response=await fetch('/api/highlights/session?session='+encodeURIComponent(sessionId));if(!response.ok)return;
+    const result=await response.json();if(request!==version||!result.jev?.ready)return;
+    flags=new Map((result.segments||[]).map(s=>[s.index,s.p]));
+    $('flagRow').hidden=!flags.size&&result.complete;
+    $('flaggedOnly').hidden=!flags.size;
+    $('flagHint').textContent=flags.size?'Jev thinks these segments probably contain a mis-heard word. Check them against the audio.':!result.scanned?'Jev hasn’t read this recording yet; likely mis-hearings will be listed here when it has.':'Jev is still reading this recording.';
+    renderFlagButton();renderSegments();}catch{}
+}
+function renderFlagButton(){$('flaggedOnly').textContent=flaggedOnly?'Show all segments':`Show likely mis-hearings (${flags.size})`;$('flaggedOnly').setAttribute('aria-pressed',String(flaggedOnly));}
 function renderSegments(){
   const filter=$('filter').value.toLowerCase();
-  $('segments').innerHTML=data.segments.filter(s=>s.text.toLowerCase().includes(filter)).map(s=>`<div class="segment ${active===s.index?'active':''}"><input type="checkbox" aria-label="Include segment ${s.index+1}" data-include="${s.index}" ${selected.has(s.index)?'checked':''}><button data-edit="${s.index}"><small>${clock(s.start)} · segment ${s.index+1}${s.text!==s.original?' · corrected':''}</small>${esc(s.text)}</button></div>`).join('')||'<p class="muted" style="padding:12px">No matching segments.</p>';
+  $('segments').innerHTML=data.segments.filter(s=>s.text.toLowerCase().includes(filter)&&(!flaggedOnly||flags.has(s.index))).map(s=>`<div class="segment ${active===s.index?'active':''}"><input type="checkbox" aria-label="Include segment ${s.index+1}" data-include="${s.index}" ${selected.has(s.index)?'checked':''}><button data-edit="${s.index}"><small>${clock(s.start)} · segment ${s.index+1}${s.text!==s.original?' · corrected':''}${flags.has(s.index)?' · <span class="flag">check wording</span>':''}</small>${esc(s.text)}</button></div>`).join('')||'<p class="muted" style="padding:12px">No matching segments.</p>';
   document.querySelectorAll('[data-include]').forEach(el=>el.onchange=()=>{const n=Number(el.dataset.include);if(el.checked)selected.add(n);else selected.delete(n);invalidate();controls();});
   document.querySelectorAll('[data-edit]').forEach(el=>el.onclick=()=>editSegment(Number(el.dataset.edit)));
   controls();
@@ -116,10 +131,11 @@ async function loadRecording(){
   const id=$('recording').value;if(!id)return;
   if(dirty()){notice('Save your transcript edit before switching recordings.',true);$('recording').value=data.session_id;return;}
   const request=++version;notice('Loading recording…');
-  try{const result=await api('session?session='+encodeURIComponent(id));if(request!==version)return;data=result;renderWorkspace();notice('Choose a segment to correct, and check the segments to use for regeneration.');}
+  try{const result=await api('session?session='+encodeURIComponent(id));if(request!==version)return;data=result;loadFlags(id,request);renderWorkspace();notice('Choose a segment to correct, and check the segments to use for regeneration.');}
   catch(e){notice(e.message,true);$('workspace').hidden=true;}
 }
-$('recording').onchange=loadRecording;$('reload').onclick=loadRecording;$('filter').oninput=()=>data&&renderSegments();$('section').onchange=renderSection;
+$('recording').onchange=loadRecording;$('reload').onclick=loadRecording;
+$('flaggedOnly').onclick=()=>{flaggedOnly=!flaggedOnly;renderFlagButton();data&&renderSegments();};$('filter').oninput=()=>data&&renderSegments();$('section').onchange=renderSection;
 $('segmentEdit').oninput=()=>{invalidate();controls();};
 $('restoreOriginal').onclick=()=>{$('segmentEdit').value=data.segments[active].original;invalidate();controls();};
 $('discardEdit').onclick=()=>{$('segmentEdit').value=data.segments[active].text;$('term').value='';controls();notice('Unsaved transcript edit discarded.');};

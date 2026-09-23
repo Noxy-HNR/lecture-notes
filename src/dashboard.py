@@ -40,6 +40,9 @@ STATIC_DIR = PROJECT_ROOT / "dashboard"
 
 DEFAULT_PORT = 8770
 
+# Background Jev scan of finished recordings (highlights.py); started by serve().
+SCANNER = None
+
 
 # ---------------------------------------------------------------------------
 # Markdown rendering
@@ -186,6 +189,34 @@ def class_document(code: str, kind: str = "notes") -> dict:
     }
 
 
+def lecture_headings(code: str) -> list[tuple[str, str]]:
+    """[(date heading, anchor)] for a class's notes, matching the anchors the page renders."""
+    path = _class_files(code).get("notes")
+    if not path or not path.exists():
+        return []
+    dates = re.findall(r"^## (.+)$", path.read_text(encoding="utf-8", errors="replace"), re.MULTILINE)
+    return list(zip(dates, lecture_anchors(dates)))
+
+
+def jev_overview() -> dict:
+    """Jev's switch, key source, scan progress and what it has cost so far."""
+    import highlights
+    import jev
+    calls, cost = 0, 0.0
+    for path in STATE_DIR.glob("*_highlights.json"):
+        try:
+            usage = json.loads(path.read_text(encoding="utf-8")).get("usage") or {}
+            calls += int(usage.get("calls", 0))
+            cost += float(usage.get("est_cost_usd", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    pending = SCANNER.pending() if SCANNER else []
+    return {"status": jev.status(), "label": jev.label(),
+            "scanner": SCANNER.snapshot() if SCANNER else None,
+            "waiting": len(pending), "scanned_calls": calls, "scanned_cost_usd": round(cost, 4),
+            "thresholds": highlights.THRESHOLDS}
+
+
 def list_sessions() -> list[dict]:
     """Recorded sessions from state/, newest first - the raw audio + transcript backups
     behind each lecture."""
@@ -236,6 +267,11 @@ def service_status() -> dict:
             status["gpu_model"] = "running" if gpu_formatter._server_healthy() else "installed (stopped)"
     except Exception as e:
         status["gpu_model"] = f"error: {type(e).__name__}"
+    try:
+        import jev
+        status["jev"] = jev.label()
+    except Exception as e:
+        status["jev"] = f"error: {type(e).__name__}"
     try:
         import diarize
         status["diarization"] = "enabled" if diarize.available() else "off (no HF token)"
@@ -401,6 +437,20 @@ class Handler(BaseHTTPRequestHandler):
             self._static("stop.js", "text/javascript; charset=utf-8")
         elif route == "/api/classes":
             self._json(list_classes())
+        elif route == "/api/highlights":
+            import highlights
+            code = one("class", "") or ""
+            if SCANNER:
+                SCANNER.wake()
+            self._json(highlights.for_class(code, lecture_headings(code), SCANNER))
+        elif route == "/api/highlights/session":
+            import highlights
+            try:
+                self._json(highlights.mishearings(one("session", "") or ""))
+            except ValueError as error:
+                self._json({"error": str(error)}, 400)
+        elif route == "/api/jev":
+            self._json(jev_overview())
         elif route == "/api/document":
             self._json(class_document(one("class", ""), one("kind", "notes")))
         elif route == "/api/search":
@@ -410,10 +460,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if one('mode') == 'semantic':
                 try:
-                    self._json(search_module.semantic_search(query, one('class') or None,
-                                                             one('transcripts', '1') == '1'))
+                    results = search_module.semantic_search(query, one('class') or None,
+                                                            one('transcripts', '1') == '1')
                 except RuntimeError as exc:
                     self._json({'error': str(exc)}, 503)
+                    return
+                if one('rank') != '1':
+                    self._json(results)  # the page before Jev ranking asked for a bare list
+                    return
+                import jev
+                if jev.status()['ready']:
+                    ranked, note = search_module.jev_rank(query, results)
+                else:
+                    ranked, note = results, jev.label()
+                self._json({'results': ranked, 'ranked_by': 'meaning' if note else 'jev', 'note': note})
                 return
             hits = search_module.search(
                 query,
@@ -482,6 +542,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/lessons/create":
             self._lesson_post()
             return
+        if parsed.path == "/api/jev/settings":
+            self._jev_settings_post()
+            return
         if parsed.path != "/api/command":
             self._send(b"not found", "text/plain", 404)
             return
@@ -505,6 +568,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "unknown action"}, 400)
             return
         self._json({"ok": telemetry.send_command(action)})
+
+    def _jev_settings_post(self):
+        """Turns Jev on or off. Same rules as the recorder buttons: this dashboard's own page only."""
+        if not self._from_this_dashboard():
+            self._json({'ok': False, 'error': 'Jev settings can only be changed from this dashboard.'}, 403)
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._json({"ok": False, "error": "JSON request required"}, 415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 1000:
+                raise ValueError("Request is empty or too large")
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict):
+                raise ValueError("Expected a JSON object")
+            import jev
+            jev.save_settings(body.get("enabled"))
+        except (ValueError, TypeError) as error:
+            self._json({"ok": False, "error": str(error)}, 400)
+            return
+        if SCANNER:
+            SCANNER.wake()
+        self._json({"ok": True, **jev_overview()})
 
     def _lesson_post(self):
         """Starts a lesson build. Same request rules as correction writes: local address,
@@ -569,8 +656,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error":str(error)},500)
 
 
+def start_scanner():
+    """Starts the Jev highlights scan. A failure here only costs highlights, never the dashboard."""
+    global SCANNER
+    try:
+        import highlights
+        SCANNER = highlights.Scanner()
+        SCANNER.start()
+    except Exception as error:
+        SCANNER = None
+        print(f"Highlights scanner not started: {type(error).__name__}")
+
+
 def serve(port: int = DEFAULT_PORT, open_browser: bool = True):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    start_scanner()
     url = f"http://127.0.0.1:{port}"
     print(f"Lecture notes dashboard: {url}")
     print(f"Diagnostics:             {url}/diagnostics")
@@ -582,6 +682,8 @@ def serve(port: int = DEFAULT_PORT, open_browser: bool = True):
     except KeyboardInterrupt:
         pass
     finally:
+        if SCANNER:
+            SCANNER.stop()
         server.server_close()
         print("\nDashboard stopped.")
 

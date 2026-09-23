@@ -425,8 +425,7 @@ The dashboard's search box has two modes. **Keyword search** needs the words you
 in the line. **Meaning search** matches by meaning, so "why does sweating cool you down" finds
 the evaporative-cooling notes even though they never use those words.
 
-It runs offline on all-MiniLM-L6-v2 through the shared service in `C:\AI\Tools
-pu-services`,
+It runs offline on all-MiniLM-L6-v2 through the shared service in `C:\AI\Tools\npu-services`,
 on the **Intel iGPU**. Your notes and transcripts are embedded once and cached, so the first
 search after new lectures takes a while (~50s for a semester's worth) and later ones take a
 second or two.
@@ -453,6 +452,57 @@ python tools/semantic_search_benchmark.py                   # re-run the device 
 
 The frozen copy of your notes that the test uses is not committed, for the same reason `notes/`
 isn't. The benchmark skips the discrete GPU while a recording is live.
+
+When Jev is on (next section), meaning search also **re-ranks** its 30 results by whether each
+one actually answers the question. On the same 32 questions the right section came first for
+27 (was 23), in the top 3 for 31 (was 29) and in the top 5 for all 32 (was 30). It adds about
+3 seconds to a new question; repeating a question is instant until the dashboard restarts. If
+Jev can't be reached, results come back in meaning order and the page says why.
+
+## Jev: exam hints, announcements, likely mis-hearings
+
+[Jev](https://docs.typesafe.ai) is TypeSafe's small judgment model: instead of writing text,
+it answers yes/no questions with a probability. The dashboard uses it to read every finished
+recording's transcript, one segment (about 30 seconds) at a time, and asks four questions of each:
+
+| | shown |
+|---|---|
+| Did the instructor say something specific will be tested, or that you need to know it? | **Notes**: "On the exam", under that lecture's date |
+| Did they say a detail will *not* be tested or needn't be memorized? | **Notes**: "Not needed for the exam" |
+| Did they announce a due date, exam or quiz, assignment, grading change, office hours...? | **Notes**: "Deadlines & announcements" |
+| Is a word probably a speech-recognition error for a term from the course? | **Corrections**: "Show likely mis-hearings" |
+
+Each item on the Notes page has **▶ time**, which plays the recording from that moment; click
+the text to see all of it. A day recorded in several parts says which part. The notes files are
+never changed; the results live beside each recording as `state/<recording>_highlights.json`
+(probabilities only, no transcript text).
+
+It runs in the background whenever the dashboard is open: newest recordings first, each one
+once, and never the recording in progress. A segment is only asked again when its text changes
+(a correction) or the questions do. **Diagnostics** shows what it is reading, what it has cost,
+and a button to turn Jev off.
+
+**What is sent.** Only to TypeSafe, and only this: the course name, the segment, up to 300
+characters before it and 200 after (so sentences cut at the edges make sense), and the class's
+glossary terms from `vocab.json`. Email addresses, phone numbers and 9+ digit numbers are replaced
+first. For search ranking: your question, each result's text, its notes heading and course.
+Nothing else leaves the machine, and nothing Jev sends back is stored except the probabilities.
+Code: `src/jev.py`, `src/highlights.py`, `jev_rank` in `src/search.py`.
+
+**Key.** It uses the TypeSafe key saved in the `C:\AI` dashboard's **Settings** tab
+(`C:\AI\Switchboard\.env`); `TYPESAFE_API_KEY` in the environment takes precedence. With no key,
+or with Jev turned off, nothing is sent and the pages look exactly as before.
+
+**Cost.** About 1,600 input tokens per segment, so roughly 1 cent for a 75-minute lecture
+(TypeSafe bills input tokens, $0.042 per million).
+
+**Accuracy.** The cut-offs in `highlights.THRESHOLDS` were chosen by reading every judgment on
+three lectures (238 segments) and then checked on two more. Exam hints are listed from 0.4,
+because missing one costs more than reading an extra line. Speech recognition errs often, so
+about a third of segments score over 0.5 for a mis-hearing, and most really do contain one;
+only those from 0.7 are listed. Jev reads transcripts, not slides, so it can miss a hint that
+was only written down, and it sometimes lists a passage that only sounds like one. Changing a
+cut-off takes effect without asking Jev again.
 
 ## Improving accuracy
 
