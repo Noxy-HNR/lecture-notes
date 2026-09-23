@@ -1449,6 +1449,7 @@ def run():
     _model = transcribe.get_model()
     guard = {"repaired": getattr(_model, "repaired_pieces", 0), "silent": getattr(_model, "silent_pieces", 0)}
     guard_base = dict(guard)
+    token_stats = {"previous": getattr(_model, "generated_tokens", 0)}
 
     def _handle_transcription_result(chunk_audio, segments, transcribe_seconds=0.0, chunk_offset=0.0):
         session.record_segments(segments, chunk_offset)
@@ -1459,9 +1460,12 @@ def run():
             with open(raw_log_path, "a", encoding="utf-8") as f:
                 f.write(f"[{stamp}] {seg['text']}\n")
 
-        tel.record_chunk(len(chunk_audio) / audio.SAMPLE_RATE, transcribe_seconds,
-                          len(segments))
         model = transcribe.get_model()
+        generated_total = getattr(model, "generated_tokens", token_stats["previous"])
+        generated_tokens = max(0, generated_total - token_stats["previous"])
+        token_stats["previous"] = generated_total
+        tel.record_chunk(len(chunk_audio) / audio.SAMPLE_RATE, transcribe_seconds,
+                         len(segments), generated_tokens=generated_tokens)
         repaired, silent = getattr(model, "repaired_pieces", 0), getattr(model, "silent_pieces", 0)
         window_start = time.strftime("%H:%M", time.localtime(session.session_start + chunk_offset))
         if repaired > guard["repaired"]:
@@ -1663,6 +1667,11 @@ def run():
         finally:
             capture.stop()
             session.close()
+            # The local formatter is a child owned by this recorder run.  Stop it
+            # explicitly after all final saves/condensing are complete; its Windows
+            # Job Object is the backstop if the console is closed too abruptly for
+            # this finally block or Python's atexit handlers to run.
+            gpu_formatter.stop_server()
             keep_awake.allow_sleep()
             tel.end_session()
             signal.signal(signal.SIGINT, previous_sigint)

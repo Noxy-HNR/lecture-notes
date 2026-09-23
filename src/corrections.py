@@ -224,6 +224,12 @@ def start_regeneration(payload):
     return {"job_id":job_id}
 
 
+def previews_running() -> bool:
+    """True while a preview is generating on this process's threads (stopping loses it)."""
+    with _jobs_lock:
+        return any(j["status"] == "running" for j in _jobs.values())
+
+
 def get_job(job_id):
     with _jobs_lock:
         if job_id not in _jobs:

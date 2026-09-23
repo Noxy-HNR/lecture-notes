@@ -36,10 +36,12 @@ class FakeModel:
 
     def __init__(self):
         self.calls = []
+        self.generated_tokens = 0
 
     def transcribe(self, samples, sample_rate):
         seconds = len(samples) / sample_rate
         self.calls.append(round(seconds, 2))
+        self.generated_tokens += 10
         return [{"text": f"window {len(self.calls)}", "start": 0.0, "end": seconds}]
 
 
@@ -152,6 +154,8 @@ def recorder(tmp_path, monkeypatch):
 
 def test_ctrl_c_stops_gracefully_and_keeps_every_captured_frame(recorder, monkeypatch):
     original_handler = signal.getsignal(signal.SIGINT)
+    formatter_stops = []
+    monkeypatch.setattr(main.gpu_formatter, "stop_server", lambda: formatter_stops.append(True))
 
     def fake_save(code, title, text, date, mode=None, session_id=None, **kwargs):
         recorder.saves.append((text, session_id))
@@ -170,6 +174,10 @@ def test_ctrl_c_stops_gracefully_and_keeps_every_captured_frame(recorder, monkey
     assert recorder.saves == [("window 1 window 2", wav.stem)]
     assert len(wav.with_name(wav.stem + "_segments.jsonl").read_text().splitlines()) == 2
     assert not list(recorder.state.glob("*.failed.json"))
+    assert formatter_stops == [True]
+    status = telemetry.read_status()
+    assert status["transcription_tokens_generated"] == 20
+    assert status["transcription_tokens_per_second"] > 0
 
 
 def test_repeated_ctrl_c_during_shutdown_explains_and_does_not_abort_the_save(recorder, monkeypatch, capsys):

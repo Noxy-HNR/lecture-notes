@@ -397,6 +397,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(error)}, 404)
         elif route == "/style.css":
             self._static("style.css", "text/css; charset=utf-8")
+        elif route == "/stop.js":
+            self._static("stop.js", "text/javascript; charset=utf-8")
         elif route == "/api/classes":
             self._json(list_classes())
         elif route == "/api/document":
@@ -443,8 +445,37 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _from_this_dashboard(self) -> bool:
+        """A button press on one of this dashboard's own pages: local address, same origin,
+        and the custom header a cross-site form can't send."""
+        origin = self.headers.get('Origin')
+        # Host check first: under DNS rebinding a hostile page is same-origin with itself,
+        # so Origin == Host alone would still let it stop or start a recording.
+        return (self._local_host() and (not origin or origin == 'http://'+self.headers.get('Host',''))
+                and self.headers.get('X-Notes-Dashboard') == '1')
+
+    def _stop_dashboard(self):
+        """Shuts this server down to free its memory. Recordings and lesson builds run in their
+        own processes and keep going; an in-progress correction preview runs inside this one,
+        so it's the only thing that blocks stopping."""
+        if not self._from_this_dashboard():
+            self._json({'ok': False, 'error': 'The dashboard can only be stopped from its own page.'}, 403)
+            return
+        corrections = sys.modules.get('corrections')
+        if corrections is not None and corrections.previews_running():
+            self._json({'ok': False, 'error': 'A correction preview is still being generated. '
+                                              'Stop the dashboard after it finishes.'}, 409)
+            return
+        self._json({'ok': True, 'message': 'Dashboard stopped.'})
+        # shutdown() waits for serve_forever() to return, so it can't run on this handler's
+        # own thread; the reply above has already been sent by the time it lands.
+        threading.Thread(target=self.server.shutdown, daemon=True, name='dashboard-stop').start()
+
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/dashboard/stop":
+            self._stop_dashboard()
+            return
         if parsed.path.startswith("/api/corrections/"):
             self._correction_post(parsed.path)
             return
@@ -454,11 +485,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path != "/api/command":
             self._send(b"not found", "text/plain", 404)
             return
-        origin=self.headers.get('Origin')
-        # Host check first: under DNS rebinding a hostile page is same-origin with itself,
-        # so Origin == Host alone would still let it stop or start a recording.
-        if (not self._local_host() or (origin and origin != 'http://'+self.headers.get('Host',''))
-                or self.headers.get('X-Notes-Dashboard')!='1'):
+        if not self._from_this_dashboard():
             self._json({'ok':False,'error':'Commands must come from this dashboard.'},403)
             return
         try:
@@ -551,10 +578,12 @@ def serve(port: int = DEFAULT_PORT, open_browser: bool = True):
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
-        server.serve_forever()
+        server.serve_forever()  # also returns when the Stop button calls shutdown()
     except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
         print("\nDashboard stopped.")
-        server.shutdown()
 
 
 if __name__ == "__main__":

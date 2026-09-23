@@ -312,6 +312,44 @@ class TestTelemetry:
         finally:
             tel.end_session()
 
+    def test_transcriber_token_throughput_tracks_latest_and_session_average(self, tel_dir):
+        tel = telemetry.Telemetry()
+        tel.start_session(class_code="T", class_title="T")
+        try:
+            tel.record_chunk(audio_seconds=20.0, transcribe_seconds=2.0, segments=2,
+                             generated_tokens=100)
+            tel.record_chunk(audio_seconds=20.0, transcribe_seconds=3.0, segments=2,
+                             generated_tokens=120)
+            tel.flush()
+            status = telemetry.read_status()
+            assert status["transcription_tokens_generated"] == 220
+            assert status["transcription_tokens_per_second"] == pytest.approx(44.0)
+            assert status["last_chunk_tokens"] == 120
+            assert status["last_chunk_tokens_per_second"] == pytest.approx(40.0)
+        finally:
+            tel.end_session()
+
+    def test_formatting_and_combined_compute_metrics_stay_separate(self, tel_dir):
+        tel = telemetry.Telemetry()
+        tel.start_session(class_code="T", class_title="T")
+        try:
+            tel.record_chunk(audio_seconds=120.0, transcribe_seconds=12.0, segments=4)
+            tel.record_save("cli", 10.0)
+            tel.record_save("gpu", 20.0)
+            tel.record_save("local", 5.0)
+            tel.flush()
+            status = telemetry.read_status()
+            assert status["transcribe_seconds_spent"] == pytest.approx(12.0)
+            assert status["last_save_method"] == "local"
+            assert status["last_save_seconds"] == pytest.approx(5.0)
+            assert status["formatting_seconds_spent"] == pytest.approx(35.0)
+            assert status["formatting_average_seconds"] == pytest.approx(35 / 3, abs=0.01)
+            assert status["local_formatter_seconds_spent"] == pytest.approx(20.0)
+            assert status["local_formatter_saves"] == 1
+            assert status["compute_seconds_spent"] == pytest.approx(47.0)
+        finally:
+            tel.end_session()
+
     def test_command_is_consumed_exactly_once(self, tel_dir):
         """A dashboard click must not be able to fire the same save twice."""
         assert telemetry.send_command("save_now")

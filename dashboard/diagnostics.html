@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Diagnostics · Lecture Notes</title>
 <link rel="stylesheet" href="/style.css">
+<script src="/stop.js" defer></script>
 </head>
 <body>
 
@@ -178,17 +179,35 @@ async function poll() {
            (data.guard_repaired || data.guard_silent) ? 'warn' : '');
 
   const rtf = data.realtime_factor ?? 0;
+  const tokenRate = data.transcription_tokens_per_second ?? 0;
+  const lastTokenRate = data.last_chunk_tokens_per_second ?? 0;
+  const formattingTotal = data.formatting_seconds_spent ?? 0;
+  const formattingAverage = data.formatting_average_seconds ?? 0;
+  const localFormatterTime = data.local_formatter_seconds_spent ?? 0;
+  const computeTotal = data.compute_seconds_spent ?? ((data.transcribe_seconds_spent ?? 0) + formattingTotal);
   document.getElementById('perf-metrics').innerHTML =
     metric('Realtime factor', rtf ? rtf.toFixed(2) + '×' : '—',
            rtf ? (rtf < 1 ? `${(1/rtf).toFixed(1)}× faster than realtime` : 'falling behind') : '',
            rtfClass(rtf)) +
     metric('Last chunk', data.last_chunk_duration ? data.last_chunk_duration.toFixed(1) + 's' : '—',
            data.last_chunk_seconds ? `${data.last_chunk_seconds}s of audio` : '') +
+    metric('Decoder throughput', tokenRate ? tokenRate.toFixed(1) + ' tok/s' : '—',
+           tokenRate ? `last: ${lastTokenRate.toFixed(1)} tok/s · ${data.transcription_tokens_generated ?? 0} tokens total` :
+             'available after the next transcription window') +
     metric('Transcribe queue', data.queue_transcription ?? 0,
            (data.queue_transcription ?? 0) > 2 ? 'backlog building' : 'keeping up',
            (data.queue_transcription ?? 0) > 2 ? 'warn' : '') +
     metric('Save queue', data.queue_saves ?? 0) +
-    metric('GPU time', duration(data.transcribe_seconds_spent));
+    metric('Transcriber time', duration(data.transcribe_seconds_spent),
+           'Cohere preprocessing, decoding, and guard repairs') +
+    metric('Last formatting', data.last_save_seconds ? data.last_save_seconds.toFixed(1) + 's' : '—',
+           data.last_save_method ? `${data.last_save_method} · ${ago(data.last_save_at)}` : 'no saves yet') +
+    metric('Formatting total', formattingTotal ? duration(formattingTotal) : '—',
+           formattingAverage ? `${formattingAverage.toFixed(1)}s average across ${data.saves_completed ?? 0} saves` : '') +
+    metric('Local formatter time', localFormatterTime ? duration(localFormatterTime) : '—',
+           `${data.local_formatter_saves ?? 0} llama-server save${(data.local_formatter_saves ?? 0) === 1 ? '' : 's'}`) +
+    metric('Cumulative compute', computeTotal ? duration(computeTotal) : '—',
+           'transcriber + formatting; work can overlap');
 
   const services = data.services || {};
   document.getElementById('services').innerHTML = Object.entries(services).map(([k, v]) =>

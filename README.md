@@ -544,7 +544,11 @@ separate process on its own port (8090)** — it does not touch, reconfigure,
 or share anything with any other personal llama.cpp/model setup on this
 machine. The model file lives in this project's own `state/llama_model/`,
 never in a shared models folder. The app starts its own server automatically
-on first use each run and shuts it down on exit (via `atexit`), so it doesn't
+on first use each run and shuts it down explicitly when the recorder finishes. An
+`atexit` hook covers ordinary interpreter shutdown, and on Windows the owned child is
+also placed in a kill-on-close Job Object so closing the recorder console cannot leave
+`llama-server.exe` orphaned. The cleanup targets only the process Lecture Notes starts;
+it never stops an independently launched server. This means it doesn't
 sit in the background holding ~3.6GB of VRAM between lecture sessions.
 
 Setup (one-time, ~3.6GB download into this project only):

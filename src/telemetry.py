@@ -54,12 +54,21 @@ class Telemetry:
             "realtime_factor": 0.0,
             "last_chunk_seconds": 0.0,
             "last_chunk_duration": 0.0,
+            "transcription_tokens_generated": 0,
+            "transcription_tokens_per_second": 0.0,
+            "last_chunk_tokens": 0,
+            "last_chunk_tokens_per_second": 0.0,
             "queue_capture_blocks": 0,
             "queue_transcription": 0,
             "queue_saves": 0,
             "last_save_at": 0.0,
             "last_save_method": "",
             "last_save_seconds": 0.0,
+            "formatting_seconds_spent": 0.0,
+            "formatting_average_seconds": 0.0,
+            "local_formatter_seconds_spent": 0.0,
+            "local_formatter_saves": 0,
+            "compute_seconds_spent": 0.0,
             "saves_completed": 0,
             "consecutive_silent_chunks": 0,
             "claude_cli": "unknown",
@@ -99,7 +108,8 @@ class Telemetry:
         with self._lock:
             self._state.update(fields)
 
-    def record_chunk(self, audio_seconds: float, transcribe_seconds: float, segments: int):
+    def record_chunk(self, audio_seconds: float, transcribe_seconds: float, segments: int,
+                     generated_tokens: int = 0):
         """Feeds the realtime-factor metric: how many seconds of GPU time each second of
         audio costs. Below 1.0 means transcription outruns the lecture (healthy);
         sustained above 1.0 means it's falling behind and the live view will lag."""
@@ -111,16 +121,36 @@ class Telemetry:
             s["transcribe_seconds_spent"] += transcribe_seconds
             s["last_chunk_seconds"] = round(audio_seconds, 2)
             s["last_chunk_duration"] = round(transcribe_seconds, 2)
+            s["transcription_tokens_generated"] += generated_tokens
+            s["last_chunk_tokens"] = generated_tokens
+            s["last_chunk_tokens_per_second"] = round(
+                generated_tokens / transcribe_seconds, 1) if transcribe_seconds > 0 else 0.0
             if s["audio_seconds_transcribed"] > 0:
                 s["realtime_factor"] = round(
                     s["transcribe_seconds_spent"] / s["audio_seconds_transcribed"], 3)
+            if s["transcribe_seconds_spent"] > 0:
+                s["transcription_tokens_per_second"] = round(
+                    s["transcription_tokens_generated"] / s["transcribe_seconds_spent"], 1)
+            s["compute_seconds_spent"] = (
+                s["transcribe_seconds_spent"] + s["formatting_seconds_spent"])
 
     def record_save(self, method: str, seconds: float):
         with self._lock:
-            self._state["saves_completed"] += 1
-            self._state["last_save_at"] = time.time()
-            self._state["last_save_method"] = method
-            self._state["last_save_seconds"] = round(seconds, 2)
+            s = self._state
+            s["saves_completed"] += 1
+            s["last_save_at"] = time.time()
+            s["last_save_method"] = method
+            s["last_save_seconds"] = round(seconds, 2)
+            s["formatting_seconds_spent"] += seconds
+            s["formatting_average_seconds"] = round(
+                s["formatting_seconds_spent"] / s["saves_completed"], 2)
+            if method == "gpu":
+                s["local_formatter_seconds_spent"] += seconds
+                s["local_formatter_saves"] += 1
+            # Cumulative processing time, not wall-clock: saves run in the background
+            # and can overlap capture (and occasionally transcription).
+            s["compute_seconds_spent"] = (
+                s["transcribe_seconds_spent"] + s["formatting_seconds_spent"])
 
     def add_transcript(self, stamp: str, text: str):
         with self._lock:
