@@ -16,7 +16,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from storage import atomic_write, update_session, session_bounds, session_markers
+from storage import atomic_write, update_session, session_bounds, session_markers, dedupe_day_headings
 import docx_export
 import gpu_formatter
 import local_formatter
@@ -442,6 +442,7 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
         updated = update_session(existing, session_id, section, replace=replace_session)
     else:
         updated = existing.rstrip() + "\n\n" + section.strip() + "\n"
+    updated = dedupe_day_headings(updated)
     atomic_write(path, updated, expected=before_save)
 
     try:
@@ -776,6 +777,7 @@ def condense_session(class_code: str, class_title: str, before_length: int,
     new_content = header_part.rstrip("\n") + "\n\n" + condensed.strip() + "\n"
     if session_id:
         new_content = update_session(content, session_id, condensed, replace=True)
+    new_content = dedupe_day_headings(new_content)
     if path.read_text(encoding="utf-8") != content:
         return False, "notes changed during formatting; retry condensation"
     atomic_write(path, new_content, expected=content)

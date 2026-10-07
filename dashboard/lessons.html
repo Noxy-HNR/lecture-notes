@@ -12,8 +12,10 @@
 .panel{padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);min-width:0}
 .panel h2{font-size:17px;margin:0 0 14px}
 .field{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--text-dim);margin-bottom:14px}
-select{font:inherit;color:var(--text);background:var(--bg-inset);border:1px solid var(--border);border-radius:7px;padding:9px 10px;width:100%}
-select:focus{outline:2px solid var(--accent)}
+select,textarea{font:inherit;color:var(--text);background:var(--bg-inset);border:1px solid var(--border);border-radius:7px;padding:9px 10px;width:100%;box-sizing:border-box}
+select:focus,textarea:focus{outline:2px solid var(--accent)}
+textarea{resize:vertical;min-height:72px;line-height:1.45}
+.hint{font-size:12px;color:var(--text-faint);display:flex;justify-content:space-between;gap:8px}
 .range{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .quick{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 16px}
 .quick button{font:inherit;font-size:12px;padding:5px 10px;border-radius:999px;border:1px solid var(--border);background:var(--bg-inset);color:var(--text-dim);cursor:pointer}
@@ -30,6 +32,7 @@ select:focus{outline:2px solid var(--accent)}
 .lesson-card:hover{border-color:var(--accent);transform:translateY(-1px)}
 .lesson-card h3{margin:0;font-size:16px;line-height:1.3}
 .lesson-card .meta{font-size:12px;color:var(--text-faint);display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center}
+.lesson-card .focus{font-size:12px;color:var(--accent);-webkit-line-clamp:2}
 .lesson-card p{margin:0;font-size:13px;color:var(--text-dim);display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .pill{font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;background:var(--accent-dim);color:var(--accent)}
 .empty-state{padding:36px;text-align:center;color:var(--text-dim);border:1px dashed var(--border);border-radius:12px}
@@ -70,6 +73,11 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
         <button data-quick="all">Everything</button>
       </div>
       <p class="summary" id="summary"></p>
+      <label class="field">Focus on (optional)
+        <textarea id="focus" maxlength="600" rows="3"
+          placeholder="e.g. walk through Lewis structures step by step, more practice on formal charge"></textarea>
+        <span class="hint"><span>Gets extra depth and practice. Everything else is still covered.</span><span id="focus-count"></span></span>
+      </label>
       <label class="field">Narrator voice<select id="voice"></select></label>
       <button class="btn primary" id="build" style="width:100%">Build lesson</button>
       <div class="progress" id="progress" hidden>
@@ -147,6 +155,7 @@ async function loadLessons() {
       <div class="meta"><span class="pill">${esc(l.class_code)}</span>
         <span>${esc(pretty(l.start))}${l.start === l.end ? '' : ' – ' + esc(pretty(l.end))}</span></div>
       <h3>${esc(l.title)}</h3>
+      ${l.focus ? `<p class="focus">Focus: ${esc(l.focus)}</p>` : ''}
       <p>${esc(l.tldr)}</p>
       <div class="meta"><span>${l.slides} slides</span><span>${minutes(l.duration_seconds)}</span></div>
     </a>`).join('')
@@ -184,13 +193,18 @@ function stop() {
 $('class').onchange = () => { store('lessonClass', $('class').value); fillDates(); };
 $('start').onchange = updateSummary; $('end').onchange = updateSummary;
 $('voice').onchange = () => store('lessonVoice', $('voice').value);
+$('focus').oninput = () => {
+  const n = $('focus').value.length;
+  $('focus-count').textContent = n > 450 ? `${n}/600` : '';
+};
 document.querySelectorAll('[data-quick]').forEach(b => b.onclick = () => quick(b.dataset.quick));
 $('build').onclick = async () => {
   notice('');
   try {
     const { job_id } = await api('/api/lessons/create', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ class_code: $('class').value, start: $('start').value, end: $('end').value, voice: $('voice').value }),
+      body: JSON.stringify({ class_code: $('class').value, start: $('start').value, end: $('end').value,
+                             voice: $('voice').value, focus: $('focus').value.trim() }),
     });
     jobStarted = Date.now(); track(job_id);
   } catch (error) { notice(error.message, 'error'); }

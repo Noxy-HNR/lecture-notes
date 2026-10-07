@@ -45,7 +45,7 @@ def _append_markdown(doc: Document, markdown: str):
         elif re.match(r"^\s*[-*]\s+", line):
             indent = len(line) - len(line.lstrip())
             content = re.sub(r"^\s*[-*]\s+", "", line)
-            style = "List Bullet 2" if indent >= 2 else "List Bullet"
+            style = "List Bullet 3" if indent >= 4 else "List Bullet 2" if indent >= 2 else "List Bullet"
             p = doc.add_paragraph(style=style)
             _add_inline_runs(p, content)
         else:

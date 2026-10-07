@@ -130,6 +130,7 @@ function coverHtml() {
   return `<div class="cover">
     <div class="kind">${esc(lesson.class_code)} · ${esc(lesson.class_title)} · ${range}</div>
     <h2>${esc(lesson.title)}</h2>
+    ${lesson.focus ? `<p class="kind" style="text-transform:none;letter-spacing:0;font-weight:500">Focus: ${esc(lesson.focus)}</p>` : ''}
     <p>${esc(lesson.tldr)}</p>
     <button class="btn primary start" id="start-lesson">▶ Start lesson${lesson.duration_seconds ? ' · ' + clock(lesson.duration_seconds) : ''}</button>
     ${lesson.warnings?.length ? `<p style="font-size:13px">${esc(lesson.warnings.join(' · '))}</p>` : ''}

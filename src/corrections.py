@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-from storage import atomic_write, RevisionConflict
+from storage import atomic_write, RevisionConflict, dedupe_day_headings
 from transcripts import digest, load_transcript, session_class, session_path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -260,6 +260,7 @@ def apply_preview(payload):
         if digest(before) != job["notes_revision"]:
             raise RevisionConflict("Notes changed before saving; generate a new preview")
         updated = before[:section["start"]] + replacement.rstrip()+"\n\n" + before[section["end"]:]
+        updated = dedupe_day_headings(updated)
         atomic_write(path,updated,expected=before)
         with _jobs_lock:
             _jobs[job["id"]]["status"] = "applied"

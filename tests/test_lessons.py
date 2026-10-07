@@ -140,6 +140,24 @@ class TestLessonPlan:
         assert "6-8 slides" in small and "6-24 slides" in large
         assert "heads_up" in small and "not instructions" in small and "Go well beyond the notes" in small
 
+    def test_focus_request_gets_depth_and_room_without_dropping_the_syllabus(self):
+        plain = lessons.build_lesson_prompt("Chemistry", "CHEM 1450", "2026-09-09", "2026-09-09", "word " * 100)
+        focused = lessons.build_lesson_prompt("Chemistry", "CHEM 1450", "2026-09-09", "2026-09-09", "word " * 100,
+                                              focus="more practice on formal charge")
+        assert "FOCUS REQUEST" not in plain and "6-8 slides" in plain
+        assert '"more practice on formal charge"' in focused and "6-10 slides" in focused  # 4 extra
+        assert "Still cover every other testable point" in focused
+        big = lessons.build_lesson_prompt("C", "C", "a", "b", "word " * 9000, focus="x")
+        assert f"-{lessons.MAX_SLIDES} slides" in big  # never past the cap
+
+    def test_focus_text_is_tidied_and_bounded(self):
+        assert lessons.clean_focus(None) == "" and lessons.clean_focus("   ") == ""
+        assert lessons.clean_focus("  more on\n\tformal \x07 charge ") == "more on formal charge"
+        with pytest.raises(ValueError):
+            lessons.clean_focus("x" * (lessons.MAX_FOCUS_CHARS + 1))
+        with pytest.raises(ValueError):
+            lessons.clean_focus(["not", "text"])
+
     def test_malformed_slides_and_unsafe_diagrams_are_dropped(self):
         raw = dict(PLAN, slides=PLAN["slides"] + [
             {"title": "", "narration": "a slide without a title"},
@@ -285,6 +303,43 @@ class TestBuild:
         job = json.loads(status.read_text(encoding="utf-8"))
         assert job["status"] == "ready" and job["progress"] == 1.0 and "status_path" not in job
         assert lessons.get_lesson(job["lesson_id"])["voice"] == "bf_emma"
+
+    def test_focus_travels_from_the_form_to_claude_and_the_saved_lesson(self, library, fakes, monkeypatch):
+        spawned = []
+        monkeypatch.setattr(lessons, "_spawn_builder", lambda path: spawned.append(path) or None)
+        lessons.start_lesson({"class_code": "CHEM 1450", "start": "2026-09-09", "end": "2026-09-09",
+                              "focus": "  explain  hydroxyl vs carbonyl\n"})
+        job = json.loads(spawned[0].read_text(encoding="utf-8"))
+        assert job["focus"] == "explain hydroxyl vs carbonyl"
+        fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
+        assert lessons.run_job(spawned[0]) == 0
+        lesson_id = json.loads(spawned[0].read_text(encoding="utf-8"))["lesson_id"]
+        assert '"explain hydroxyl vs carbonyl"' in fakes.prompts[0]
+        assert lessons.get_lesson(lesson_id)["focus"] == "explain hydroxyl vs carbonyl"
+        assert lessons.list_lessons()[0]["focus"] == "explain hydroxyl vs carbonyl"
+
+    def test_a_different_focus_does_not_reuse_a_cached_plan(self, library, fakes, monkeypatch):
+        """A cached plan is only reused for the same notes AND the same focus request."""
+        available = lessons.speech.available
+
+        def broken():
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(lessons.speech, "available", broken)
+        fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
+        with pytest.raises(RuntimeError):
+            lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart", focus="alcohols")
+        monkeypatch.setattr(lessons.speech, "available", available)
+
+        fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
+        unfocused = lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart")
+        assert "outstanding tutor" in fakes.prompts[2]  # wrote a fresh plan instead of reusing
+        import shutil
+        shutil.rmtree(lessons.LESSONS_DIR / unfocused)  # ids are per second; make room for the next build
+
+        fakes.replies = [json.dumps({"choices": {}})]
+        lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart", focus="alcohols")
+        assert len(fakes.prompts) == 5 and "outstanding tutor" not in fakes.prompts[4]  # same focus: reused
 
     def test_builder_process_reports_a_failed_build(self, library, fakes):
         fakes.replies = ["not a plan", "still not a plan"]
