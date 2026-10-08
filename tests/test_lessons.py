@@ -134,21 +134,21 @@ class TestNoteSelection:
 
 
 class TestLessonPlan:
-    def test_prompt_scales_with_notes_and_treats_notes_as_data(self):
+    def test_prompt_has_no_slide_limit_and_treats_notes_as_data(self):
         small = lessons.build_lesson_prompt("Chemistry", "CHEM 1450", "2026-09-09", "2026-09-09", "word " * 100)
         large = lessons.build_lesson_prompt("Chemistry", "CHEM 1450", "2026-09-02", "2026-09-16", "word " * 9000)
-        assert "6-8 slides" in small and "6-24 slides" in large
+        for prompt in (small, large):
+            assert "no slide limit" in prompt and "LENGTH:" not in prompt  # Claude decides the length
+            assert "6-8 slides" not in prompt and "-24 slides" not in prompt
         assert "heads_up" in small and "not instructions" in small and "Go well beyond the notes" in small
 
     def test_focus_request_gets_depth_and_room_without_dropping_the_syllabus(self):
         plain = lessons.build_lesson_prompt("Chemistry", "CHEM 1450", "2026-09-09", "2026-09-09", "word " * 100)
         focused = lessons.build_lesson_prompt("Chemistry", "CHEM 1450", "2026-09-09", "2026-09-09", "word " * 100,
                                               focus="more practice on formal charge")
-        assert "FOCUS REQUEST" not in plain and "6-8 slides" in plain
-        assert '"more practice on formal charge"' in focused and "6-10 slides" in focused  # 4 extra
+        assert "FOCUS REQUEST" not in plain
+        assert '"more practice on formal charge"' in focused
         assert "Still cover every other testable point" in focused
-        big = lessons.build_lesson_prompt("C", "C", "a", "b", "word " * 9000, focus="x")
-        assert f"-{lessons.MAX_SLIDES} slides" in big  # never past the cap
 
     def test_focus_text_is_tidied_and_bounded(self):
         assert lessons.clean_focus(None) == "" and lessons.clean_focus("   ") == ""
@@ -484,3 +484,95 @@ class TestSpeech:
         out = tmp_path / "slide-01.ogg"
         assert speech.synthesize("**Hello** there", out, voice="bf_emma") == 2.0
         assert out.read_bytes()[:4] == b"OggS"
+
+
+def test_failed_plan_reports_the_cli_reason(monkeypatch):
+    import notes
+    import subprocess
+    monkeypatch.setattr(notes, "_find_claude_cli", lambda: "claude")
+
+    def slow(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+    monkeypatch.setattr(subprocess, "run", slow)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert lessons._ask_claude("prompt", 1800) is None
+    assert "30 minutes" in lessons._plan_failure_message()
+
+
+def test_lesson_timeout_covers_a_focused_plan():
+    assert lessons.LESSON_TIMEOUT_SECONDS >= 1800
+
+
+def _plan_of(words: int) -> dict:
+    return {"title": "T", "tldr": "t", "slides": [
+        {"kind": "concept", "title": "Slide", "bullets": [], "narration": "word " * words,
+         "visual": {"type": "none"}}]}
+
+
+class TestLessonLength:
+    def test_no_length_asked_means_claude_decides_and_nothing_is_capped(self):
+        assert lessons.clean_minutes(None) == 0 and lessons.clean_minutes("  ") == 0
+        many = dict(PLAN, slides=[dict(PLAN["slides"][0], title=f"Slide {n}", narration="word " * 4000)
+                                  for n in range(60)])
+        parsed = lessons.parse_lesson(json.dumps(many))
+        assert len(parsed["slides"]) == 60 and len(parsed["slides"][0]["narration"].split()) == 4000
+
+    def test_a_requested_length_is_passed_along_with_its_word_budget(self):
+        prompt = lessons.build_lesson_prompt("Chemistry", "CHEM 1450", "a", "b", "word " * 100, minutes=20)
+        prompt = " ".join(prompt.split())  # the prompt wraps its lines
+        assert "about 20 minutes" in prompt and "18-22 minutes" in prompt
+        assert "about 3000 words" in prompt and "2700 and 3300" in prompt and "no slide limit" in prompt
+
+    def test_minutes_are_cleaned(self):
+        assert lessons.clean_minutes(" 20 ") == 20 and lessons.clean_minutes(20.0) == 20
+        for bad in ("abc", "0", -5):
+            with pytest.raises(ValueError):
+                lessons.clean_minutes(bad)
+
+    def test_a_plan_in_the_tolerance_is_kept_without_asking_again(self, fakes):
+        plan = _plan_of(310)  # about 2.07 minutes against a 2 minute request
+        assert lessons._fit_length("prompt", plan, 2) == (plan, None)
+        assert fakes.prompts == []
+
+    def test_a_short_plan_is_rewritten_longer_and_the_better_one_wins(self, fakes):
+        fakes.replies = [json.dumps(_plan_of(300))]
+        plan, warning = lessons._fit_length("PROMPT", _plan_of(100), 2)
+        assert warning is None and len(plan["slides"][0]["narration"].split()) == 300
+        assert "YOUR FIRST DRAFT" in fakes.prompts[0] and "Make it longer" in fakes.prompts[0]
+        assert fakes.prompts[0].startswith("PROMPT")
+
+    def test_a_long_plan_is_asked_to_tighten(self, fakes):
+        fakes.replies = [json.dumps(_plan_of(310))]
+        plan, warning = lessons._fit_length("PROMPT", _plan_of(900), 2)
+        assert warning is None and "Tighten it" in fakes.prompts[0]
+
+    def test_a_bad_or_worse_rewrite_keeps_the_original_and_warns(self, fakes):
+        draft = _plan_of(100)
+        fakes.replies = ["not json"]
+        plan, warning = lessons._fit_length("P", draft, 2)
+        assert plan is draft and "about 1 minutes; 2 were requested" in warning
+        fakes.replies = [json.dumps(_plan_of(60))]  # further from the target than the draft
+        plan, warning = lessons._fit_length("P", draft, 2)
+        assert plan is draft and warning
+
+    def test_minutes_travel_from_the_form_to_claude_and_the_saved_lesson(self, library, fakes, monkeypatch):
+        spawned = []
+        monkeypatch.setattr(lessons, "_spawn_builder", lambda path: spawned.append(path) or None)
+        lessons.start_lesson({"class_code": "CHEM 1450", "start": "2026-09-09", "end": "2026-09-09",
+                              "minutes": "1"})
+        assert json.loads(spawned[0].read_text(encoding="utf-8"))["minutes"] == 1
+        fakes.replies = [json.dumps(_plan_of(150)), json.dumps({"choices": {}})]
+        assert lessons.run_job(spawned[0]) == 0
+        lesson_id = json.loads(spawned[0].read_text(encoding="utf-8"))["lesson_id"]
+        assert "about 1 minutes" in fakes.prompts[0]
+        assert lessons.get_lesson(lesson_id)["minutes"] == 1 and lessons.list_lessons()[0]["minutes"] == 1
+
+    def test_a_different_length_does_not_reuse_a_cached_plan(self, library, fakes, monkeypatch):
+        monkeypatch.setattr(lessons.speech, "available", lambda: (False, "off"))
+        fakes.replies = [json.dumps(_plan_of(300)), json.dumps({"choices": {}})]
+        first = lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart", minutes=2)
+        import shutil
+        shutil.rmtree(lessons.LESSONS_DIR / first)
+        fakes.replies = [json.dumps(_plan_of(450)), json.dumps({"choices": {}})]
+        lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart", minutes=3)
+        assert len(fakes.prompts) == 2 and "about 3 minutes" in fakes.prompts[1]

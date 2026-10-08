@@ -36,6 +36,7 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 
+import keep_awake
 import notes
 import speech
 
@@ -45,9 +46,9 @@ LESSONS_DIR = ROOT / "lessons"
 
 DATE_FORMAT = "%A, %B %d, %Y"          # "## Wednesday, September 9, 2026"
 USER_AGENT = "LectureNotesLessons/1.0 (personal study tool)"
-LESSON_TIMEOUT_SECONDS = 600           # a long range can take Claude several minutes
+LESSON_TIMEOUT_SECONDS = 3600          # only a hang guard: a long lesson takes a long time to write, and 600s
+                                       # killed every focused PSYC/BIOL build at exactly 10:00
 PICK_TIMEOUT_SECONDS = 300
-MAX_SLIDES = 24
 MAX_IMAGE_BYTES = 12_000_000
 MAX_IMAGE_SIDE = 1600
 KINDS = ("overview", "concept", "example", "recap", "check")
@@ -128,13 +129,28 @@ def notes_for_range(code: str, start: date, end: date) -> tuple[str, str, list[s
 # ---------------------------------------------------------------------------
 
 MAX_FOCUS_CHARS = 600
-FOCUS_EXTRA_SLIDES = 4   # room to go deeper on what the student asked about
+# Lesson length is up to Claude unless the student asks for minutes. There is no slide cap and no
+# word cap; a requested length is only passed along, then checked against the finished plan.
+SPEECH_WORDS_PER_MINUTE = 150   # measured from the narrator on past lessons: 146-160
+LENGTH_TOLERANCE = 0.10         # "20 minutes" means 18-22
 
 
-def slide_budget(notes_markdown: str, focus: str = "") -> tuple[int, int]:
-    words = len(notes_markdown.split())
-    most = max(8, min(MAX_SLIDES, 6 + words // 300 + (FOCUS_EXTRA_SLIDES if focus else 0)))
-    return min(6, most), most
+def clean_minutes(value) -> int:
+    """The optional length request from the build form: whole minutes, or 0 for "you decide"."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0
+    try:
+        minutes = int(float(str(value).strip()))
+    except ValueError:
+        raise ValueError("Length must be a number of minutes")
+    if minutes < 1:
+        raise ValueError("Length must be at least 1 minute")
+    return minutes
+
+
+def narration_minutes(lesson: dict) -> float:
+    """How long a plan's narration runs when read aloud."""
+    return sum(len(slide["narration"].split()) for slide in lesson["slides"]) / SPEECH_WORDS_PER_MINUTE
 
 
 def clean_focus(text) -> str:
@@ -156,7 +172,7 @@ def _focus_section(focus: str) -> str:
 THE STUDENT'S FOCUS REQUEST
 The student asked for this lesson to focus on:
 "{focus}"
-- Give what they asked about the most depth: extra slides, slower step-by-step explanation, more
+- Give what they asked about the most depth: more slides, slower step-by-step explanation, more
   worked examples, and check questions that test it. Say in the overview slide that the lesson
   leans into it.
 - Still cover every other testable point in the notes, just more briefly - the notes remain the
@@ -167,12 +183,28 @@ The student asked for this lesson to focus on:
 """
 
 
+def _length_section(minutes: int) -> str:
+    if not minutes:
+        return """- There is no slide limit and no time limit. Use as many slides as the material needs - one per
+  core idea - and as much narration per slide as that idea needs to be understood (usually 80-250
+  words, more for hard ideas). Don't pad it and don't squeeze it."""
+    low, high = round(minutes * (1 - LENGTH_TOLERANCE)), round(minutes * (1 + LENGTH_TOLERANCE))
+    words = minutes * SPEECH_WORDS_PER_MINUTE
+    return f"""- LENGTH: the student asked for a lesson of about {minutes} minutes, read aloud. It must run
+  {low}-{high} minutes. The narrator speaks about {SPEECH_WORDS_PER_MINUTE} words a minute, so the narration
+  across ALL slides must total about {words} words (between {low * SPEECH_WORDS_PER_MINUTE} and
+  {high * SPEECH_WORDS_PER_MINUTE}); titles, bullets and key terms aren't spoken, so don't count them.
+  Use as many slides as that takes - there is no slide limit - and keep a running word count of the
+  narration as you write. If the material is too big for the time, teach the most testable ideas
+  fully and the rest briefly rather than dropping any. If it is small for the time, go deeper:
+  worked examples, analogies, common mistakes and extra check questions - not repetition."""
+
+
 def build_lesson_prompt(class_title: str, class_code: str, first: str, last: str, notes_markdown: str,
-                        focus: str = "") -> str:
-    fewest, most = slide_budget(notes_markdown, focus)
+                        focus: str = "", minutes: int = 0) -> str:
     span = first if first == last else f"{first} to {last}"
     return f"""You are an outstanding tutor. A student in {class_title} ({class_code}) found the lectures
-from {span} confusing - the professor explains things poorly. Build a short narrated slideshow
+from {span} confusing - the professor explains things poorly. Build a narrated slideshow
 lesson that re-teaches this material so it finally makes sense.
 
 WHAT TO COVER
@@ -192,12 +224,11 @@ WHAT TO COVER
 HOW TO TEACH
 - Plain words and short sentences. Define every technical term the first time it appears.
 - Order the slides so each builds on the one before. Start with a "What you'll learn" overview
-  slide, end with a recap slide, then 2-4 "check" slides with quick questions.
-- About one slide per core idea: {fewest}-{most} slides in total, depending on how much material
-  there is. Use "example" slides for worked examples.
+  slide, end with a recap slide, then a few "check" slides with quick questions (more of them in a
+  longer lesson). Use "example" slides for worked examples.
+{_length_section(minutes)}
 - 2-5 bullets per slide, each under about 15 words - the narration does the explaining.
-- Narration is what a friendly tutor would SAY over the slide: 60-150 words, conversational,
-  explains the why and doesn't just read the bullets. It will be read aloud by a text-to-speech
+- Narration is what a friendly tutor would SAY over the slide: conversational, explains the why and doesn't just read the bullets. It will be read aloud by a text-to-speech
   voice, so no markdown, emojis, bullet symbols or abbreviations it can't pronounce; write
   formulas and symbols the way they are spoken ("H two O", "delta G", "greater than").
 - For "check" slides the narration asks the question and tells the student to think before
@@ -249,6 +280,14 @@ NOTES ({span}):
 def _ask_claude(prompt: str, timeout: int) -> str | None:
     return (notes._try_claude_cli_format(prompt, timeout=timeout)
             or notes._try_claude_api_format(prompt, max_tokens=16000))
+
+
+def _plan_failure_message() -> str:
+    """Says why the lesson couldn't be written, using the CLI's recorded reason when there is one."""
+    reason = notes.last_cli_failure
+    if not reason:
+        return "The lesson could not be written: the Claude API fallback failed too (check ANTHROPIC_API_KEY)."
+    return f"The lesson could not be written: {reason}."
 
 
 def _json_object(text: str):
@@ -303,7 +342,7 @@ def parse_lesson(reply: str) -> dict:
     for raw in data.get("slides") or []:
         if not isinstance(raw, dict):
             continue
-        title, narration = _clean(raw.get("title"), 120), _clean(raw.get("narration"), 2500)
+        title, narration = _clean(raw.get("title"), 120), _clean(raw.get("narration"), 30000)
         if not title or not narration:
             continue
         kind = raw.get("kind") if raw.get("kind") in KINDS else "concept"
@@ -327,7 +366,7 @@ def parse_lesson(reply: str) -> dict:
         raise ValueError("The lesson plan had no usable slides")
     return {"title": _clean(data.get("title"), 120) or "Lesson",
             "tldr": _clean(data.get("tldr"), 900),
-            "slides": slides[:MAX_SLIDES]}
+            "slides": slides}
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +573,40 @@ def _update(job: dict, **fields):
         _write_json(Path(job["status_path"]), {k: v for k, v in job.items() if k != "status_path"})
 
 
+def _fit_length(prompt: str, lesson: dict, minutes: int) -> tuple[dict, str | None]:
+    """Checks a fresh plan against the requested length. A plan outside the tolerance gets one
+    rewrite with its measured length fed back; whichever plan is closer is kept. Returns the
+    plan and a warning if it still misses."""
+    wanted = minutes * LENGTH_TOLERANCE
+    have = narration_minutes(lesson)
+    if abs(have - minutes) <= wanted:
+        return lesson, None
+    words = round(have * SPEECH_WORDS_PER_MINUTE)
+    low, high = round(minutes * (1 - LENGTH_TOLERANCE)), round(minutes * (1 + LENGTH_TOLERANCE))
+    fix = ("Make it longer by teaching deeper: more worked examples, analogies, common mistakes, extra check "
+           "questions and fuller narration - not by repeating yourself." if have < minutes else
+           "Tighten it: shorten narration, merge slides that cover one idea and trim asides, keeping "
+           "every testable point.")
+    reply = _ask_claude(
+        f"{prompt}\n\nYOUR FIRST DRAFT (JSON):\n{json.dumps(lesson, ensure_ascii=False)}\n\n"
+        f"That draft narrates about {have:.0f} minutes ({words} words), but the student asked for about "
+        f"{minutes} minutes - {low}-{high} minutes, {low * SPEECH_WORDS_PER_MINUTE}-"
+        f"{high * SPEECH_WORDS_PER_MINUTE} words of narration in total. {fix} Rewrite the complete "
+        "lesson in the same JSON shape and reply with only the JSON object.", LESSON_TIMEOUT_SECONDS)
+    try:
+        revised = parse_lesson(reply or "")
+        if abs(narration_minutes(revised) - minutes) < abs(have - minutes):
+            lesson = revised
+    except (ValueError, json.JSONDecodeError):
+        pass
+    final = narration_minutes(lesson)
+    if abs(final - minutes) <= wanted:
+        return lesson, None
+    return lesson, f"The narration runs about {final:.0f} minutes; {minutes} were requested"
+
+
 def build_lesson(code: str, start: date, end: date, voice: str, job: dict | None = None,
-                 focus: str = "") -> str:
+                 focus: str = "", minutes: int = 0) -> str:
     """Builds a lesson and returns its id. Works in lessons/<id>.partial/ and renames it on
     success, so a failed or interrupted build never shows up as a broken lesson."""
     job = job if job is not None else {}
@@ -546,7 +617,8 @@ def build_lesson(code: str, start: date, end: date, voice: str, job: dict | None
     # same notes succeeds, so a build that fails later - a lost connection, a crash - can be
     # retried without writing the whole lesson again. Changed notes or a different focus
     # request get a new cache key.
-    keyed = json.dumps([notes_markdown, focus]) if focus else notes_markdown  # unfocused keys unchanged
+    keyed = (json.dumps([notes_markdown, focus] + ([minutes] if minutes else []))
+             if focus or minutes else notes_markdown)  # plain builds keep their old keys
     digest = hashlib.sha1(keyed.encode("utf-8")).hexdigest()[:12]
     plan_cache = LESSONS_DIR / ".plans" / f"{code.replace(' ', '_')}_{start:%Y%m%d}-{end:%Y%m%d}_{digest}.json"
     lesson = None
@@ -558,16 +630,21 @@ def build_lesson(code: str, start: date, end: date, voice: str, job: dict | None
             lesson = None
     if lesson is None:
         _update(job, stage="Writing the lesson with Claude", progress=0.08)
-        prompt = build_lesson_prompt(class_title, code, dates[0], dates[-1], notes_markdown, focus)
+        prompt = build_lesson_prompt(class_title, code, dates[0], dates[-1], notes_markdown, focus, minutes)
         reply = _ask_claude(prompt, LESSON_TIMEOUT_SECONDS)
         if not reply:
-            raise RuntimeError("Claude CLI/API is unavailable, so the lesson couldn't be written")
+            raise RuntimeError(_plan_failure_message())
         try:
             lesson = parse_lesson(reply)
         except (ValueError, json.JSONDecodeError):
             reply = _ask_claude(prompt + "\n\nYour previous reply was not valid JSON in the required shape. "
                                 "Reply again with only the JSON object.", LESSON_TIMEOUT_SECONDS)
             lesson = parse_lesson(reply or "")
+        if minutes:
+            _update(job, stage="Checking the lesson length", progress=0.25)
+            lesson, miss = _fit_length(prompt, lesson, minutes)
+            if miss:
+                warnings.append(miss)
         plan_cache.parent.mkdir(parents=True, exist_ok=True)
         _write_json(plan_cache, lesson)
 
@@ -640,10 +717,13 @@ def build_lesson(code: str, start: date, end: date, voice: str, job: dict | None
             except Exception as error:
                 warnings.append(f"Slide {number} narration failed: {error}")
 
+        if minutes and total and abs(total / 60 - minutes) > minutes * LENGTH_TOLERANCE:
+            warnings.append(f"The recorded lesson runs {total / 60:.0f} minutes; {minutes} were requested")
         record = {"id": lesson_id, "class_code": code, "class_title": class_title,
                   "title": lesson["title"], "tldr": lesson["tldr"], "dates": dates,
                   "start": start.isoformat(), "end": end.isoformat(),
                   "created_at": time.time(), "voice": voice, "model": notes.CLAUDE_MODEL, "focus": focus,
+                  "minutes": minutes,
                   "duration_seconds": round(total, 1), "warnings": warnings, "slides": slides}
         (work / "lesson.json").write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
         work.rename(LESSONS_DIR / lesson_id)
@@ -664,6 +744,7 @@ def start_lesson(payload: dict) -> dict:
         start, end = end, start
     voice = payload.get("voice") if payload.get("voice") in speech.VOICES else speech.DEFAULT_VOICE
     focus = clean_focus(payload.get("focus"))
+    minutes = clean_minutes(payload.get("minutes"))
     notes_for_range(code, start, end)  # fail fast on a bad class or an empty range
     jobs_dir = LESSONS_DIR / ".jobs"
     with _jobs_lock:
@@ -682,7 +763,7 @@ def start_lesson(payload: dict) -> dict:
             shutil.rmtree(leftover, ignore_errors=True)
         job = {"id": uuid.uuid4().hex, "status": "running", "stage": "Starting", "progress": 0.01,
                "class_code": code, "start": start.isoformat(), "end": end.isoformat(), "voice": voice,
-               "focus": focus, "created_at": time.time(), "lesson_id": None, "pid": None}
+               "focus": focus, "minutes": minutes, "created_at": time.time(), "lesson_id": None, "pid": None}
         status_path = jobs_dir / f"{job['id']}.json"
         _write_json(status_path, job)
         _processes[job["id"]] = _spawn_builder(status_path)
@@ -734,9 +815,12 @@ def run_job(status_path: Path) -> int:
     job.update(status_path=str(status_path))
     _update(job, pid=os.getpid(), stage="Reading notes", progress=0.02)
     try:
-        lesson_id = build_lesson(job["class_code"], date.fromisoformat(job["start"]),
-                                 date.fromisoformat(job["end"]), job.get("voice") or speech.DEFAULT_VOICE, job,
-                                 focus=job.get("focus") or "")
+        # A build takes many minutes. Its own sleep block (the screen may still turn off) keeps it
+        # running with the lid closed, whether or not a recording is going.
+        with keep_awake.KeepAwake():
+            lesson_id = build_lesson(job["class_code"], date.fromisoformat(job["start"]),
+                                     date.fromisoformat(job["end"]), job.get("voice") or speech.DEFAULT_VOICE, job,
+                                     focus=job.get("focus") or "", minutes=job.get("minutes") or 0)
     except Exception as error:
         _update(job, status="failed", stage="Failed", error=str(error))
         return 1
@@ -774,7 +858,7 @@ def list_lessons() -> list[dict]:
         except (OSError, ValueError):
             continue
         out.append({key: data.get(key) for key in ("id", "class_code", "class_title", "title", "tldr",
-                                                   "start", "end", "dates", "created_at", "duration_seconds", "focus")}
+                                                   "start", "end", "dates", "created_at", "duration_seconds", "focus", "minutes")}
                    | {"slides": len(data.get("slides") or [])})
     return sorted(out, key=lambda lesson: lesson.get("created_at") or 0, reverse=True)
 

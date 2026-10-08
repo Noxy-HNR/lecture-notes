@@ -193,11 +193,19 @@ def _looks_like_assistant_chatter(text: str) -> bool:
     return not has_structure
 
 
+last_cli_failure: str | None = None  # why the most recent CLI call returned None (None after a success)
+
+
 def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> str | None:
     """Returns clean markdown via the Claude Code CLI (subscription usage), or None if unusable.
-    `timeout` is only raised by long one-off jobs (lessons); note saves keep the default."""
+    `timeout` is only raised by long one-off jobs (lessons); note saves keep the default.
+    When it returns None the reason is left in `last_cli_failure`, so a caller that has no
+    fallback can say what actually went wrong instead of guessing."""
+    global last_cli_failure
+    last_cli_failure = None
     cli = _find_claude_cli()
     if not cli:
+        last_cli_failure = "the Claude CLI isn't installed (claude.exe was not found)"
         return None
     try:
         result = subprocess.run(
@@ -209,13 +217,23 @@ def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> s
             timeout=timeout,
         )
         if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-300:]
+            last_cli_failure = f"the Claude CLI exited with code {result.returncode}" + (f": {detail}" if detail else "")
             return None
         text = result.stdout.strip()
-        if not text or _looks_like_assistant_chatter(text):
+        if not text:
+            last_cli_failure = "the Claude CLI returned an empty reply"
+            return None
+        if _looks_like_assistant_chatter(text):
+            last_cli_failure = f"the Claude CLI replied with a message instead of the content: {text[:200]!r}"
             return None  # treated exactly like a failed call, so the caller falls through
         return text
-    except Exception:
-        # CLI not logged in, timed out, offline, etc. -> fall back.
+    except subprocess.TimeoutExpired:
+        last_cli_failure = f"the Claude CLI did not finish within {timeout // 60} minutes"
+        return None
+    except Exception as error:
+        # CLI not logged in, offline, etc. -> fall back.
+        last_cli_failure = f"the Claude CLI could not be run ({type(error).__name__}: {error})"
         return None
 
 
