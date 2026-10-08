@@ -92,8 +92,8 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
     <div class="track" id="track" role="group" aria-label="Slides"></div>
     <span class="time" id="time"></span>
     <select id="speed" aria-label="Narration speed" title="Narration speed">
-      <option value="0.85">0.85×</option><option value="1">1×</option><option value="1.15">1.15×</option>
-      <option value="1.3">1.3×</option><option value="1.5">1.5×</option>
+      <option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option>
+      <option value="1.5">1.5×</option><option value="2">2×</option><option value="2.5">2.5×</option><option value="3">3×</option>
     </select>
     <button class="icon" id="auto" aria-pressed="true" title="Advance automatically (a)">Auto</button>
     <button class="icon" id="cc" aria-pressed="false" title="Show narration text (c)">CC</button>
@@ -107,6 +107,9 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const clock = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const rate = () => Number($('speed').value) || 1;
+// Lengths and positions are shown as they play at the chosen speed: 30 minutes at 2x reads 15:00.
+const startLabel = () => '▶ Start lesson' + (lesson.duration_seconds ? ' · ' + clock(lesson.duration_seconds / rate()) : '');
 const params = new URLSearchParams(location.search);
 const lessonId = params.get('id');
 const audio = $('audio');
@@ -132,7 +135,7 @@ function coverHtml() {
     <h2>${esc(lesson.title)}</h2>
     ${lesson.focus ? `<p class="kind" style="text-transform:none;letter-spacing:0;font-weight:500">Focus: ${esc(lesson.focus)}</p>` : ''}
     <p>${esc(lesson.tldr)}</p>
-    <button class="btn primary start" id="start-lesson">▶ Start lesson${lesson.duration_seconds ? ' · ' + clock(lesson.duration_seconds) : ''}</button>
+    <button class="btn primary start" id="start-lesson">${startLabel()}</button>
     ${lesson.warnings?.length ? `<p style="font-size:13px">${esc(lesson.warnings.join(' · '))}</p>` : ''}
   </div>`;
 }
@@ -200,7 +203,7 @@ function drawTrack() {
 function updateTime() {
   const before = slides().slice(0, Math.max(0, index - 1)).reduce((sum, s) => sum + (s.audio_seconds || 0), 0);
   const here = index > 0 && !audio.paused || (index > 0 && audio.currentTime) ? audio.currentTime : 0;
-  $('time').textContent = lesson.duration_seconds ? `${clock(before + here)} / ${clock(lesson.duration_seconds)}` : '';
+  $('time').textContent = lesson.duration_seconds ? `${clock((before + here) / rate())} / ${clock(lesson.duration_seconds / rate())}` : '';
   const fill = $('fill-' + index), dur = slideAt(index)?.audio_seconds;
   if (fill && dur) fill.style.width = Math.min(100, audio.currentTime / dur * 100) + '%';
 }
@@ -248,7 +251,11 @@ $('play').onclick = () => setPlaying(!playing);
 $('prev').onclick = () => go(index - 1);
 $('next').onclick = () => go(index + 1);
 $('track').onclick = e => { const i = e.target.closest('[data-i]')?.dataset.i; if (i) go(Number(i)); };
-$('speed').onchange = () => { audio.playbackRate = Number($('speed').value); store('lessonSpeed', $('speed').value); };
+$('speed').onchange = () => {
+  audio.playbackRate = Number($('speed').value); store('lessonSpeed', $('speed').value);
+  updateTime();
+  const start = $('start-lesson'); if (start) start.textContent = startLabel();
+};
 $('auto').onclick = () => { const on = $('auto').getAttribute('aria-pressed') !== 'true'; $('auto').setAttribute('aria-pressed', on); store('lessonAuto', on); };
 $('cc').onclick = () => { const on = $('cc').getAttribute('aria-pressed') !== 'true'; $('cc').setAttribute('aria-pressed', on); $('captions').hidden = !on; store('lessonCaptions', on); };
 $('full').onclick = () => document.fullscreenElement ? document.exitFullscreen() : $('player').requestFullscreen?.();
@@ -263,7 +270,11 @@ document.addEventListener('keydown', e => {
 });
 
 (async () => {
-  if (recall('lessonSpeed')) $('speed').value = recall('lessonSpeed'); else $('speed').value = '1';
+  // A speed saved from the old list (0.85, 1.15, 1.3) isn't an option any more: use the nearest one.
+  const saved = Number(recall('lessonSpeed')) || 1;
+  const speeds = [...$('speed').options].map(o => Number(o.value));
+  $('speed').value = String(speeds.reduce((a, b) => Math.abs(b - saved) < Math.abs(a - saved) ? b : a));
+  audio.playbackRate = Number($('speed').value);
   if (recall('lessonAuto') === 'false') $('auto').setAttribute('aria-pressed', 'false');
   if (recall('lessonCaptions') === 'true') { $('cc').setAttribute('aria-pressed', 'true'); $('captions').hidden = false; }
   try {
