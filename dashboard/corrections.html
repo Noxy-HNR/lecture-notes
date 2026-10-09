@@ -30,7 +30,8 @@ audio{width:100%;margin:12px 0}button:disabled{opacity:.45;cursor:not-allowed}[h
 <div class="eyebrow">Refine your notes</div><h1 class="page-title">A clearer record of your lecture.</h1>
 <p class="muted">Listen, fix the transcript, then replace only the note section you choose.</p>
 <div id="notice" class="notice" role="status" aria-live="polite">Loading recordings…</div>
-<div class="toolbar"><label class="field">Recording<select id="recording" aria-label="Recording"><option value="">Choose a recording</option></select></label>
+<div class="toolbar"><label class="field">Class<select id="class" aria-label="Class"><option value="">Choose a class</option></select></label>
+<label class="field">Lecture date<select id="recording" aria-label="Lecture date" disabled><option value="">Choose a date</option></select></label>
 <button class="btn" id="reload">Reload recording</button></div>
 <div id="workspace" hidden>
 <div class="work-grid">
@@ -82,7 +83,7 @@ function controls(){
   $('regenerate').disabled=busy||!$('section').value||!selected.size||dirty();
   $('selectionCount').textContent=`${selected.size} segment${selected.size===1?'':'s'} selected for regeneration`;
   $('apply').disabled=busy||!job||dirty();
-  $('recording').disabled=busy;$('reload').disabled=busy;$('section').disabled=busy;
+  $('class').disabled=busy;$('recording').disabled=busy||!$('class').value;$('reload').disabled=busy;$('section').disabled=busy;
 }
 // Segments Jev thinks probably contain a mis-heard word (index -> probability). Loaded after
 // the workspace; empty when Jev is off, has no key, or hasn't read this recording yet.
@@ -131,10 +132,30 @@ async function loadRecording(){
   const id=$('recording').value;if(!id)return;
   if(dirty()){notice('Save your transcript edit before switching recordings.',true);$('recording').value=data.session_id;return;}
   const request=++version;notice('Loading recording…');
-  try{const result=await api('session?session='+encodeURIComponent(id));if(request!==version)return;data=result;loadFlags(id,request);renderWorkspace();notice('Choose a segment to correct, and check the segments to use for regeneration.');}
+  try{const result=await api('session?session='+encodeURIComponent(id));if(request!==version)return;data=result;$('class').value=data.class_code;controls();loadFlags(id,request);renderWorkspace();notice('Choose a segment to correct, and check the segments to use for regeneration.');}
   catch(e){notice(e.message,true);$('workspace').hidden=true;}
 }
 $('recording').onchange=loadRecording;$('reload').onclick=loadRecording;
+let sessionsList=[];
+const longDate=s=>new Date(Number(s.date.slice(0,4)),Number(s.date.slice(4,6))-1,Number(s.date.slice(6))).toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric',year:'numeric'});
+const clockTime=s=>`${s.time.slice(0,2)}:${s.time.slice(2,4)}`;
+function fillClasses(code){
+  const codes=[...new Set(sessionsList.map(s=>s.class_code))].sort();
+  $('class').innerHTML='<option value="">Choose a class</option>'+codes.map(c=>{const n=sessionsList.filter(s=>s.class_code===c).length;return `<option value="${esc(c)}"${c===code?' selected':''}>${esc(c)} · ${n} lecture${n===1?'':'s'}</option>`;}).join('');
+}
+function fillDates(code,id=''){
+  const list=sessionsList.filter(s=>s.class_code===code);
+  $('recording').innerHTML='<option value="">Choose a date</option>'+list.map(s=>`<option value="${esc(s.id)}"${s.id===id?' selected':''}>${esc(longDate(s))} · ${esc(clockTime(s))}${s.audio?'':' · no audio'}</option>`).join('');
+  $('recording').disabled=busy||!code;
+}
+function changeClass(){
+  const code=$('class').value;
+  if(dirty()){notice('Save your transcript edit before switching classes.',true);$('class').value=data.class_code;return;}
+  ++version;invalidate();data=null;active=null;selected.clear();$('workspace').hidden=true;
+  fillDates(code);controls();
+  notice(code?'Choose the lecture date to correct.':'Choose a class to begin.');
+}
+$('class').onchange=changeClass;
 $('flaggedOnly').onclick=()=>{flaggedOnly=!flaggedOnly;renderFlagButton();data&&renderSegments();};$('filter').oninput=()=>data&&renderSegments();$('section').onchange=renderSection;
 $('segmentEdit').oninput=()=>{invalidate();controls();};
 $('restoreOriginal').onclick=()=>{$('segmentEdit').value=data.segments[active].original;invalidate();controls();};
@@ -156,5 +177,14 @@ $('regenerate').onclick=async()=>{
 $('apply').onclick=async()=>{busy=true;controls();notice('Applying this section…');try{const result=await api('apply',{job_id:job.id,text:$('after').value});data=result.workspace;renderWorkspace();notice(result.warning||'Section updated. Other sections are unchanged, and the previous notes are saved as a revision.');}catch(e){notice(e.message,true);}finally{busy=false;controls();}};
 $('discard').onclick=()=>{invalidate();controls();notice('Preview discarded. Notes were not changed.');};
 window.addEventListener('beforeunload',event=>{if(dirty()||job){event.preventDefault();event.returnValue='';}});
-(async()=>{try{const sessions=await api('sessions');$('recording').innerHTML='<option value="">Choose a recording</option>'+sessions.map(s=>`<option value="${esc(s.id)}">${esc(s.class_code)} · ${s.date.slice(0,4)}-${s.date.slice(4,6)}-${s.date.slice(6)} ${s.time.slice(0,2)}:${s.time.slice(2,4)}</option>`).join('');const requested=new URLSearchParams(location.search).get('session');if(sessions.some(s=>s.id===requested)){$('recording').value=requested;await loadRecording();}else notice(sessions.length?'Choose a recording to begin.':'No transcripts yet. Record or recover a lecture first.');}catch(e){notice(e.message,true);}})();
+(async()=>{
+  try{
+    sessionsList=await api('sessions');
+    const requested=new URLSearchParams(location.search).get('session');
+    const match=sessionsList.find(s=>s.id===requested);
+    fillClasses(match?match.class_code:'');
+    if(match){fillDates(match.class_code,match.id);await loadRecording();}
+    else{fillDates('');notice(sessionsList.length?'Choose a class, then the lecture date to correct.':'No transcripts yet. Record or recover a lecture first.');}
+  }catch(e){notice(e.message,true);}
+})();
 </script></body></html>
