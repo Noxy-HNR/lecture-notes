@@ -657,13 +657,15 @@ def _parse_flashcards_json(raw: str) -> list[dict] | None:
 
 
 def generate_flashcards(class_code: str, class_title: str, mode: str = "auto",
-                         count: int = FLASHCARD_COUNT) -> tuple[bool, str | None, list[dict] | None]:
+                         count: int = FLASHCARD_COUNT,
+                         timeout: int = CLI_TIMEOUT_SECONDS) -> tuple[bool, str | None, list[dict] | None]:
     """Generates a multiple-choice quiz from all of a class's notes so far. CLI/API only -
     same reasoning as generate_study_guide: writing plausible wrong answers and covering
     material proportionally needs real understanding of the whole notes file, not just
     single-chunk formatting. Returns (True, None, questions) on success, where each question
     is {"question", "options" (4 strings), "correct_index", "explanation"}, or
-    (False, reason, None)."""
+    (False, reason, None). `timeout` only needs raising for a semester's worth of notes,
+    which can take the CLI longer than a single note save."""
     if mode not in FORMATTING_MODES:
         raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
     if mode != "auto":
@@ -678,7 +680,7 @@ def generate_flashcards(class_code: str, class_title: str, mode: str = "auto",
         return False, "no notes yet for this class", None
 
     prompt = _build_flashcards_prompt(class_title, class_code, content, count)
-    raw = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    raw = _try_claude_cli_format(prompt, timeout=timeout) or _try_claude_api_format(prompt)
     if not raw:
         return False, "Claude CLI/API unavailable", None
 
