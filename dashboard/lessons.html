@@ -25,7 +25,25 @@ textarea{resize:vertical;min-height:72px;line-height:1.45}
 .bar{height:8px;border-radius:99px;background:var(--bg-inset);overflow:hidden;border:1px solid var(--border)}
 .bar>div{height:100%;width:0;background:var(--accent);transition:width .4s ease}
 .stage-text{font-size:13px;margin-top:8px;color:var(--text-dim);display:flex;justify-content:space-between;gap:10px}
-.notice{padding:10px 12px;border-radius:8px;border:1px solid var(--border);font-size:13px;margin-top:14px;white-space:pre-wrap}
+.eta{font-size:13px;margin-top:10px;color:var(--text)}
+.eta span{display:block;margin-top:3px;color:var(--text-dim)}
+.steps{list-style:none;margin:14px 0 0;padding:0;display:grid;gap:10px;font-size:13px}
+.steps li{display:grid;grid-template-columns:18px 1fr auto;gap:2px 8px;align-items:baseline}
+.steps .mark{text-align:center;color:var(--text-faint)}
+.steps .name{color:var(--text)}
+.steps .time{font-size:12px;color:var(--text-faint);white-space:nowrap;font-variant-numeric:tabular-nums}
+.steps .detail{grid-column:2 / -1;font-size:12px;color:var(--text-dim)}
+.steps .done .mark{color:var(--good)}
+.steps .current .mark{color:var(--accent);font-weight:700}
+.steps .current .name{font-weight:600}
+.steps .stopped .mark{color:var(--bad)}
+.steps .stopped .detail{color:var(--bad)}
+.steps .upcoming,.steps .upcoming .name{color:var(--text-faint)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.job-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.job-actions .btn{flex:1 1 auto}
+.job-actions p{flex-basis:100%;margin:0;font-size:13px;color:var(--text-dim)}
+.notice{padding:10px 12px;border-radius:8px;border:1px solid var(--border);font-size:13px;margin-top:14px;white-space:pre-wrap;overflow-wrap:anywhere}
 .notice.error{border-color:var(--bad);color:var(--bad)}.notice.good{border-color:var(--good)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px}
 .lesson-card{display:flex;flex-direction:column;gap:8px;padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);color:inherit;text-decoration:none;transition:border-color .15s,transform .15s}
@@ -87,6 +105,11 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
       <div class="progress" id="progress" hidden>
         <div class="bar"><div id="bar"></div></div>
         <div class="stage-text"><span id="stage">Starting…</span><span id="elapsed"></span></div>
+        <div class="eta" id="eta" hidden></div>
+        <ol class="steps" id="steps" aria-label="Build steps"></ol>
+        <div class="notice" id="reason" role="status" hidden></div>
+        <div class="notice error" id="unreachable" role="status" hidden></div>
+        <div class="job-actions" id="job-actions"></div>
       </div>
       <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
     </section>
@@ -94,6 +117,7 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
     <section aria-labelledby="library-title">
       <div class="row-between" style="margin-bottom:12px">
         <div class="section-label" id="library-title" style="margin:0">Your lessons</div>
+        <a class="btn" id="review-link" href="/lesson?review=1" hidden></a>
       </div>
       <div class="grid" id="lessons"></div>
     </section>
@@ -105,7 +129,10 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const pretty = iso => new Date(iso + 'T12:00:00').toLocaleDateString(undefined, {weekday:'short', month:'short', day:'numeric'});
 const minutes = s => !s ? 'no narration' : s < 60 ? `${Math.round(s)}s` : `${Math.round(s / 60)} min`;
+const STEP_MARK = { done: '✓', current: '›', stopped: '✕', upcoming: '○' };
+const STEP_SR = { done: 'Done: ', current: 'In progress: ', stopped: 'Stopped: ', upcoming: 'To come: ' };
 let classes = [], jobTimer = null, jobStarted = 0;
+let activeJob = null, lastJob = null, cancelAsked = false, cancelling = false, actionsKey = '';
 
 function store(key, value) { try { value == null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch {} }
 function recall(key) { try { return localStorage.getItem(key); } catch { return null; } }
@@ -114,12 +141,43 @@ function notice(text, kind = '') {
   $('notice').hidden = !text; $('notice').className = 'notice ' + kind; $('notice').textContent = text || '';
 }
 
+// Its own line in the build panel, so it never replaces another notice; the next reply clears it.
+function showUnreachable() {
+  $('unreachable').textContent = "Can't reach the dashboard right now. Still checking…";
+  $('unreachable').hidden = false;
+}
+
+function hideUnreachable() {
+  $('unreachable').hidden = true;
+}
+
 async function api(path, options) {
   const response = await fetch(path, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
 }
+
+// Like api(), but keeps the status and never throws, so a missing route (an old dashboard answers
+// 404 with plain text) can be told apart from a real error.
+async function call(path, options) {
+  try {
+    const response = await fetch(path, options);
+    const data = await response.json().catch(() => null);
+    return { ok: response.ok, status: response.status, data };
+  } catch {
+    return { ok: false, status: 0, data: { error: "Can't reach the dashboard right now." } };
+  }
+}
+
+function failureText(result) {
+  if (result.status === 404 && (!result.data || /available in this version/.test(result.data.error || '')))
+    return 'Restart the dashboard to turn this on.';
+  return result.data?.error || `Request failed (${result.status})`;
+}
+
+const postJson = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Notes-Dashboard': '1' },
+                            body: JSON.stringify(body) });
 
 function currentClass() { return classes.find(c => c.code === $('class').value); }
 
@@ -167,32 +225,228 @@ async function loadLessons() {
     : '<div class="empty-state">No lessons yet. Build one from a lecture on the left.</div>';
 }
 
-function track(jobId) {
-  store('lessonJob', jobId);
-  $('progress').hidden = false; $('build').disabled = true; jobStarted = jobStarted || Date.now();
-  clearInterval(jobTimer);
-  const tick = async () => {
-    let job;
-    try { job = await api('/api/lessons/job?id=' + encodeURIComponent(jobId)); }
-    catch (error) { stop(); notice(error.message, 'error'); return; }
-    $('bar').style.width = Math.round((job.progress || 0) * 100) + '%';
-    $('stage').textContent = job.stage || '';
-    const secs = Math.round((Date.now() - (job.created_at * 1000 || jobStarted)) / 1000);
-    $('elapsed').textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
-    if (job.status === 'ready') {
-      stop(); await loadLessons();
-      notice('Lesson ready.', 'good');
-      $('notice').innerHTML = `Lesson ready. <a href="/lesson?id=${encodeURIComponent(job.lesson_id)}">Play it now →</a>`;
-    } else if (job.status === 'failed') {
-      stop(); notice('The lesson could not be built: ' + (job.error || 'unknown error'), 'error');
-    }
-  };
-  tick(); jobTimer = setInterval(tick, 1500);
+// "Questions to review (N)" links to the review queue only when there are some; an old dashboard
+// has no such route, so the link simply stays hidden.
+async function loadReviewCount() {
+  const link = $('review-link');
+  const result = await call('/api/quiz/review');
+  const count = result.ok && result.data ? Number(result.data.count) || 0 : 0;
+  link.textContent = `Questions to review (${count})`;
+  link.hidden = count < 1;
 }
 
-function stop() {
-  clearInterval(jobTimer); jobTimer = null; jobStarted = 0; store('lessonJob', null);
+// ---- build progress -------------------------------------------------------------------------
+
+// "45 s" or "6 min 12 s".
+function clockSpan(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s} s`;
+  return `${Math.floor(s / 60)} min${s % 60 ? ` ${s % 60} s` : ''}`;
+}
+
+// "2:05" style, for the total elapsed time.
+function clockCount(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+const clockTime = ms => new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+const wholeMinutes = seconds => Math.max(1, Math.round(seconds / 60));
+
+// The time-left wording for a running build, or null when the build has not measured enough yet.
+// A measured estimate (narration) gets one figure and one finish time. A rough estimate, from the
+// fixed step lengths, gets a range and a finish window, never a single made-up clock time.
+function etaWording(job, now = Date.now()) {
+  if (job.status !== 'running' || job.eta_seconds == null) return null;
+  if (job.eta_seconds < 30) return { left: 'finishing up', finish: '' };   // also a zero-length range
+  if (job.eta_range) {
+    const [low, high] = job.eta_range;
+    const from = wholeMinutes(low), to = wholeMinutes(high);
+    return {
+      left: from === to ? `about ${from} min left` : `roughly ${from}–${to} min left`,
+      finish: `done between ${clockTime(now + low * 1000)} and ${clockTime(now + high * 1000)}`,
+    };
+  }
+  return { left: `about ${wholeMinutes(job.eta_seconds)} min left`,
+           finish: `done around ${clockTime(now + job.eta_seconds * 1000)}` };
+}
+
+// The step list: done steps with their durations, the step in progress with its detail and time so
+// far, the step a failed or cancelled build stopped in, then the steps still to come.
+function stepsHtml(job, now = Date.now()) {
+  const steps = job.steps || [];
+  const rows = steps.map((step, index) => {
+    const last = index === steps.length - 1;
+    let state = 'done';
+    if (job.status === 'running') state = !step.finished_at && last ? 'current' : 'done';
+    else if (last && job.status !== 'ready') state = 'stopped';
+    const started = step.started_at;
+    const span = state === 'current' ? now / 1000 - started : (step.finished_at || started) - started;
+    const time = state === 'current' ? `${clockSpan(span)} so far` : clockSpan(span);
+    const stopNote = state === 'stopped' ? (job.status === 'cancelled' ? 'stopped here' : 'failed here') : '';
+    const detail = [step.detail, stopNote].filter(Boolean).join(' · ');
+    return `<li class="${state}"${state === 'current' ? ' aria-current="step"' : ''}>` +
+      `<span class="mark" aria-hidden="true">${STEP_MARK[state]}</span>` +
+      `<span class="name"><span class="sr-only">${STEP_SR[state]}</span>${esc(step.name)}</span>` +
+      `<span class="time">${esc(time)}</span>` +
+      (detail ? `<span class="detail">${esc(detail)}</span>` : '') + '</li>';
+  });
+  if (job.status === 'running') {
+    for (const next of job.upcoming || []) {
+      rows.push(`<li class="upcoming"><span class="mark" aria-hidden="true">${STEP_MARK.upcoming}</span>` +
+        `<span class="name"><span class="sr-only">${STEP_SR.upcoming}</span>${esc(next.name)}` +
+        `${next.optional ? ' (only if there are pictures)' : ''}</span></li>`);
+    }
+  }
+  return rows.join('');
+}
+
+// When the last step ended, so a stopped build's elapsed time stops growing.
+function finishedAt(job) {
+  const ends = (job.steps || []).map(step => step.finished_at).filter(Boolean);
+  return ends.length ? Math.max(...ends) * 1000 : null;
+}
+
+function showJob(job) {
+  const now = Date.now();
+  const end = job.status === 'running' ? now : finishedAt(job);
+  const started = job.created_at ? job.created_at * 1000 : jobStarted || now;
+  $('progress').hidden = false;
+  $('bar').style.width = Math.round((job.progress || 0) * 100) + '%';
+  $('stage').textContent = job.stage || '';
+  $('elapsed').textContent = end ? clockCount((end - started) / 1000) : '';
+  const wording = etaWording(job, now);
+  $('eta').hidden = !wording;
+  $('eta').innerHTML = wording ? `${esc(wording.left)}${wording.finish ? `<span>${esc(wording.finish)}</span>` : ''}` : '';
+  $('steps').innerHTML = stepsHtml(job, now);
+  const reason = job.status === 'running' ? '' : (job.error || job.message || '');
+  $('reason').hidden = !reason;
+  $('reason').className = 'notice ' + (job.status === 'failed' ? 'error' : '');
+  $('reason').textContent = reason;
+  renderActions(job);
+}
+
+// Buttons are only redrawn when their state changes: a poll that redrew them would close a
+// half-answered "Cancel this build?" before the person reached it.
+function renderActions(job) {
+  if (!job) return;   // the panel was hidden by a poll while a request was out
+  const key = [job.id, job.status, Boolean(job.plan_saved), cancelAsked, cancelling].join('|');
+  if (key === actionsKey) return;
+  actionsKey = key;
+  let html = '';
+  if (job.status === 'running' && cancelling) {
+    html = '<p>Cancelling… this stops the builder and every program it started.</p>';
+  } else if (job.status === 'running' && cancelAsked) {
+    // Only claim the plan is kept when it is: it is saved once the plan has been written.
+    const kept = job.plan_saved ? ' The lesson plan already written is kept, so trying again is quicker.' : '';
+    html = `<p>Cancel this build? The half-built lesson is deleted.${kept}</p>` +
+           '<button class="btn danger" data-action="cancel-yes">Yes, cancel the build</button>' +
+           '<button class="btn" data-action="cancel-no">Keep building</button>';
+  } else if (job.status === 'running') {
+    html = '<button class="btn danger" data-action="cancel-ask">Cancel build</button>';
+  } else if (job.status === 'failed' || job.status === 'cancelled') {
+    html = `<button class="btn primary" data-action="retry">${job.plan_saved ? 'Try again (reuses the saved plan)' : 'Try again'}</button>` +
+           '<button class="btn" data-action="dismiss">Dismiss</button>';
+  }
+  $('job-actions').innerHTML = html;
+}
+
+async function runAction(action) {
+  if (action === 'cancel-ask' || action === 'cancel-no') {
+    cancelAsked = action === 'cancel-ask';
+    renderActions(lastJob);
+    // the button that was pressed has been replaced: keep keyboard focus on its successor
+    $('job-actions').querySelector(cancelAsked ? '[data-action=cancel-no]' : '[data-action=cancel-ask]')?.focus();
+  } else if (action === 'cancel-yes') {
+    await cancelBuild();
+  } else if (action === 'retry') {
+    await retryBuild();
+  } else if (action === 'dismiss') {
+    hideJob();
+  }
+}
+
+async function cancelBuild() {
+  const jobId = activeJob;
+  cancelAsked = false; cancelling = true; renderActions(lastJob);
+  const result = await call('/api/lessons/cancel', postJson({ job_id: jobId }));
+  cancelling = false;
+  // The build finished (or another was started) while the request was out: that is already on screen.
+  if (activeJob !== jobId) return;
+  if (result.ok) applyJob(result.data);
+  else {
+    if (result.status === 0) showUnreachable(); else notice(failureText(result), 'error');
+    renderActions(lastJob);
+  }
+  $('job-actions').querySelector('button')?.focus();
+}
+
+// A second press while the first request is out would start a second build, which the server then refuses.
+let retrying = false;
+
+async function retryBuild() {
+  if (retrying || !lastJob) return;
+  retrying = true;
+  notice('');
+  const job = lastJob;
+  try {
+    const result = await call('/api/lessons/create', postJson({
+      class_code: job.class_code, start: job.start, end: job.end, voice: job.voice,
+      focus: job.focus || '', minutes: job.minutes ? String(job.minutes) : '' }));
+    if (result.ok) { jobStarted = Date.now(); track(result.data.job_id); }
+    else notice(failureText(result), 'error');
+  } finally {
+    retrying = false;
+  }
+}
+
+// Applies a job as the server reports it. Running builds keep polling; a finished lesson is
+// announced and its progress panel goes away; a failed or cancelled build stays on screen, with
+// its reason, until it is dismissed or another build starts, so it can be tried again.
+function applyJob(job) {
+  hideUnreachable();   // a reply got through, so the dashboard is reachable again
+  lastJob = job;
+  if (job.status === 'running') { showJob(job); return; }
+  clearInterval(jobTimer); jobTimer = null;
+  if (job.status === 'ready') {
+    hideJob();
+    loadLessons().catch(() => {});
+    notice('Lesson ready.', 'good');
+    $('notice').innerHTML = `Lesson ready. <a href="/lesson?id=${encodeURIComponent(job.lesson_id)}">Play it now →</a>`;
+    return;
+  }
+  store('lessonJob', job.id);
+  showJob(job);
+  updateSummary();
+}
+
+function hideJob() {
+  clearInterval(jobTimer); jobTimer = null;
+  activeJob = null; lastJob = null; jobStarted = 0;
+  store('lessonJob', null);
+  hideUnreachable();
   $('progress').hidden = true; updateSummary();
+}
+
+function track(jobId) {
+  store('lessonJob', jobId);
+  activeJob = jobId; cancelAsked = false; cancelling = false; actionsKey = '';
+  jobStarted = jobStarted || Date.now();
+  clearInterval(jobTimer);
+  const tick = async () => {
+    const result = await call('/api/lessons/job?id=' + encodeURIComponent(jobId));
+    if (activeJob !== jobId) return;   // another build was started while this request was out
+    if (!result.ok) {
+      // The record was cleaned up (old builds are removed after a week, or by Free up space): nothing to show.
+      if (result.status === 404) { hideJob(); return; }
+      // A dropped connection is a dashboard that is restarting: the build keeps going, so keep the job.
+      if (result.status === 0) { showUnreachable(); return; }
+      hideJob(); notice(failureText(result), 'error'); return;
+    }
+    applyJob(result.data);
+  };
+  tick(); jobTimer = setInterval(tick, 1500);
+  updateSummary();   // disables Build while the job is being tracked
 }
 
 $('class').onchange = () => { store('lessonClass', $('class').value); fillDates(); };
@@ -203,6 +457,10 @@ $('focus').oninput = () => {
   $('focus-count').textContent = n > 450 ? `${n}/600` : '';
 };
 document.querySelectorAll('[data-quick]').forEach(b => b.onclick = () => quick(b.dataset.quick));
+$('job-actions').onclick = event => {
+  const button = event.target.closest('[data-action]');
+  if (button) runAction(button.dataset.action);
+};
 $('build').onclick = async () => {
   notice('');
   try {
@@ -217,6 +475,7 @@ $('build').onclick = async () => {
 };
 
 (async () => {
+  loadReviewCount();
   try {
     const info = await api('/api/lessons/classes');
     classes = info.classes.filter(c => c.dates.length);
