@@ -22,7 +22,7 @@
     <input id="search" aria-label="Search notes and transcripts" class="search" type="search" autocomplete="off"
            placeholder="Search all notes and transcripts…  (/ to focus)">
   </div>
-  <span class="rec-pill" id="rec-pill" hidden><span class="live-dot" aria-hidden="true"></span>Recording now</span>
+  <span class="rec-pill" id="rec-pill" hidden><span class="live-dot" aria-hidden="true"></span><span class="rec-text">Recording now</span></span>
 </header>
 
 <main id="main" class="notes-view">
@@ -36,7 +36,7 @@ const searchBox = document.getElementById('search');
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtDate = ts => new Date(ts * 1000).toLocaleDateString(undefined, { month:'short', day:'numeric' });
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const plural = (n, word) => `${n} ${n === 1 ? word : word.endsWith('s') ? word + 'es' : word + 's'}`;
 
 let viewVersion = 0;
 async function api(path) {
@@ -85,11 +85,17 @@ function renderSnippet(text, query) {
 // The landing view: every class with its words and the audio recorded for it, the newest class's lectures, and
 // what Jev flagged in its recordings. Clicking a class or a lecture opens its notes.
 
-async function openDashboard() {
+async function openDashboard({ fresh = true } = {}) {
   const version = ++viewVersion;
   state.view = 'dashboard'; state.activeClass = null; state.query = '';
   searchBox.value = '';
 
+  // The page stays open through a lecture, so coming back takes the current numbers (and keeps
+  // the last ones if the dashboard can't be reached).
+  if (fresh) {
+    try { state.classes = await api('/api/classes'); } catch (e) { /* keep the last list */ }
+    if (version !== viewVersion) return;
+  }
   const classes = state.classes;
   const totalWords = classes.reduce((a, c) => a + c.words, 0);
   const totalLectures = classes.reduce((a, c) => a + c.lectures, 0);
@@ -204,7 +210,7 @@ async function openDashboard() {
   }
 
   try {
-    state.sessions = state.sessions || await api('/api/sessions');
+    state.sessions = await api('/api/sessions');
   } catch (e) {
     state.sessions = null;
   }
@@ -261,7 +267,8 @@ async function loadFocus(code, version) {
     const box = boxes.get(t.anchor);
     const note = !jevReady ? 'Notes ready'
       : !box ? 'No recording'
-      : flagged(box) ? plural(flagged(box), 'flagged item') : 'Nothing flagged';
+      : flagged(box) ? plural(flagged(box), 'flagged item')
+      : box.pending.length ? 'Not read yet' : 'Nothing flagged';
     return `<li><button type="button" class="lecture-row" data-class="${esc(code)}" data-anchor="${esc(t.anchor)}">
         <span class="lecture-date">${esc(t.date)}</span><span class="lecture-note">${esc(note)}</span></button></li>`;
   }).join('') : '<li class="panel-note">No lectures in these notes yet.</li>';
@@ -491,14 +498,19 @@ searchBox.addEventListener('input', () => {
 searchBox.addEventListener('keydown', e => { if(e.key === 'Enter') runSearch(); });
 
 async function runSearch() {
-  const version = ++viewVersion;
   const q = searchBox.value.trim();
   state.query = q;
   if (!q) {
-    if (state.activeClass) openClass(state.activeClass, state.kind);
-    else if (state.view !== 'dashboard') openDashboard();
+    // Clearing a search goes back to where it started. On any other view an empty search does
+    // nothing - and must not cancel the view that is still loading.
+    if (state.view === 'search') {
+      if (state.activeClass) openClass(state.activeClass, state.kind);
+      else if (state.classes.length) openDashboard();
+      else showEmpty();
+    }
     return;
   }
+  const version = ++viewVersion;
   state.view = 'search';
   main.innerHTML = '<p class="muted">Searching… The first meaning search also indexes new passages.</p>';
   let hits, ranking = null;
@@ -542,18 +554,31 @@ document.addEventListener('keydown', e => {
 
 // ---------- boot ----------
 
-// "Recording now" in the top bar. Best effort: a slow or failed status check just hides it.
-(async () => {
+// "Recording now" in the top bar: a recording is live (a fresh heartbeat), not just the recorder
+// window being open - the same test the Diagnostics page uses. Best effort: a failed check leaves
+// whatever is showing. Rechecked every 30 s while the tab is visible, since the page stays open.
+async function refreshRecordingPill() {
   try {
     const status = await api('/api/status');
-    document.getElementById('rec-pill').hidden = !(status.recorder && status.recorder.running);
-  } catch (e) { /* keep it hidden */ }
-})();
+    const fresh = status.updated_at && (Date.now() / 1000 - status.updated_at) <= 30;
+    document.getElementById('rec-pill').hidden = !(status.active && fresh);
+  } catch (e) { /* keep what is showing */ }
+}
+refreshRecordingPill();
+setInterval(() => { if (!document.hidden) refreshRecordingPill(); }, 30000);
+
+// No notes at all (a first lecture, or notes that failed to save): the raw recordings are still the
+// way to get the lecture back, so they stay reachable.
+function showEmpty() {
+  main.innerHTML = `<div class="empty">No notes yet — record a lecture first.
+    <div style="margin-top:14px"><button type="button" class="btn" id="empty-recordings">Raw recordings</button></div></div>`;
+  document.getElementById('empty-recordings').onclick = openSessions;
+}
 
 (async () => {
   state.classes = await api('/api/classes');
-  if (state.classes.length) openDashboard();
-  else main.innerHTML = '<div class="empty">No notes yet — record a lecture first.</div>';
+  if (state.classes.length) openDashboard({ fresh: false });
+  else showEmpty();
 })();
 </script>
 </body>
