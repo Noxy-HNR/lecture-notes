@@ -22,31 +22,21 @@
     <input id="search" aria-label="Search notes and transcripts" class="search" type="search" autocomplete="off"
            placeholder="Search all notes and transcripts…  (/ to focus)">
   </div>
+  <span class="rec-pill" id="rec-pill" hidden><span class="live-dot" aria-hidden="true"></span><span class="rec-text">Recording now</span></span>
 </header>
 
-<div class="shell">
-  <aside>
-    <div class="section-label">Classes</div>
-    <div id="class-list"></div>
-    <div class="section-label" style="margin-top:22px">Library</div>
-    <button class="class-card" data-view="sessions">
-      <div class="code">Recordings</div>
-      <div class="title">Raw audio &amp; transcripts</div>
-    </button>
-  </aside>
-
-  <main id="main">
-    <div class="empty">Loading…</div>
-  </main>
-</div>
+<main id="main" class="notes-view">
+  <div class="empty">Loading…</div>
+</main>
 
 <script>
-const state = { classes: [], activeClass: null, kind: 'notes', view: 'class', query: '' };
+const state = { classes: [], sessions: null, activeClass: null, kind: 'notes', view: 'dashboard', query: '' };
 const main = document.getElementById('main');
 const searchBox = document.getElementById('search');
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtDate = ts => new Date(ts * 1000).toLocaleDateString(undefined, { month:'short', day:'numeric' });
+const plural = (n, word) => `${n} ${n === 1 ? word : word.endsWith('s') ? word + 'es' : word + 's'}`;
 
 let viewVersion = 0;
 async function api(path) {
@@ -91,30 +81,246 @@ function renderSnippet(text, query) {
     .replaceAll(S.m0, '<mark>').replaceAll(S.m1, '</mark>');
 }
 
-// ---------- sidebar ----------
+// ---------- dashboard ----------
+// The landing view: every class with its words and the audio recorded for it, the newest class's lectures, and
+// what Jev flagged in its recordings. Clicking a class or a lecture opens its notes.
 
-function renderSidebar() {
-  const list = document.getElementById('class-list');
-  list.innerHTML = state.classes.map(c => `
-    <button class="class-card ${state.view === 'class' && state.activeClass === c.code ? 'active' : ''}"
-            data-class="${esc(c.code)}">
-      <div class="code">${esc(c.code)}</div>
-      <div class="title">${esc(c.title)}</div>
-      <div class="meta">${c.lectures} lecture${c.lectures === 1 ? '' : 's'} ·
-        ${c.words.toLocaleString()} words · ${fmtDate(c.updated)}</div>
-    </button>`).join('');
-  list.querySelectorAll('[data-class]').forEach(el =>
-    el.onclick = () => openClass(el.dataset.class));
-  document.querySelector('[data-view="sessions"]').onclick = openSessions;
+async function openDashboard({ fresh = true } = {}) {
+  const version = ++viewVersion;
+  state.view = 'dashboard'; state.activeClass = null; state.query = '';
+  searchBox.value = '';
+
+  // The page stays open through a lecture, so coming back takes the current numbers (and keeps
+  // the last ones if the dashboard can't be reached).
+  if (fresh) {
+    try { state.classes = await api('/api/classes'); } catch (e) { /* keep the last list */ }
+    if (version !== viewVersion) return;
+  }
+  const classes = state.classes;
+  const totalWords = classes.reduce((a, c) => a + c.words, 0);
+  const totalLectures = classes.reduce((a, c) => a + c.lectures, 0);
+  const largest = classes.reduce((a, c) => (!a || c.words > a.words ? c : a), null);
+  const newest = classes.reduce((a, c) => (!a || c.updated > a.updated ? c : a), null);
+  const byWords = [...classes].sort((a, b) => b.words - a.words);
+
+  const rows = byWords.map(c => {
+    return `
+      <tr>
+        <th scope="row">
+          <button type="button" class="row-link" data-class="${esc(c.code)}">${esc(c.code)}</button>
+          <div class="row-title">${esc(c.title)}</div>
+        </th>
+        <td class="num">${c.lectures}</td>
+        <td class="num">${c.words.toLocaleString()}</td>
+        <td class="recorded" data-recorded="${esc(c.code)}"><span class="muted-cell">Loading…</span></td>
+        <td class="muted-cell">${fmtDate(c.updated)}</td>
+      </tr>`;
+  }).join('');
+
+  main.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="eyebrow">Dashboard</div>
+        <h1 class="page-title">Lecture notes</h1>
+        <p class="page-sub">${plural(classes.length, 'class')}, ${totalWords.toLocaleString()} words. ${plural(totalLectures, 'lecture')} in all.</p>
+      </div>
+      <div class="page-actions">
+        <button type="button" class="btn" id="open-recordings">Recordings</button>
+      </div>
+    </div>
+
+    <section class="stat-grid" aria-label="Summary">
+      <div class="stat">
+        <div class="stat-label">Classes</div>
+        <div class="stat-value">${classes.length}</div>
+        <div class="stat-sub">${esc(classes.map(c => c.code).join(', ')) || 'None yet'}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Words in notes</div>
+        <div class="stat-value">${totalWords.toLocaleString()}</div>
+        <div class="stat-sub">${largest ? `Largest: ${esc(largest.code)}, ${largest.words.toLocaleString()}` : 'No notes yet'}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Lectures</div>
+        <div class="stat-value">${totalLectures}</div>
+        <div class="stat-sub">${newest ? `Newest class: ${esc(newest.code)}, ${fmtDate(newest.updated)}` : ''}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Recordings</div>
+        <div class="stat-value" id="stat-recordings">…</div>
+        <div class="stat-sub" id="stat-recordings-sub">Raw audio and transcripts</div>
+      </div>
+    </section>
+
+    <div class="dash-grid">
+      <section class="panel" aria-labelledby="classes-title">
+        <div class="panel-head">
+          <h2 class="label-caps" id="classes-title">Classes</h2>
+          <span class="panel-meta">Sorted by words</span>
+        </div>
+        <div class="table-wrap">
+          <table class="class-table">
+            <thead>
+              <tr>
+                <th scope="col">Class</th>
+                <th scope="col" class="num">Lectures</th>
+                <th scope="col" class="num">Words</th>
+                <th scope="col">Audio recorded</th>
+                <th scope="col">Updated</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="dash-side">
+        <section class="panel" aria-labelledby="lectures-title">
+          <div class="panel-head">
+            <h2 class="label-caps" id="lectures-title">Lectures</h2>
+            <span class="panel-meta" id="lectures-meta"></span>
+          </div>
+          <ol class="lecture-list" id="lecture-list"><li class="panel-meta">Loading…</li></ol>
+        </section>
+
+        <section class="panel" aria-labelledby="highlights-title">
+          <div class="panel-head">
+            <h2 class="label-caps" id="highlights-title">Flagged in the recording</h2>
+          </div>
+          <div id="recording-panel"><p class="panel-note">Loading…</p></div>
+        </section>
+      </div>
+    </div>
+
+    <section class="panel latest-notes" id="latest-notes" aria-labelledby="latest-title" hidden>
+      <div class="panel-head">
+        <h2 class="label-caps" id="latest-title"></h2>
+        <button type="button" class="btn btn-sm" id="open-latest">Open notes</button>
+      </div>
+      <div class="latest-body" id="latest-body"></div>
+    </section>`;
+
+  document.getElementById('open-recordings').onclick = openSessions;
+  main.querySelectorAll('.row-link').forEach(b => b.onclick = () => openClass(b.dataset.class));
+
+  if (newest) loadFocus(newest.code, version);
+  else {
+    document.getElementById('lecture-list').innerHTML = '<li class="panel-meta">No lectures yet.</li>';
+    document.getElementById('recording-panel').innerHTML = '<p class="panel-note">Record a lecture to see what Jev flags.</p>';
+  }
+
+  try {
+    state.sessions = await api('/api/sessions');
+  } catch (e) {
+    state.sessions = null;
+  }
+  if (version !== viewVersion) return;
+  const sessions = state.sessions || [];
+  const total = sessions.reduce((a, s) => a + s.mb, 0);
+  document.getElementById('stat-recordings').textContent = state.sessions ? sessions.length : '—';
+  document.getElementById('stat-recordings-sub').textContent = state.sessions
+    ? `${(total / 1000).toFixed(1)} GB of audio backups` : 'Could not load recordings';
+  fillRecorded();
+}
+
+// Audio recorded per class, from the same session list as the Recordings count.
+function fillRecorded() {
+  for (const cell of main.querySelectorAll('[data-recorded]')) {
+    const sessions = state.sessions;
+    if (!sessions) { cell.innerHTML = '<span class="muted-cell">Unavailable</span>'; continue; }
+    const mine = sessions.filter(s => s.class_code === cell.dataset.recorded);
+    if (!mine.length) { cell.innerHTML = '<span class="muted-cell">Not recorded</span>'; continue; }
+    const minutes = mine.reduce((a, s) => a + s.minutes, 0);
+    const amount = minutes >= 60 ? `${(minutes / 60).toFixed(1)} h` : `${Math.round(minutes)} min`;
+    cell.innerHTML = `<div class="recorded-amount">${amount}</div><div class="row-title">${plural(mine.length, 'session')}</div>`;
+  }
+}
+
+// The lectures and flagged items for one class, shown on the dashboard.
+async function loadFocus(code, version) {
+  const lectureList = document.getElementById('lecture-list');
+  const recPanel = document.getElementById('recording-panel');
+  const meta = document.getElementById('lectures-meta');
+  meta.textContent = code;
+
+  let doc, hl = null;
+  try {
+    [doc, hl] = await Promise.all([
+      api(`/api/document?class=${encodeURIComponent(code)}&kind=notes`),
+      api(`/api/highlights?class=${encodeURIComponent(code)}`).catch(() => null),
+    ]);
+  } catch (e) {
+    if (version !== viewVersion) return;
+    lectureList.innerHTML = `<li class="panel-note">${esc(e.message)}</li>`;
+    return;
+  }
+  if (version !== viewVersion) return;
+
+  const toc = doc.toc || [];
+  renderLatestNotes(code, doc, toc);
+  const boxes = new Map((hl?.lectures || []).map(box => [box.anchor, box]));
+  const jevReady = !!(hl && hl.jev && hl.jev.ready);
+  const flagged = box => box ? box.exam.length + box.announcement.length + box.not_tested.length : 0;
+
+  meta.textContent = `${code} · ${plural(toc.length, 'lecture')}`;
+  lectureList.innerHTML = toc.length ? toc.map(t => {
+    const box = boxes.get(t.anchor);
+    const note = !jevReady ? 'Notes ready'
+      : !box ? 'No recording'
+      : flagged(box) ? plural(flagged(box), 'flagged item')
+      : box.pending.length ? 'Not read yet' : 'Nothing flagged';
+    return `<li><button type="button" class="lecture-row" data-class="${esc(code)}" data-anchor="${esc(t.anchor)}">
+        <span class="lecture-date">${esc(t.date)}</span><span class="lecture-note">${esc(note)}</span></button></li>`;
+  }).join('') : '<li class="panel-note">No lectures in these notes yet.</li>';
+  lectureList.querySelectorAll('.lecture-row').forEach(b =>
+    b.onclick = () => openClass(b.dataset.class, 'notes', b.dataset.anchor));
+
+  if (!jevReady) {
+    recPanel.innerHTML = '<p class="panel-note">Highlights come from Jev, which is off or has no key. Lecture notes are unaffected.</p>';
+    return;
+  }
+  // The newest lecture that has anything flagged (or is still being read).
+  const latest = [...toc].reverse().find(t => {
+    const box = boxes.get(t.anchor);
+    return box && (flagged(box) || box.pending.length);
+  });
+  if (!latest) {
+    recPanel.innerHTML = '<p class="panel-note">Nothing flagged in this class\'s recordings yet.</p>';
+    return;
+  }
+  const box = boxes.get(latest.anchor);
+  recPanel.innerHTML = `<p class="panel-note" style="margin-bottom:4px">${esc(latest.date)}</p>${highlightBox(box)}`;
+  wireHighlights(recPanel);
+}
+
+// The opening of the newest lecture that has notes, so the dashboard shows what was written, not just a date.
+function renderLatestNotes(code, doc, toc) {
+  const panel = document.getElementById('latest-notes');
+  if (!toc.length || !doc.html) { panel.hidden = true; return; }
+  const template = document.createElement('template');
+  template.innerHTML = doc.html;
+  for (const item of [...toc].reverse()) {
+    const heading = template.content.getElementById(item.anchor);
+    const blocks = [];
+    for (let node = heading?.nextElementSibling; node && node.tagName !== 'H2' && blocks.length < 4; node = node.nextElementSibling) {
+      blocks.push(node.cloneNode(true));
+    }
+    if (!blocks.length) continue;
+    document.getElementById('latest-body').replaceChildren(...blocks);
+    document.getElementById('latest-title').textContent = `Latest notes · ${code} · ${item.date}`;
+    document.getElementById('open-latest').onclick = () => openClass(code, 'notes', item.anchor);
+    panel.hidden = false;
+    return;
+  }
+  panel.hidden = true;
 }
 
 // ---------- class document ----------
 
-async function openClass(code, kind = 'notes') {
+async function openClass(code, kind = 'notes', anchor = null) {
   const version = ++viewVersion;
   state.activeClass = code; state.kind = kind; state.view = 'class';
   searchBox.value = ''; state.query = '';
-  renderSidebar();
   main.innerHTML = '<div class="empty">Loading…</div>';
 
   const cls = state.classes.find(c => c.code === code) || {};
@@ -151,12 +357,14 @@ async function openClass(code, kind = 'notes') {
   }
 
   main.innerHTML = `
+    <button type="button" class="back-link" id="back-link">← All classes</button>
     <h1 class="page-title">${esc(cls.title || code)}</h1>
-    <div class="page-sub">${esc(code)} · ${cls.lectures || 0} lecture${cls.lectures === 1 ? '' : 's'}${
+    <div class="page-sub">${esc(code)} · ${plural(cls.lectures || 0, 'lecture')}${
       doc.words ? ` · ${doc.words.toLocaleString()} words` : ''}</div>
     <div style="margin-bottom:22px">${tabs}</div>
     ${body}`;
 
+  document.getElementById('back-link').onclick = openDashboard;
   main.querySelectorAll('#kind-tabs button').forEach(b =>
     b.onclick = () => !b.disabled && openClass(code, b.dataset.kind));
   if (kind === 'notes' && !doc.error) loadHighlights(code, version);
@@ -166,6 +374,7 @@ async function openClass(code, kind = 'notes') {
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); card.click(); }
     };
   });
+  if (anchor) document.getElementById(anchor)?.scrollIntoView({ block: 'start' });
 }
 
 // ---------- lecture highlights (Jev) ----------
@@ -205,6 +414,23 @@ function highlightBox(box) {
   </section>`;
 }
 
+// Makes the play buttons and the click-to-expand passages inside `root` work.
+function wireHighlights(root) {
+  root.querySelectorAll('.hl-play').forEach(button => button.onclick = () => {
+    const item = button.closest('.hl-item');
+    const open = item.querySelector('audio');
+    if (open) { open.remove(); return; }
+    root.querySelectorAll('.hl-item audio').forEach(a => a.remove());
+    item.insertAdjacentHTML('beforeend', `<audio controls autoplay preload="auto" aria-label="Lecture recording"
+      src="/api/audio?file=${encodeURIComponent(button.dataset.file)}#t=${Math.max(0, Number(button.dataset.start)).toFixed(2)}"></audio>`);
+  });
+  root.querySelectorAll('.hl-text').forEach(text => {
+    const toggle = () => text.classList.toggle('open');
+    text.onclick = toggle;
+    text.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } };
+  });
+}
+
 async function loadHighlights(code, version) {
   let data;
   try { data = await api(`/api/highlights?class=${encodeURIComponent(code)}`); } catch { return; }
@@ -214,19 +440,7 @@ async function loadHighlights(code, version) {
     const html = highlightBox(box);
     if (heading && html) heading.insertAdjacentHTML('afterend', html);
   }
-  main.querySelectorAll('.hl-play').forEach(button => button.onclick = () => {
-    const item = button.closest('.hl-item');
-    const open = item.querySelector('audio');
-    if (open) { open.remove(); return; }
-    main.querySelectorAll('.hl-item audio').forEach(a => a.remove());
-    item.insertAdjacentHTML('beforeend', `<audio controls autoplay preload="auto" aria-label="Lecture recording"
-      src="/api/audio?file=${encodeURIComponent(button.dataset.file)}#t=${Math.max(0, Number(button.dataset.start)).toFixed(2)}"></audio>`);
-  });
-  main.querySelectorAll('.hl-text').forEach(text => {
-    const toggle = () => text.classList.toggle('open');
-    text.onclick = toggle;
-    text.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } };
-  });
+  wireHighlights(main);
   // Still reading a lecture: look again shortly, as long as this class is still on screen.
   if ((data.lectures || []).some(box => box.pending.some(p => p !== 'recording'))) refreshHighlightsLater(code, version);
 }
@@ -247,16 +461,15 @@ async function openSessions() {
   const version = ++viewVersion;
   state.view = 'sessions'; state.activeClass = null;
   searchBox.value = ''; state.query = '';
-  renderSidebar();
-  document.querySelector('[data-view="sessions"]').classList.add('active');
   main.innerHTML = '<div class="empty">Loading…</div>';
 
-  const sessions = await api('/api/sessions');
+  const sessions = state.sessions = await api('/api/sessions');
   if (version !== viewVersion) return;
   const total = sessions.reduce((a, s) => a + s.mb, 0);
   main.innerHTML = `
+    <button type="button" class="back-link" id="back-link">← All classes</button>
     <h1 class="page-title">Recordings</h1>
-    <div class="page-sub">${sessions.length} sessions · ${(total/1000).toFixed(1)} GB of audio backups</div>
+    <div class="page-sub">${plural(sessions.length, 'session')} · ${(total/1000).toFixed(1)} GB of audio backups</div>
     ${sessions.length ? sessions.map(s => `
       <div class="hit">
         <div class="hit-meta">
@@ -270,6 +483,7 @@ async function openSessions() {
         ${player(s.wav)}
         <a class="btn" href="/corrections?session=${encodeURIComponent(s.wav.replace(/\.wav$/,''))}">Correct this lecture</a>
       </div>`).join('') : '<div class="empty">No recordings yet.</div>'}`;
+  document.getElementById('back-link').onclick = openDashboard;
 }
 
 // ---------- search ----------
@@ -284,10 +498,19 @@ searchBox.addEventListener('input', () => {
 searchBox.addEventListener('keydown', e => { if(e.key === 'Enter') runSearch(); });
 
 async function runSearch() {
-  const version = ++viewVersion;
   const q = searchBox.value.trim();
   state.query = q;
-  if (!q) { if (state.activeClass) openClass(state.activeClass, state.kind); return; }
+  if (!q) {
+    // Clearing a search goes back to where it started. On any other view an empty search does
+    // nothing - and must not cancel the view that is still loading.
+    if (state.view === 'search') {
+      if (state.activeClass) openClass(state.activeClass, state.kind);
+      else if (state.classes.length) openDashboard();
+      else showEmpty();
+    }
+    return;
+  }
+  const version = ++viewVersion;
   state.view = 'search';
   main.innerHTML = '<p class="muted">Searching… The first meaning search also indexes new passages.</p>';
   let hits, ranking = null;
@@ -331,11 +554,31 @@ document.addEventListener('keydown', e => {
 
 // ---------- boot ----------
 
+// "Recording now" in the top bar: a recording is live (a fresh heartbeat), not just the recorder
+// window being open - the same test the Diagnostics page uses. Best effort: a failed check leaves
+// whatever is showing. Rechecked every 30 s while the tab is visible, since the page stays open.
+async function refreshRecordingPill() {
+  try {
+    const status = await api('/api/status');
+    const fresh = status.updated_at && (Date.now() / 1000 - status.updated_at) <= 30;
+    document.getElementById('rec-pill').hidden = !(status.active && fresh);
+  } catch (e) { /* keep what is showing */ }
+}
+refreshRecordingPill();
+setInterval(() => { if (!document.hidden) refreshRecordingPill(); }, 30000);
+
+// No notes at all (a first lecture, or notes that failed to save): the raw recordings are still the
+// way to get the lecture back, so they stay reachable.
+function showEmpty() {
+  main.innerHTML = `<div class="empty">No notes yet — record a lecture first.
+    <div style="margin-top:14px"><button type="button" class="btn" id="empty-recordings">Raw recordings</button></div></div>`;
+  document.getElementById('empty-recordings').onclick = openSessions;
+}
+
 (async () => {
   state.classes = await api('/api/classes');
-  renderSidebar();
-  if (state.classes.length) openClass(state.classes[0].code);
-  else main.innerHTML = '<div class="empty">No notes yet — record a lecture first.</div>';
+  if (state.classes.length) openDashboard({ fresh: false });
+  else showEmpty();
 })();
 </script>
 </body>

@@ -57,6 +57,7 @@ import gpu_formatter
 import soundfile as sf
 import console_colors as c
 import keep_awake
+import lid_watch
 import mic_mute
 import telemetry as telemetry_module
 
@@ -1495,6 +1496,19 @@ def run():
     stop_request = StopRequest(save_listener.requested)  # wakes collection, keeping its partial audio
     stop_requested = stop_request.requested
     previous_sigint = signal.signal(signal.SIGINT, stop_request.handle)
+    # Closing the lid ends the lecture the same way Ctrl+C does: stop, transcribe what's left, save.
+    # The sleep block (keep_awake) stays on until the whole save is done, so a lid-close can't
+    # freeze the laptop halfway through writing the notes. Lessons being built are separate
+    # processes with their own sleep block, so they keep going.
+    def _lid_closed():
+        message = "Laptop lid closed - stopping the recording and saving your notes"
+        print(c.warning("\n" + message))
+        tel.add_event("warning", message)
+        stop_request.handle(None, None)
+
+    lid = lid_watch.LidWatcher(_lid_closed)
+    if lid.start():
+        tel.add_event("info", "Lid watch on: closing the lid will stop the recording and save the notes")
     silent_seconds = 0.0
     dropout = DropoutMonitor(audio.SAMPLE_RATE,
                              muted_check=getattr(mic_mute, "is_muted", None) if source == "mic" else None)
@@ -1586,7 +1600,7 @@ def run():
             def _step(msg):
                 print(c.heading(f"[{time.time() - shutdown_start:5.1f}s] ") + c.info(msg))
 
-            keep_awake.allow_sleep()
+            lid.stop()
             save_listener.stop()
 
             _step("Stopping audio capture...")
@@ -1672,7 +1686,8 @@ def run():
             # Job Object is the backstop if the console is closed too abruptly for
             # this finally block or Python's atexit handlers to run.
             gpu_formatter.stop_server()
-            keep_awake.allow_sleep()
+            lid.stop()
+            keep_awake.allow_sleep()  # only now: a lid-close during the save must not suspend it
             tel.end_session()
             signal.signal(signal.SIGINT, previous_sigint)
             stop_request.close()

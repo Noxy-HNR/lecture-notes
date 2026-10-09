@@ -3,40 +3,45 @@
    prefers-color-scheme so it isn't jarring in a bright room. */
 
 :root {
-  --bg: #0d1519;
-  --bg-raised: #142127;
-  --bg-inset: #101b20;
-  --border: #283a43;
-  --border-strong: #3a515c;
-  --text: #edf4f4;
-  --text-dim: #a6b9c1;
-  --text-faint: #8a9fa9;
-  --accent: #79d9bb;
-  --accent-dim: #214c43;
-  --good: #4ade80;
-  --warn: #fbbf24;
-  --bad: #f87171;
-  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  /* Assistant design tokens (web/src/index.css). Dark is the only palette the design system has;
+     the light block below stays for people who prefer it. */
+  --bg: #1f1e1d;
+  --bg-raised: #2a2826;
+  --bg-inset: #181716;
+  --border: #3a3835;
+  --border-strong: #4d4a46;
+  --text: #ece9e4;
+  --text-dim: #d8d3cc;
+  --text-faint: #a39e96;
+  --accent: #d97757;
+  --accent-dim: #d9775729;
+  --accent-ink: #1b1412;
+  --good: #7fb77e;
+  --warn: #d9a441;
+  --bad: #e07070;
+  --mono: ui-monospace, "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, "Segoe UI Variable", "Segoe UI", sans-serif;
   --radius: 10px;
   --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.18);
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f7f9;
+    /* Light version of the Assistant palette, from the canvas light artboards (ivory ground, clay accent). */
+    --bg: #faf9f5;
     --bg-raised: #ffffff;
-    --bg-inset: #f0f2f5;
-    --border: #e3e7ed;
-    --border-strong: #cfd6e0;
-    --text: #16191f;
-    --text-dim: #566072;
-    --text-faint: #647482;
-    --accent: #08765f;
-    --accent-dim: #d9f1e8;
-    --good: #16a34a;
-    --warn: #b45309;
-    --bad: #dc2626;
+    --bg-inset: #f1efe9;
+    --border: #e4e0d6;
+    --border-strong: #c9c4b8;
+    --text: #1f1e1d;
+    --text-dim: #3d3a36;
+    --text-faint: #6b665e;
+    --accent: #a84f2f;
+    --accent-dim: #c4623f1f;
+    --accent-ink: #ffffff;
+    --good: #2f6f2e;
+    --warn: #8a5a12;
+    --bad: #b42318;
     --shadow: 0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.06);
   }
 }
@@ -469,3 +474,75 @@ audio { border-radius:12px; max-width:100%; }
 
 /* Corrections: segments Jev thinks contain a mis-heard word. */
 .correction-main .segment .flag { color: var(--warn); font-weight: 600; }
+
+/* ---------- dashboard: the landing page of "/", on the Assistant tokens ----------
+   Rules are scoped to .notes-view (the page's <main>) so the other pages that share this
+   stylesheet keep their own .panel, .stat and .back-link. Only the two re-themed controls
+   below are global. */
+
+nav.tabs a.active { color: var(--text); background: var(--bg-raised); box-shadow: inset 0 0 0 1px var(--border-strong); }
+.btn.primary { color: var(--accent-ink); }
+
+.rec-pill { display: inline-flex; align-items: center; gap: 8px; height: 28px; padding: 0 11px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border)); background: var(--accent-dim);
+  color: var(--text); font-size: 12px; font-weight: 500; white-space: nowrap; }
+.rec-pill[hidden] { display: none; }
+.rec-pill .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+/* In a half-width window the search box is the casualty: keep the dot, and the words for screen readers only. */
+@media (max-width: 1100px) {
+  .rec-pill { padding: 0 10px; gap: 0; }
+  .rec-pill .rec-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+}
+
+.notes-view .page-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px 16px; margin-bottom: 22px; }
+.notes-view .page-head .page-sub { margin-bottom: 0; }
+.notes-view .page-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.notes-view .back-link { background: none; border: 0; padding: 4px 0; margin-bottom: 10px; color: var(--text-faint); font: inherit; font-size: 13px; cursor: pointer; }
+.notes-view .back-link:hover { color: var(--text); }
+
+.notes-view .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 22px; }
+.notes-view .stat { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; min-width: 0; }
+.notes-view .stat-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em; font-weight: 600; color: var(--text-faint); }
+.notes-view .stat-value { font-size: 22px; font-weight: 600; letter-spacing: -.01em; margin-top: 6px; color: var(--text); font-variant-numeric: tabular-nums; }
+.notes-view .stat-sub { font-size: 12.5px; color: var(--text-faint); margin-top: 2px; overflow-wrap: anywhere; }
+
+.notes-view .dash-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+@media (max-width: 1100px) { .notes-view .dash-grid { grid-template-columns: minmax(0, 1fr); } }
+.notes-view .dash-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.notes-view .panel { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; min-width: 0; }
+.notes-view .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; margin-bottom: 6px; }
+.notes-view .label-caps { margin: 0; font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-faint); }
+.notes-view .panel-meta, .notes-view .panel-note { font-size: 12.5px; color: var(--text-faint); margin: 0; line-height: 1.5; }
+.notes-view .table-wrap { overflow-x: auto; padding: 5px; margin: -5px; }
+.notes-view .class-table { width: 100%; min-width: 540px; border-collapse: collapse; font-size: 13.5px; }
+.notes-view .class-table th, .notes-view .class-table td { padding: 12px 8px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+.notes-view .class-table th:first-child, .notes-view .class-table td:first-child { padding-left: 0; }
+.notes-view .class-table thead th { padding-top: 6px; font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-faint); }
+.notes-view .class-table tbody th { font-weight: 400; }
+.notes-view .class-table tbody tr:last-child th, .notes-view .class-table tbody tr:last-child td { border-bottom: 0; }
+.notes-view .class-table tbody tr:hover th, .notes-view .class-table tbody tr:hover td { background: var(--bg-inset); }
+.notes-view .class-table .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+.notes-view .row-link { background: none; border: 0; padding: 0; font: inherit; font-size: 14px; font-weight: 600; color: var(--text); text-align: left; cursor: pointer; }
+.notes-view .row-link:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.notes-view .row-title { font-size: 12.5px; color: var(--text-faint); margin-top: 2px; }
+.notes-view .muted-cell { color: var(--text-faint); white-space: nowrap; font-size: 12.5px; }
+.notes-view .recorded { white-space: nowrap; }
+.notes-view .recorded-amount { font-size: 14px; font-weight: 550; color: var(--text); font-variant-numeric: tabular-nums; }
+
+.notes-view .lecture-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.notes-view .lecture-list li { border-top: 1px solid var(--border); }
+.notes-view .lecture-list li:first-child { border-top: 0; }
+.notes-view .lecture-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: baseline; width: 100%; padding: 11px 0; background: none; border: 0; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.notes-view .lecture-row:hover .lecture-date { color: var(--accent); }
+.notes-view .lecture-date { font-size: 13.5px; font-weight: 550; }
+.notes-view .lecture-note { font-size: 12px; color: var(--text-faint); white-space: nowrap; }
+.notes-view #recording-panel .highlights { margin: 6px 0 0; }
+.notes-view #recording-panel .panel-note { margin-bottom: 4px; }
+
+.notes-view .latest-notes { margin-top: 16px; }
+.notes-view .latest-notes[hidden] { display: none; }
+.notes-view .latest-body { margin-top: 10px; max-height: 280px; overflow: hidden; font-size: 14px; line-height: 1.7; color: var(--text-dim);
+  -webkit-mask-image: linear-gradient(#000 60%, transparent); mask-image: linear-gradient(#000 60%, transparent); overflow-wrap: anywhere; }
+.notes-view .latest-body h3 { font-size: 15px; color: var(--text); margin: 6px 0 4px; }
+.notes-view .latest-body p { margin: 8px 0; }
+.notes-view .latest-body ul { margin: 8px 0; padding-left: 20px; }

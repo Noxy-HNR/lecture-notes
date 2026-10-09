@@ -6,6 +6,65 @@
 <title>Diagnostics · Lecture Notes</title>
 <link rel="stylesheet" href="/style.css">
 <script src="/stop.js" defer></script>
+<style>
+/* System health and Free up space. Only these cards use these classes; style.css is shared, so
+   the look is built from its variables here. */
+[hidden] { display: none !important; }
+.hc-card { min-width: 0; padding: 20px 22px; background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow); }
+.hc-head { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px 18px; margin-bottom: 14px; }
+.hc-head > div { min-width: 0; max-width: 680px; }
+.hc-title { margin: 0 0 4px; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+.hc-muted { margin: 0; color: var(--text-dim); font-size: 13px; }
+.hc-ok { margin: 0; color: var(--good); font-weight: 600; }
+.hc-problems { margin: 0 0 14px; }
+.hc-problems ul { margin: 0; padding: 12px 14px 12px 32px; background: var(--bg-inset); border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border)); border-radius: 10px; }
+.hc-problems li { margin: 3px 0; overflow-wrap: anywhere; }
+.hc-rows { border-top: 1px solid var(--border); }
+.hc-row { display: grid; grid-template-columns: minmax(150px, 190px) minmax(0, 1fr); gap: 6px 22px; align-items: start;
+  padding: 13px 0; border-bottom: 1px solid var(--border); }
+.hc-label { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 14px; font-weight: 560; min-width: 0; }
+.hc-value { min-width: 0; font-size: 14px; overflow-wrap: anywhere; }
+.hc-value .hc-muted { margin-top: 3px; }
+.hc-bar { max-width: 420px; height: 8px; margin-top: 9px; overflow: hidden; background: var(--bg-inset); border: 1px solid var(--border); border-radius: 99px; }
+.hc-bar > div { height: 100%; width: 0; background: var(--good); border-radius: 99px; transition: width .4s ease; }
+.hc-bar > div.warn { background: var(--warn); }
+.hc-bar > div.bad { background: var(--bad); }
+.hc-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-top: 10px; }
+.hc-status { min-height: 1.2em; margin: 0; font-size: 13px; color: var(--text-dim); overflow-wrap: anywhere; }
+.hc-status.good { color: var(--good); }
+.hc-status.bad { color: var(--bad); }
+.hc-spin { display: inline-block; width: 12px; height: 12px; margin-right: 7px; vertical-align: -1px; border: 2px solid var(--border-strong);
+  border-top-color: var(--accent); border-radius: 50%; animation: hc-spin .8s linear infinite; }
+@keyframes hc-spin { to { transform: rotate(360deg); } }
+.hc-group { min-width: 0; margin: 18px 0 0; padding: 0; border: 0; }
+.hc-group legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; }
+.hc-group legend span { font-weight: 500; }
+.hc-hint { margin: 0 0 4px; font-size: 12.5px; }
+.hc-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 4px 12px; padding: 10px 2px; border-top: 1px solid var(--border); cursor: pointer; }
+.hc-item input { margin-top: 4px; }
+.hc-name { display: block; font-size: 14px; overflow-wrap: anywhere; }
+.hc-detail { display: block; font-size: 12.5px; color: var(--text-dim); overflow-wrap: anywhere; }
+.hc-why { display: block; font-size: 12.5px; color: var(--warn); overflow-wrap: anywhere; }
+.hc-size { font-size: 13px; color: var(--text-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.hc-foot { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 16px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.hc-foot .btn { flex: 0 1 auto; }
+.hc-report { margin-top: 12px; }
+.hc-report p { margin: 0 0 6px; font-size: 13.5px; }
+.hc-report ul { margin: 0 0 8px; padding-left: 20px; font-size: 13px; color: var(--text-dim); }
+.hc-dialog { width: min(460px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 22px 24px; color: var(--text);
+  background: var(--bg-raised); border: 1px solid var(--border-strong); border-radius: var(--radius); box-shadow: var(--shadow); }
+.hc-dialog::backdrop { background: color-mix(in srgb, var(--bg) 70%, transparent); }
+.hc-dialog h3 { margin: 0 0 10px; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.hc-dialog p { margin: 0 0 8px; font-size: 14px; }
+.hc-dialog ul { max-height: 180px; margin: 6px 0 0; padding-left: 20px; overflow-y: auto; font-size: 14px; overflow-wrap: anywhere; }
+.hc-dialog .hc-foot { margin-top: 18px; padding-top: 0; border-top: 0; }
+@media (max-width: 640px) {
+  .hc-card { padding: 16px; }
+  .hc-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .hc-foot .btn { flex: 1 1 140px; }
+}
+</style>
 </head>
 <body>
 
@@ -56,6 +115,92 @@
       <div id="services" style="display:flex;gap:8px;flex-wrap:wrap"></div>
     </div>
 
+    <div>
+      <div class="section-label">System health</div>
+      <section class="hc-card" aria-labelledby="hc-title">
+        <div class="hc-head">
+          <div>
+            <h2 class="hc-title" id="hc-title">Can lessons and recordings run?</h2>
+            <p class="hc-muted" id="hc-when" role="status">Checking…</p>
+          </div>
+        </div>
+        <div class="hc-problems" id="hc-problems"></div>
+        <div class="hc-rows" id="hc-rows">
+          <div class="hc-row">
+            <div class="hc-label"><span>Claude</span><span class="chip" id="hc-claude-chip"></span></div>
+            <div class="hc-value">
+              <div id="hc-claude"></div>
+              <div class="hc-muted" id="hc-claude-last"></div>
+              <div class="hc-actions">
+                <button class="btn" id="hc-test" type="button">Test Claude</button>
+                <span class="hc-muted">Asks one short question. Uses a few seconds of Claude.</span>
+              </div>
+              <p class="hc-status" id="hc-test-status" role="status"></p>
+            </div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Memory (RAM)</span><span class="chip" id="hc-ram-chip"></span></div>
+            <div class="hc-value">
+              <div id="hc-ram"></div>
+              <div class="hc-bar" aria-hidden="true"><div id="hc-ram-bar"></div></div>
+            </div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Disk space</span><span class="chip" id="hc-disk-chip"></span></div>
+            <div class="hc-value">
+              <div id="hc-disk"></div>
+              <div class="hc-bar" aria-hidden="true"><div id="hc-disk-bar"></div></div>
+            </div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Recorder</span><span class="chip" id="hc-recorder-chip"></span></div>
+            <div class="hc-value" id="hc-recorder"></div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Lesson builds</span><span class="chip" id="hc-build-chip"></span></div>
+            <div class="hc-value" id="hc-build"></div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Narration</span><span class="chip" id="hc-narration-chip"></span></div>
+            <div class="hc-value" id="hc-narration"></div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Laptop lid</span><span class="chip" id="hc-lid-chip"></span></div>
+            <div class="hc-value" id="hc-lid"></div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Local model server</span><span class="chip" id="hc-llama-chip"></span></div>
+            <div class="hc-value" id="hc-llama"></div>
+          </div>
+          <div class="hc-row">
+            <div class="hc-label"><span>Storage</span><span class="chip" id="hc-storage-chip"></span></div>
+            <div class="hc-value" id="hc-storage"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div>
+      <div class="section-label">Free up space</div>
+      <section class="hc-card" aria-labelledby="fs-title">
+        <div class="hc-head">
+          <div>
+            <h2 class="hc-title" id="fs-title">Leftovers from lesson builds</h2>
+            <p class="hc-muted">Only lessons/ is cleaned up. Notes and recordings are never touched. Deleting is permanent: nothing goes to the Recycle Bin.</p>
+          </div>
+          <button class="btn" id="fs-rescan" type="button">Scan again</button>
+        </div>
+        <p class="hc-muted" id="fs-building" hidden>A lesson build is running, so nothing can be deleted until it finishes. The list below is still current.</p>
+        <p class="hc-status" id="fs-note" role="status"></p>
+        <div id="fs-list"></div>
+        <div class="hc-foot">
+          <span class="hc-muted" id="fs-selected">Nothing selected</span>
+          <button class="btn danger" id="fs-delete" type="button" disabled>Delete selected</button>
+        </div>
+        <div class="hc-report" id="fs-report" role="status"></div>
+      </section>
+    </div>
+
     <div id="jev-panel" hidden>
       <div class="section-label">Jev (TypeSafe)</div>
       <p class="muted" id="jev-summary" style="margin:0 0 10px"></p>
@@ -78,6 +223,15 @@
       </div>
     </div>
   </div>
+<dialog class="hc-dialog" id="fs-confirm" aria-labelledby="fs-confirm-title">
+  <h3 id="fs-confirm-title">Permanently delete?</h3>
+  <p class="hc-muted">This can't be undone. Nothing goes to the Recycle Bin.</p>
+  <div id="fs-confirm-lessons"></div>
+  <div class="hc-foot">
+    <button class="btn" id="fs-cancel" type="button" autofocus>Cancel</button>
+    <button class="btn danger" id="fs-confirm-go" type="button">Delete</button>
+  </div>
+</dialog>
 </main>
 
 <script>
@@ -298,6 +452,407 @@ document.getElementById('jev-toggle').onclick = async e => {
 };
 loadJev();
 setInterval(loadJev, 15000);
+</script>
+<script>
+// System health and Free up space. Its own block, so a mistake here cannot stop the live status
+// above. Every text from the server goes through hcEsc. A dashboard too old to have a route
+// answers 404, and each card then says to restart it instead of breaking.
+(function () {
+  const hcEsc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  const $ = id => document.getElementById(id);
+  const OWN = {'Content-Type': 'application/json', 'X-Notes-Dashboard': '1'};
+  const RESTART = 'Restart the dashboard to turn this on.';
+  const BATCH = 100;                       // the server caps a request body at 20 KB; 100 items fit well inside it
+  const LEVEL = {ok: ['good', 'OK'], low: ['warn', 'Low'], critical: ['bad', 'Critical']};
+  const GROUPS = [
+    ['partial', 'Unfinished lesson builds', 'Work folders left behind by builds that stopped. Safe to delete.'],
+    ['plan', 'Saved lesson plans', 'A retry reuses a recent plan and skips the minutes of writing, so recent plans are kept.'],
+    ['job', 'Build records and logs', 'What past builds did, with their logs.'],
+    ['lesson', 'Finished lessons', 'Never ticked for you. Deleting one also removes its audio, pictures and quiz answers.'],
+  ];
+
+  let healthBusy = false, healthBuilding = false;   // the last health check saw a lesson build running
+  let scanning = false, queuedScan = false, scanned = false, scanBuilding = false, deleting = false, missing = false;
+  let items = new Map();                             // "kind:id" -> item from the last scan
+  let selected = new Set();
+  let pending = [];                                  // the items the open confirm dialog is about
+
+  const keyOf = item => `${item.kind}:${item.id}`;
+  const suggested = item => item.suggested && !item.protected && item.kind !== 'lesson';
+  const chosenItems = () => [...selected].map(key => items.get(key)).filter(item => item && !item.protected);
+
+  function hcSize(bytes) {
+    const n = Number(bytes) || 0;
+    if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(1) + ' GB';
+    if (n >= 10 * 1024 ** 2) return Math.round(n / 1024 ** 2) + ' MB';
+    if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1) + ' MB';
+    if (n >= 1024) return Math.round(n / 1024) + ' KB';
+    return n + ' B';
+  }
+
+  function hcWhen(epoch) {
+    if (!epoch) return '';
+    return new Date(epoch * 1000).toLocaleString([], {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'});
+  }
+
+  function hcAgo(epoch) {
+    const seconds = Date.now() / 1000 - epoch;
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
+    return hcWhen(epoch);
+  }
+
+  // {ok, status, data, missing}. Throws only when the dashboard can't be reached at all. An old dashboard
+  // answers a route it doesn't know with plain text, so "missing" is a 404 that isn't JSON. A JSON 404 is a
+  // real answer (say, a file that has gone) and is shown as the error it is, not as a reason to restart.
+  async function request(url, options) {
+    const response = await fetch(url, options);
+    const isJson = (response.headers.get('Content-Type') || '').includes('json');
+    let data = null;
+    if (isJson) {
+      try { data = await response.json(); } catch { data = null; }
+    }
+    return {ok: response.ok, status: response.status, data, missing: response.status === 404 && !isJson};
+  }
+
+  const failure = (r, fallback) => (r.data && typeof r.data.error === 'string' && r.data.error) || fallback;
+  // Server messages are usually whole sentences; one without its full stop gets one before more text follows.
+  const sentence = text => (/[.!?]$/.test(text) ? text : `${text}.`);
+
+  function show(valueId, chipId, text, state, chipText) {
+    $(valueId).textContent = text;
+    const chip = $(chipId);
+    chip.className = 'chip' + (state ? ' ' + state : '');
+    chip.textContent = chipText || '';
+    chip.hidden = !chipText;
+  }
+
+  function bar(id, percent, state) {
+    const fill = $(id);
+    fill.style.width = Math.max(0, Math.min(100, percent)) + '%';
+    fill.className = state === 'good' ? '' : state;
+  }
+
+  // One health row. A section that failed or is missing says so in its own row.
+  function row(h, name, valueId, chipId, describe) {
+    const section = h[name];
+    if (!section) return show(valueId, chipId, 'Not reported by this dashboard', '', '');
+    if (section.error) return show(valueId, chipId, `Couldn't check: ${section.error}`, 'bad', 'Error');
+    describe(section);
+  }
+
+  function renderProblems(list) {
+    $('hc-problems').innerHTML = list && list.length
+      ? `<ul>${list.map(problem => `<li>${hcEsc(problem)}</li>`).join('')}</ul>`
+      : '<p class="hc-ok">Everything looks fine.</p>';
+  }
+
+  function renderHealth(h) {
+    renderProblems(h.problems);
+    $('hc-when').textContent = h.checked_at
+      ? `Checked ${new Date(h.checked_at * 1000).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit', second: '2-digit'})}. Refreshes every 15 seconds.`
+      : '';
+
+    row(h, 'claude', 'hc-claude', 'hc-claude-chip', c => {
+      const version = c.version ? ` · version ${c.version}` : '';
+      const test = c.last_test;
+      const text = (c.cli_found ? `Command-line tool found${version}` : 'Command-line tool not found') + ` · API key ${c.api_key}`;
+      const [state, label] = !c.cli_found ? (c.api_key === 'set' ? ['warn', 'API key only'] : ['bad', 'Not found'])
+        : test && !test.ok ? ['warn', 'Test failed'] : ['good', 'Ready'];
+      show('hc-claude', 'hc-claude-chip', text, state, label);
+      $('hc-claude-last').textContent = !test ? 'Not tested yet. Press Test Claude to check it.'
+        : test.ok ? `Last test ${hcAgo(test.at)}: answered in ${test.seconds} s`
+        : `Last test ${hcAgo(test.at)} failed: ${test.reason || 'no reason was given'}`;
+    });
+
+    row(h, 'memory', 'hc-ram', 'hc-ram-chip', m => {
+      const [state, label] = LEVEL[m.level] || ['', ''];
+      show('hc-ram', 'hc-ram-chip', `${Number(m.available_gb).toFixed(1)} GB free of ${Number(m.total_gb).toFixed(1)} GB`, state, label);
+      bar('hc-ram-bar', m.total_gb ? (m.available_gb / m.total_gb) * 100 : 0, state);
+    });
+    row(h, 'disk', 'hc-disk', 'hc-disk-chip', d => {
+      const [state, label] = LEVEL[d.level] || ['', ''];
+      show('hc-disk', 'hc-disk-chip', `${Number(d.free_gb).toFixed(1)} GB free of ${Number(d.total_gb).toFixed(1)} GB`, state, label);
+      bar('hc-disk-bar', d.total_gb ? (d.free_gb / d.total_gb) * 100 : 0, state);
+    });
+    row(h, 'recorder', 'hc-recorder', 'hc-recorder-chip', r => {
+      show('hc-recorder', 'hc-recorder-chip', r.active ? `Recording${r.class_code ? ' ' + r.class_code : ''}` : 'Not recording',
+        r.active ? 'good' : '', r.active ? 'On' : 'Idle');
+    });
+    row(h, 'lesson_build', 'hc-build', 'hc-build-chip', b => {
+      const label = r => [r.class_code, r.range].filter(Boolean).join(', ');
+      if (b.running) {
+        const r = b.running;
+        const percent = typeof r.progress === 'number' ? ` · ${Math.round(r.progress * 100)}%` : '';
+        return show('hc-build', 'hc-build-chip', `Running now: ${label(r)} — ${r.stage || 'starting'}${percent}`, 'good', 'Running');
+      }
+      const f = b.last_failure;
+      if (!f) return show('hc-build', 'hc-build-chip', 'No failed or cancelled builds', 'good', 'OK');
+      const where = label(f) ? ` (${label(f)})` : '';
+      if (f.status === 'cancelled') return show('hc-build', 'hc-build-chip', `Last build was cancelled${where} on ${hcWhen(f.when)}`, '', 'Cancelled');
+      const step = f.step ? ` at ${f.step}` : '';
+      show('hc-build', 'hc-build-chip', `Failed${step}${where} on ${hcWhen(f.when)}: ${f.reason || 'No reason was recorded'}`,
+        f.superseded ? '' : 'bad', f.superseded ? 'Older' : 'Failed');
+    });
+    row(h, 'narration', 'hc-narration', 'hc-narration-chip', n => {
+      if (n.available) return show('hc-narration', 'hc-narration-chip', 'Voice is ready', 'good', 'Ready');
+      show('hc-narration', 'hc-narration-chip', `Off: ${n.reason || 'the voice is not ready'}`, 'warn', 'Off');
+    });
+    row(h, 'lid_watch', 'hc-lid', 'hc-lid-chip', l => {
+      show('hc-lid', 'hc-lid-chip', l.available ? 'A laptop lid is reported on this PC' : 'No laptop lid is reported on this PC',
+        l.available ? 'good' : '', l.available ? 'Available' : '');
+    });
+    row(h, 'llama_server', 'hc-llama', 'hc-llama-chip', s => {
+      if (s.listening) return show('hc-llama', 'hc-llama-chip', `Listening on port ${s.port}`, 'good', 'Running');
+      show('hc-llama', 'hc-llama-chip', `Not running (port ${s.port})`, '', 'Stopped');
+    });
+    row(h, 'storage', 'hc-storage', 'hc-storage-chip', s => {
+      const mb = v => (v == null ? 'still counting' : `${v} MB`);
+      const recordings = s.state_gb == null ? 'still counting' : `${s.state_gb} GB`;
+      show('hc-storage', 'hc-storage-chip', `Notes ${mb(s.notes_mb)} · Lessons ${mb(s.lessons_mb)} · Recordings ${recordings}`,
+        s.approximate ? 'warn' : '', s.approximate ? 'Partly counted' : '');
+    });
+  }
+
+  function showMissingHealth() {
+    $('hc-rows').hidden = true;
+    $('hc-when').textContent = '';
+    $('hc-problems').innerHTML = `<p class="hc-muted">${RESTART}</p>`;
+  }
+
+  async function loadHealth() {
+    if (healthBusy) return;
+    healthBusy = true;
+    try {
+      const r = await request('/api/health');
+      if (r.missing) return showMissingHealth();
+      if (!r.ok || !r.data) throw new Error(failure(r, `status ${r.status}`));
+      $('hc-rows').hidden = false;
+      renderHealth(r.data);
+      const building = !!(r.data.lesson_build && r.data.lesson_build.running);
+      const changed = building !== healthBuilding;
+      healthBuilding = building;
+      refreshFree();
+      // A build started or ended, so what is protected has changed: look again and keep the ticks. Or the list
+      // was left blank because the dashboard was old at the last look: look again now that it answers.
+      if (!deleting && (changed || missing)) scanFree(!missing);
+    } catch (error) {
+      $('hc-when').textContent = `Couldn't check health just now (${error.message || 'no reply'}). Showing the last check.`;
+    } finally {
+      healthBusy = false;
+    }
+  }
+
+  async function testClaude() {
+    const button = $('hc-test'), status = $('hc-test-status');
+    button.disabled = true;
+    status.className = 'hc-status';
+    status.innerHTML = '<span class="hc-spin" aria-hidden="true"></span>Asking Claude one short question. This can take up to 45 seconds.';
+    try {
+      const r = await request('/api/health/test-claude', {method: 'POST', headers: OWN, body: '{}'});
+      if (r.missing) {
+        status.textContent = RESTART;
+      } else if (!r.ok) {
+        status.className = 'hc-status bad';
+        status.textContent = failure(r, `Claude wasn't tested (status ${r.status}).`);
+      } else if (r.data.ok) {
+        status.className = 'hc-status good';
+        status.textContent = `Claude answered in ${r.data.seconds} s.`;
+      } else {
+        status.className = 'hc-status bad';
+        status.textContent = `Claude didn't answer: ${r.data.reason || 'no reason was given'}`;
+      }
+    } catch {
+      status.className = 'hc-status bad';
+      status.textContent = 'Lost contact with the dashboard while Claude was being tested. The result will show in a moment.';
+    } finally {
+      button.disabled = false;
+      loadHealth();
+    }
+  }
+
+  // ---------- Free up space ----------
+
+  function setFreeNote(text, state, spinner) {
+    const note = $('fs-note');
+    note.className = 'hc-status' + (state ? ' ' + state : '');
+    note.innerHTML = (spinner ? '<span class="hc-spin" aria-hidden="true"></span>' : '') + hcEsc(text);
+  }
+
+  function itemRow(item) {
+    const key = keyOf(item);
+    const why = item.protected ? `<span class="hc-why">${hcEsc(item.protected_reason || 'In use right now')}</span>` : '';
+    return `<label class="hc-item"><input type="checkbox" data-key="${hcEsc(key)}"${selected.has(key) ? ' checked' : ''}>` +
+      `<span><span class="hc-name">${hcEsc(item.label)}</span><span class="hc-detail">${hcEsc(item.detail)}</span>${why}</span>` +
+      `<span class="hc-size">${hcSize(item.bytes)}</span></label>`;
+  }
+
+  function renderGroups(all) {
+    const list = $('fs-list');
+    if (!all.length) {
+      list.innerHTML = '<p class="hc-muted">Nothing to clean up: lessons/ has no leftovers.</p>';
+      return;
+    }
+    list.innerHTML = GROUPS.map(([kind, title, hint]) => {
+      const group = all.filter(item => item.kind === kind);
+      if (!group.length) return '';
+      const bytes = group.reduce((sum, item) => sum + item.bytes, 0);
+      return `<fieldset class="hc-group"><legend>${hcEsc(title)} <span class="hc-muted">${group.length} · ${hcSize(bytes)}</span></legend>` +
+        `<p class="hc-muted hc-hint">${hcEsc(hint)}</p>${group.map(itemRow).join('')}</fieldset>`;
+    }).join('');
+  }
+
+  // Everything that depends on the state: the checkboxes, the total, the Delete button, the build note.
+  function refreshFree() {
+    const building = healthBuilding || scanBuilding;
+    const blocked = building || deleting || scanning || missing;
+    const chosen = chosenItems();
+    const bytes = chosen.reduce((sum, item) => sum + item.bytes, 0);
+    $('fs-selected').textContent = chosen.length ? `${chosen.length} selected · ${hcSize(bytes)}` : 'Nothing selected';
+    $('fs-delete').disabled = blocked || chosen.length === 0;
+    $('fs-rescan').disabled = deleting || scanning;
+    $('fs-building').hidden = !building;
+    for (const box of $('fs-list').querySelectorAll('input[type="checkbox"]')) {
+      const item = items.get(box.dataset.key);
+      box.disabled = blocked || !item || item.protected;
+    }
+  }
+
+  // keep: true keeps the user's own ticks for items that are still there (Scan again, a build ending);
+  // false starts again from the suggestions (first load, after a delete).
+  async function scanFree(keep) {
+    if (deleting) return;
+    if (scanning) {
+      queuedScan = true;             // a refresh asked for meanwhile: run once more when this one ends
+      return;
+    }
+    scanning = true;
+    refreshFree();
+    setFreeNote('Looking through lessons/…', '', true);
+    try {
+      const r = await request('/api/cleanup');
+      if (r.missing) {
+        missing = true;
+        $('fs-list').innerHTML = '';
+        return setFreeNote(RESTART);
+      }
+      if (!r.ok || !r.data) return setFreeNote(failure(r, `Couldn't look through lessons/ (status ${r.status}).`), 'bad');
+      missing = false;
+      const previous = selected;
+      items = new Map(r.data.items.map(item => [keyOf(item), item]));
+      scanBuilding = !!r.data.running_build;
+      selected = keep && scanned
+        ? new Set([...previous].filter(key => items.has(key) && !items.get(key).protected))
+        : new Set(r.data.items.filter(suggested).map(keyOf));
+      scanned = true;
+      renderGroups(r.data.items);
+      setFreeNote('');
+    } catch {
+      setFreeNote("Couldn't reach the dashboard. Press Scan again to retry.", 'bad');
+    } finally {
+      scanning = false;
+      refreshFree();
+      if (queuedScan) {
+        queuedScan = false;
+        scanFree(true);
+      }
+    }
+  }
+
+  function askDelete() {
+    const chosen = chosenItems();
+    if (!chosen.length) return;
+    pending = chosen;
+    const bytes = chosen.reduce((sum, item) => sum + item.bytes, 0);
+    const n = chosen.length;
+    $('fs-confirm-title').textContent = `Permanently delete ${n} item${n === 1 ? '' : 's'} (${hcSize(bytes)})? This can't be undone.`;
+    const lessons = chosen.filter(item => item.kind === 'lesson');
+    $('fs-confirm-lessons').innerHTML = lessons.length
+      ? `<p class="hc-muted">Including ${lessons.length} finished lesson${lessons.length === 1 ? '' : 's'}:</p>` +
+        `<ul>${lessons.map(item => `<li>${hcEsc(item.label)}</li>`).join('')}</ul>`
+      : '';
+    $('fs-confirm').showModal();
+  }
+
+  function skippedLabel(reference, before) {
+    const found = before.get(`${reference.kind}:${reference.id}`);
+    return found ? found.label : reference.id;
+  }
+
+  function renderReport(report, before) {
+    const lines = [];
+    if (report.deleted) {
+      lines.push(`<p>Freed ${hcSize(report.freed)} by deleting ${report.deleted} item${report.deleted === 1 ? '' : 's'}.</p>`);
+    } else if (!report.error) {
+      lines.push('<p>Nothing was deleted.</p>');
+    }
+    if (report.skipped.length) {
+      lines.push(`<p>Skipped ${report.skipped.length}:</p><ul>` + report.skipped.map(skip =>
+        `<li>${hcEsc(skippedLabel(skip.item || {}, before))}: ${hcEsc(skip.reason)}</li>`).join('') + '</ul>');
+    }
+    if (report.error) lines.push(`<p class="hc-status bad">${hcEsc(report.error)}</p>`);
+    $('fs-report').innerHTML = lines.join('');
+  }
+
+  async function runDelete(batch) {
+    if (!batch.length) return;
+    deleting = true;
+    refreshFree();
+    setFreeNote('Deleting…', '', true);
+    const before = new Map(items);     // the labels of what was asked for, before the re-scan replaces them
+    const report = {deleted: 0, freed: 0, skipped: [], error: ''};
+    try {
+      for (let start = 0; start < batch.length && !report.error; start += BATCH) {
+        const chunk = batch.slice(start, start + BATCH).map(item => ({kind: item.kind, id: item.id}));
+        const r = await request('/api/cleanup/delete', {method: 'POST', headers: OWN, body: JSON.stringify({items: chunk, confirm: true})});
+        if (r.missing) {
+          report.error = RESTART;
+        } else if (!r.ok || !r.data) {
+          report.error = `${sentence(failure(r, `The delete was refused (status ${r.status})`))} Nothing more was deleted.`;
+        } else {
+          report.deleted += (r.data.deleted || []).length;
+          report.freed += Number(r.data.freed_bytes) || 0;
+          report.skipped.push(...(r.data.skipped || []));
+        }
+      }
+    } catch {
+      report.error = "Lost contact with the dashboard partway through. Scan again to see what is left.";
+    }
+    deleting = false;
+    await scanFree(false);
+    renderReport(report, before);
+  }
+
+  $('fs-list').addEventListener('change', event => {
+    const box = event.target;
+    if (!(box instanceof HTMLInputElement) || box.type !== 'checkbox') return;
+    const item = items.get(box.dataset.key);
+    if (!item || item.protected) {
+      box.checked = false;
+      return;
+    }
+    if (box.checked) selected.add(box.dataset.key);
+    else selected.delete(box.dataset.key);
+    refreshFree();
+  });
+
+  $('hc-test').onclick = testClaude;
+  $('fs-rescan').onclick = () => scanFree(true);
+  $('fs-delete').onclick = askDelete;
+  $('fs-cancel').onclick = () => $('fs-confirm').close();
+  $('fs-confirm-go').onclick = () => {
+    const batch = pending;
+    pending = [];
+    $('fs-confirm').close();
+    runDelete(batch);
+  };
+  $('fs-confirm').addEventListener('close', () => { pending = []; });
+
+  loadHealth();
+  scanFree(false);
+  setInterval(loadHealth, 15000);
+})();
 </script>
 </body>
 </html>

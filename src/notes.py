@@ -16,7 +16,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from storage import atomic_write, update_session, session_bounds, session_markers
+from storage import atomic_write, update_session, session_bounds, session_markers, dedupe_day_headings
 import docx_export
 import gpu_formatter
 import local_formatter
@@ -193,11 +193,19 @@ def _looks_like_assistant_chatter(text: str) -> bool:
     return not has_structure
 
 
+last_cli_failure: str | None = None  # why the most recent CLI call returned None (None after a success)
+
+
 def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> str | None:
     """Returns clean markdown via the Claude Code CLI (subscription usage), or None if unusable.
-    `timeout` is only raised by long one-off jobs (lessons); note saves keep the default."""
+    `timeout` is only raised by long one-off jobs (lessons); note saves keep the default.
+    When it returns None the reason is left in `last_cli_failure`, so a caller that has no
+    fallback can say what actually went wrong instead of guessing."""
+    global last_cli_failure
+    last_cli_failure = None
     cli = _find_claude_cli()
     if not cli:
+        last_cli_failure = "the Claude CLI isn't installed (claude.exe was not found)"
         return None
     try:
         result = subprocess.run(
@@ -209,13 +217,23 @@ def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> s
             timeout=timeout,
         )
         if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-300:]
+            last_cli_failure = f"the Claude CLI exited with code {result.returncode}" + (f": {detail}" if detail else "")
             return None
         text = result.stdout.strip()
-        if not text or _looks_like_assistant_chatter(text):
+        if not text:
+            last_cli_failure = "the Claude CLI returned an empty reply"
+            return None
+        if _looks_like_assistant_chatter(text):
+            last_cli_failure = f"the Claude CLI replied with a message instead of the content: {text[:200]!r}"
             return None  # treated exactly like a failed call, so the caller falls through
         return text
-    except Exception:
-        # CLI not logged in, timed out, offline, etc. -> fall back.
+    except subprocess.TimeoutExpired:
+        last_cli_failure = f"the Claude CLI did not finish within {timeout // 60} minutes"
+        return None
+    except Exception as error:
+        # CLI not logged in, offline, etc. -> fall back.
+        last_cli_failure = f"the Claude CLI could not be run ({type(error).__name__}: {error})"
         return None
 
 
@@ -442,6 +460,7 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
         updated = update_session(existing, session_id, section, replace=replace_session)
     else:
         updated = existing.rstrip() + "\n\n" + section.strip() + "\n"
+    updated = dedupe_day_headings(updated)
     atomic_write(path, updated, expected=before_save)
 
     try:
@@ -638,13 +657,15 @@ def _parse_flashcards_json(raw: str) -> list[dict] | None:
 
 
 def generate_flashcards(class_code: str, class_title: str, mode: str = "auto",
-                         count: int = FLASHCARD_COUNT) -> tuple[bool, str | None, list[dict] | None]:
+                         count: int = FLASHCARD_COUNT,
+                         timeout: int = CLI_TIMEOUT_SECONDS) -> tuple[bool, str | None, list[dict] | None]:
     """Generates a multiple-choice quiz from all of a class's notes so far. CLI/API only -
     same reasoning as generate_study_guide: writing plausible wrong answers and covering
     material proportionally needs real understanding of the whole notes file, not just
     single-chunk formatting. Returns (True, None, questions) on success, where each question
     is {"question", "options" (4 strings), "correct_index", "explanation"}, or
-    (False, reason, None)."""
+    (False, reason, None). `timeout` only needs raising for a semester's worth of notes,
+    which can take the CLI longer than a single note save."""
     if mode not in FORMATTING_MODES:
         raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
     if mode != "auto":
@@ -659,7 +680,7 @@ def generate_flashcards(class_code: str, class_title: str, mode: str = "auto",
         return False, "no notes yet for this class", None
 
     prompt = _build_flashcards_prompt(class_title, class_code, content, count)
-    raw = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    raw = _try_claude_cli_format(prompt, timeout=timeout) or _try_claude_api_format(prompt)
     if not raw:
         return False, "Claude CLI/API unavailable", None
 
@@ -776,6 +797,7 @@ def condense_session(class_code: str, class_title: str, before_length: int,
     new_content = header_part.rstrip("\n") + "\n\n" + condensed.strip() + "\n"
     if session_id:
         new_content = update_session(content, session_id, condensed, replace=True)
+    new_content = dedupe_day_headings(new_content)
     if path.read_text(encoding="utf-8") != content:
         return False, "notes changed during formatting; retry condensation"
     atomic_write(path, new_content, expected=content)

@@ -105,3 +105,26 @@ def update_session(content, session_id, section, replace=False):
         body = section.strip() if replace else prior + "\n\n" + section.strip()
         return content[:left] + start + "\n" + body + "\n" + end + content[right:]
     return content.rstrip() + "\n\n" + start + "\n" + section.strip() + "\n" + end + "\n"
+
+
+def dedupe_day_headings(content):
+    """Keeps one `## <date>` header per day in a notes file. A level-2 header that repeats
+    the level-2 header just before it is dropped, so every later session of that day sits
+    under the first one. Days that come back later in the file keep their header, so no
+    content is ever moved under a different day."""
+    out = []
+    previous = None
+    drop_next_blank = False
+    for line in content.split("\n"):
+        if drop_next_blank:
+            drop_next_blank = False
+            if not line.strip():
+                continue
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            if heading == previous:
+                drop_next_blank = True
+                continue
+            previous = heading
+        out.append(line)
+    return "\n".join(out)

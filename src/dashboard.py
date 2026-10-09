@@ -289,6 +289,23 @@ def service_status() -> dict:
 # HTTP
 # ---------------------------------------------------------------------------
 
+# Endpoint -> (module, function). The functions take/return JSON-ready data; GETs take no body
+# (/api/quiz takes ?lesson=<id>) and POSTs take the parsed JSON object.
+FEATURE_GETS = {
+    "/api/quiz": ("quiz", "get_state"),             # get_state(lesson_id)
+    "/api/quiz/review": ("quiz", "review"),         # review()
+    "/api/health": ("health", "snapshot"),          # snapshot() - cheap, never calls a model
+    "/api/cleanup": ("lesson_cleanup", "scan"),     # scan() - read-only
+}
+FEATURE_POSTS = {
+    "/api/lessons/cancel": ("lessons", "cancel_job_request"),   # {job_id}
+    "/api/quiz/answer": ("quiz", "record_answer"),               # {lesson_id, slide, result, ...}
+    "/api/quiz/reset": ("quiz", "reset"),                        # {lesson_id?}
+    "/api/health/test-claude": ("health", "test_claude"),        # {} - the one call that uses the model
+    "/api/cleanup/delete": ("lesson_cleanup", "delete"),         # {items: [...], confirm: true}
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # the default logger spams a line per poll; the dashboard polls constantly
@@ -473,6 +490,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "Unknown lesson route"}, 404)
             except FileNotFoundError as error:
                 self._json({"error": str(error)}, 404)
+        elif route in FEATURE_GETS:
+            self._feature_get(route, one)
         elif route == "/style.css":
             self._static("style.css", "text/css; charset=utf-8")
         elif route == "/stop.js":
@@ -585,6 +604,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/lessons/create":
             self._lesson_post()
             return
+        if parsed.path in FEATURE_POSTS:
+            self._feature_post(parsed.path)
+            return
         if parsed.path == "/api/jev/settings":
             self._jev_settings_post()
             return
@@ -659,6 +681,54 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(error)}, 409)
         except (ValueError, TypeError) as error:
             self._json({"error": str(error)}, 400)
+
+    def _feature_get(self, route, one):
+        """Read-only feature endpoints. Each is a plain function in its own module, imported when
+        first used so a missing or broken module costs only its own endpoint."""
+        try:
+            module_name, call = FEATURE_GETS[route]
+            module = __import__(module_name)
+            argument = {"/api/quiz": lambda: (one("lesson", ""),)}.get(route, lambda: ())()
+            self._json(getattr(module, call)(*argument))
+        except Exception as error:
+            self._feature_error(error)
+
+    def _feature_post(self, route):
+        """Feature endpoints that change something. Same rules as the stop and command buttons:
+        a local address, this dashboard's own page, and a JSON body of a sane size."""
+        if not self._from_this_dashboard():
+            self._json({"error": "That can only be done from this dashboard's own pages"}, 403)
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._json({"error": "JSON request required"}, 415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= length <= 20_000:
+                raise ValueError("Request is too large")
+            payload = json.loads(self._read_body(length) or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a JSON object")
+            module_name, call = FEATURE_POSTS[route]
+            self._json(getattr(__import__(module_name), call)(payload))
+        except Exception as error:
+            self._feature_error(error)
+
+    def _feature_error(self, error: Exception):
+        """ValueError is the caller's mistake (400), FileNotFoundError an unknown id (404), a
+        missing feature module 404. An exception can name its own status with `http_status`
+        (409 for "busy" or "in use"). Anything else is ours: a generic 500, details in the log."""
+        if isinstance(error, ImportError):
+            self._json({"error": "That feature isn't available in this version"}, 404)
+        elif isinstance(error, FileNotFoundError):
+            self._json({"error": str(error)}, 404)
+        elif isinstance(error, (ValueError, TypeError)):
+            self._json({"error": str(error)}, 400)
+        elif isinstance(getattr(error, "http_status", None), int):
+            self._json({"error": str(error)}, error.http_status)
+        else:
+            print(f"Dashboard feature error: {type(error).__name__}: {error}")
+            self._json({"error": "Something went wrong; see the dashboard window for details"}, 500)
 
     def _correction_post(self, route):
         from storage import RevisionConflict
