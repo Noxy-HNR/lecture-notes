@@ -195,7 +195,7 @@ cache, so a general cache cleanup can't delete it. It's the only transcription m
 says why and won't start the recording. After that everything runs fully offline.
 
 **Recommended:** the Claude Code CLI is already installed
-(`C:\Users\braxt\.local\bin\claude.exe`, on PATH as `claude`). Log in once with
+(`%USERPROFILE%\.local\bin\claude.exe`, on PATH as `claude`). Log in once with
 your Pro/Max account so note formatting uses your subscription instead of
 paid API credits:
 
