@@ -1,5 +1,15 @@
 # Lecture Notes App
 
+Schedule lecture recordings, transcribe speech with local Whisper, and turn the results into organized study notes. Optional AI-assisted workflows support speaker-aware Q&A, corrections, and review materials.
+
+## Quick navigation
+
+- [Start a recording](#starting-notes-from-diagnostics)
+- [Install and run the app](#one-time-setup)
+- [Recover an interrupted session](#recovering-a-crashedinterrupted-session)
+- [Improve transcription accuracy](#improving-accuracy)
+- [Use meaning search](#meaning-search)
+
 ## Starting Notes from diagnostics
 
 Open the dashboard's **Diagnostics** page and click **Start Notes**. It opens the
