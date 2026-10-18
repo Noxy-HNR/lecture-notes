@@ -269,7 +269,10 @@ def service_status() -> dict:
         if not gpu_formatter.available():
             status["gpu_model"] = "not installed"
         else:
-            status["gpu_model"] = "running" if gpu_formatter._server_healthy() else "installed (stopped)"
+            # Ask the OS listener table first (about 1 ms). A TCP connect to a port nobody listens on can
+            # block for ~2 s on Windows, and that is the usual state, so it must not be the first probe.
+            listening = gpu_formatter._port_open()
+            status["gpu_model"] = "running" if listening and gpu_formatter._server_healthy() else "installed (stopped)"
     except Exception as e:
         status["gpu_model"] = f"error: {type(e).__name__}"
     try:
@@ -283,6 +286,32 @@ def service_status() -> dict:
     except Exception as e:
         status["diarization"] = f"error: {type(e).__name__}"
     return status
+
+
+# The Diagnostics page polls /api/status every second. The parts that probe the machine (the service
+# checks and the scan for a running recorder, which walks every process) change rarely, so they are
+# reused for a few seconds instead of being redone on every poll. Starting the recorder drops the
+# cached answer so the page sees it at once.
+SLOW_STATUS_SECONDS = 5.0
+_slow_status = {"at": 0.0, "value": None}
+_slow_status_lock = threading.Lock()
+
+
+def slow_status(now: float | None = None) -> tuple[dict, dict]:
+    now = time.monotonic() if now is None else now
+    with _slow_status_lock:
+        cached = _slow_status["value"]
+        if cached is not None and 0 <= now - _slow_status["at"] < SLOW_STATUS_SECONDS:
+            return cached
+    value = (service_status(), recorder_launcher.recorder_state())
+    with _slow_status_lock:
+        _slow_status.update(at=now, value=value)
+    return value
+
+
+def forget_slow_status() -> None:
+    with _slow_status_lock:
+        _slow_status.update(at=0.0, value=None)
 
 
 # ---------------------------------------------------------------------------
@@ -553,8 +582,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(list_sessions())
         elif route == "/api/status":
             payload = telemetry.read_status()
-            payload["services"] = service_status()
-            payload["recorder"] = recorder_launcher.recorder_state()
+            payload["services"], payload["recorder"] = slow_status()
             self._json(payload)
         else:
             self._send(b"not found", "text/plain", 404)
@@ -628,7 +656,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         action = body.get("action", "")
         if action == 'start':
-            try:self._json(recorder_launcher.start_recorder())
+            try:
+                result = recorder_launcher.start_recorder()
+                forget_slow_status()
+                self._json(result)
             except (OSError,RuntimeError) as exc:self._json({'ok':False,'error':str(exc)},500)
             return
         if action not in ("save_now", "stop"):

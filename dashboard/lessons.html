@@ -149,7 +149,7 @@ const pretty = iso => new Date(iso + 'T12:00:00').toLocaleDateString(undefined, 
 const minutes = s => !s ? 'no narration' : s < 60 ? `${Math.round(s)}s` : `${Math.round(s / 60)} min`;
 const STEP_MARK = { done: '✓', current: '›', stopped: '✕', upcoming: '○' };
 const STEP_SR = { done: 'Done: ', current: 'In progress: ', stopped: 'Stopped: ', upcoming: 'To come: ' };
-let classes = [], jobTimer = null, jobStarted = 0;
+let classes = [], jobTimer = null, jobStarted = 0, tickNow = null;
 let activeJob = null, lastJob = null, cancelAsked = false, cancelling = false, actionsKey = '';
 
 function store(key, value) { try { value == null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch {} }
@@ -480,10 +480,13 @@ function track(jobId) {
     }
     applyJob(result.data);
   };
-  tick(); jobTimer = setInterval(tick, 1500);
+  // Skip the timer while the tab is hidden; the visibilitychange listener below catches up when it is shown.
+  tickNow = tick;
+  tick(); jobTimer = setInterval(() => { if (!document.hidden) tick(); }, 1500);
   updateSummary();   // disables Build while the job is being tracked
 }
 
+document.addEventListener('visibilitychange', () => { if (!document.hidden && jobTimer && tickNow) tickNow(); });
 $('class').onchange = () => { store('lessonClass', $('class').value); fillDates(); };
 $('start').onchange = updateSummary; $('end').onchange = updateSummary;
 $('voice').onchange = () => store('lessonVoice', $('voice').value);

@@ -415,8 +415,14 @@ document.getElementById('btn-start').onclick = e => send('start', e.target);
 document.getElementById('btn-save').onclick = e => send('save_now', e.target);
 document.getElementById('btn-stop').onclick = e => send('stop', e.target);
 
+// Poll only while this tab is visible: a page left open in a background tab should not keep the dashboard
+// server and the CPU busy. It refreshes straight away when the tab is shown again.
+function pollWhileVisible(fn, ms) {
+  setInterval(() => { if (!document.hidden) fn(); }, ms);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) fn(); });
+}
 poll();
-setInterval(poll, 1000);
+pollWhileVisible(poll, 1000);
 
 // Jev: what it's used for, whether it's on, and what it has done. Hidden on an older dashboard
 // server that doesn't have the endpoint.
@@ -457,7 +463,7 @@ document.getElementById('jev-toggle').onclick = async e => {
   finally { e.target.disabled = false; }
 };
 loadJev();
-setInterval(loadJev, 15000);
+pollWhileVisible(loadJev, 15000);
 </script>
 <script>
 // System health and Free up space. Its own block, so a mistake here cannot stop the live status
@@ -857,7 +863,7 @@ setInterval(loadJev, 15000);
 
   loadHealth();
   scanFree(false);
-  setInterval(loadHealth, 15000);
+  pollWhileVisible(loadHealth, 15000);
 })();
 </script>
 </body>

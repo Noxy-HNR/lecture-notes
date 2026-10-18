@@ -1344,8 +1344,10 @@ def run():
                         help="Add local word timestamps at session end when aligner assets are installed")
     parser.add_argument("--encoder", choices=['eager', 'compile-bf16', 'compile-fp8'], default=None,
                         help="Encoder runtime (BF16 compiles single-piece batches; experimental FP8 changes some words)")
-    parser.add_argument('--captions', choices=['auto', 'off'], default='auto',
-                        help='Fast local provisional captions when native assets are installed')
+    parser.add_argument('--captions', choices=['auto', 'on', 'off'], default='auto',
+                        help='Fast local provisional captions when native assets are installed. '
+                             'auto: on while plugged in, off on battery (the preview keeps about two '
+                             'CPU cores busy); on: always; off: never')
     parser.add_argument('--vocabulary-retry', choices=['auto', 'off'], default='auto',
                         help='Retry selected glossary near misses locally after recording')
     parser.add_argument("--diarize", action="store_true",
@@ -1506,7 +1508,13 @@ def run():
                        notes_path=str(notes.notes_path(cls["code"])), wav_path=str(wav_path))
     tel.add_event("info", f"Recording started: {cls['code']} ({source})")
     import streaming
-    if args.captions != 'off' and streaming.available():
+    import power
+    captions_wanted = args.captions == 'on' or (args.captions == 'auto' and not power.on_battery())
+    if args.captions == 'auto' and not captions_wanted and streaming.available():
+        tel.add_event('info', 'Live preview captions are off while on battery to save power '
+                              '(they keep about two CPU cores busy). The recording and final notes are unaffected; '
+                              'start with --captions on to keep them.')
+    if captions_wanted and streaming.available():
         import vocab
         preview_completed = []
         preview_flush = {'at': 0.0}

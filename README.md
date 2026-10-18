@@ -775,7 +775,8 @@ for timings, fidelity checks, and the decisions about defaults.
    one known glossary-word change, and every other word unchanged. The original and
    both candidates remain in the segment ledger. Accepted corrections refresh the
    complete session's notes. Use `--captions off` or `--vocabulary-retry off` to skip
-   these paths.
+   these paths. The live preview keeps about two CPU cores busy (measured), so by default
+   (`--captions auto`) it runs only while plugged in; `--captions on` keeps it on battery.
 
 Public assets are pinned in the project-owned `state/` directories:
 
