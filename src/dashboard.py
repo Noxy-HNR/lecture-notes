@@ -479,8 +479,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(lessons.list_lessons())
                 elif route == "/api/lessons/classes":
                     narration, reason = speech.available()
+                    # "freestyle" tells the page this server can build a lesson from a description; an older
+                    # server doesn't say, and the page keeps that choice switched off.
                     self._json({"classes": lessons.list_classes(), "voices": speech.VOICES,
-                                "default_voice": speech.DEFAULT_VOICE,
+                                "default_voice": speech.DEFAULT_VOICE, "freestyle": True,
                                 "narration": narration, "narration_reason": reason})
                 elif route == "/api/lessons/lesson":
                     self._json(lessons.get_lesson(one("id", "")))

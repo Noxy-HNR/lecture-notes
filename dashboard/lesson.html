@@ -170,8 +170,9 @@ const slideAt = i => i === 0 ? null : slides()[i - 1];
 function coverHtml() {
   const range = lesson.dates.length > 1 ? `${lesson.dates.length} lectures` : '1 lecture';
   return `<div class="cover">
-    <div class="kind">${esc(lesson.class_code)} · ${esc(lesson.class_title)} · ${range}</div>
+    <div class="kind">${lesson.kind === 'freestyle' ? 'Freestyle lesson' : `${esc(lesson.class_code)} · ${esc(lesson.class_title)} · ${range}`}</div>
     <h2>${esc(lesson.title)}</h2>
+    ${lesson.kind === 'freestyle' && lesson.topic ? `<p class="kind" style="text-transform:none;letter-spacing:0;font-weight:500">Topic: ${esc(lesson.topic)}</p>` : ''}
     ${lesson.focus ? `<p class="kind" style="text-transform:none;letter-spacing:0;font-weight:500">Focus: ${esc(lesson.focus)}</p>` : ''}
     <p>${esc(lesson.tldr)}</p>
     <button class="btn primary start" id="start-lesson">${startLabel()}</button>

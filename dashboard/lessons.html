@@ -12,6 +12,11 @@
 .panel{padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);min-width:0}
 .panel h2{font-size:17px;margin:0 0 14px}
 .field{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--text-dim);margin-bottom:14px}
+.mode{display:flex;gap:4px;margin:0 0 16px;padding:3px;border:1px solid var(--border);border-radius:9px;background:var(--bg-inset)}
+.mode button{flex:1;font:inherit;font-size:13px;padding:7px 10px;border:0;border-radius:7px;background:none;color:var(--text-dim);cursor:pointer}
+.mode button[aria-selected="true"]{background:var(--bg-raised);color:var(--text);box-shadow:0 0 0 1px var(--border)}
+.mode button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.mode button:disabled{opacity:.5;cursor:not-allowed}
 select,textarea,input[type=number]{font:inherit;color:var(--text);background:var(--bg-inset);border:1px solid var(--border);border-radius:7px;padding:9px 10px;width:100%;box-sizing:border-box}
 select:focus,textarea:focus,input[type=number]:focus{outline:2px solid var(--accent)}
 textarea{resize:vertical;min-height:72px;line-height:1.45}
@@ -73,12 +78,17 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
   <div class="page-heading">
     <div class="eyebrow">Study lessons</div>
     <h1 class="page-title">Re-learn it the easy way.</h1>
-    <p class="page-sub">Pick a stretch of lectures and get a short narrated slideshow that explains it all in plain language, with pictures and diagrams.</p>
+    <p class="page-sub">Pick a stretch of lectures, or describe anything you want to learn, and get a narrated slideshow that explains it in plain language, with pictures and diagrams.</p>
   </div>
 
   <div class="layout">
     <section class="panel" aria-labelledby="build-title">
       <h2 id="build-title">Build a lesson</h2>
+      <div class="mode" role="tablist" aria-label="What the lesson is about">
+        <button type="button" role="tab" id="mode-notes" aria-selected="true">From my notes</button>
+        <button type="button" role="tab" id="mode-free" aria-selected="false">Freestyle</button>
+      </div>
+      <div id="notes-fields">
       <label class="field">Class<select id="class"></select></label>
       <div class="range">
         <label class="field">From<select id="start"></select></label>
@@ -96,9 +106,17 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
           placeholder="e.g. walk through Lewis structures step by step, more practice on formal charge"></textarea>
         <span class="hint"><span>Gets extra depth and practice. Everything else is still covered.</span><span id="focus-count"></span></span>
       </label>
+      </div>
+      <div id="free-fields" hidden>
+        <label class="field">What do you want to learn?
+          <textarea id="topic" maxlength="1500" rows="5"
+            placeholder="e.g. how noise-cancelling headphones work, from scratch&#10;or: the causes of the French Revolution, for a high-school exam&#10;or: how to read a nutrition label"></textarea>
+          <span class="hint"><span>No notes are used. Mention your level or how deep you want to go if you like.</span><span id="topic-count"></span></span>
+        </label>
+      </div>
       <label class="field">Length in minutes (optional)
         <input id="minutes" type="number" min="1" step="1" inputmode="numeric" placeholder="Leave blank to let Claude decide">
-        <span class="hint"><span>Aims within about 10% of this. Blank means as long as the notes need.</span></span>
+        <span class="hint"><span>Aims within about 10% of this. Blank means as long as the material needs.</span></span>
       </label>
       <label class="field">Narrator voice<select id="voice"></select></label>
       <button class="btn primary" id="build" style="width:100%">Build lesson</button>
@@ -189,7 +207,21 @@ function fillDates() {
   updateSummary();
 }
 
+// "notes": a lesson from the class notes; "free": a lesson on whatever the person describes.
+let mode = recall('lessonMode') === 'free' ? 'free' : 'notes';
+
+function setMode(next) {
+  mode = next === 'free' ? 'free' : 'notes';
+  store('lessonMode', mode);
+  $('mode-notes').setAttribute('aria-selected', String(mode === 'notes'));
+  $('mode-free').setAttribute('aria-selected', String(mode === 'free'));
+  $('notes-fields').hidden = mode === 'free';
+  $('free-fields').hidden = mode !== 'free';
+  updateSummary();
+}
+
 function updateSummary() {
+  if (mode === 'free') { $('build').disabled = !!jobTimer || $('topic').value.trim().length < 3; return; }
   const cls = currentClass();
   if (!cls || !cls.dates.length) { $('summary').textContent = 'No dated lectures for this class yet.'; $('build').disabled = true; return; }
   let [a, b] = [$('start').value, $('end').value]; if (a > b) [a, b] = [b, a];
@@ -217,12 +249,13 @@ async function loadLessons() {
       <div class="meta"><span class="pill">${esc(l.class_code)}</span>
         <span>${esc(pretty(l.start))}${l.start === l.end ? '' : ' – ' + esc(pretty(l.end))}</span></div>
       <h3>${esc(l.title)}</h3>
+      ${l.topic ? `<p class="focus">Topic: ${esc(l.topic)}</p>` : ''}
       ${l.focus ? `<p class="focus">Focus: ${esc(l.focus)}</p>` : ''}
       ${l.minutes ? `<p class="focus">Asked for ${esc(String(l.minutes))} min</p>` : ''}
       <p>${esc(l.tldr)}</p>
       <div class="meta"><span>${l.slides} slides</span><span>${minutes(l.duration_seconds)}</span></div>
     </a>`).join('')
-    : '<div class="empty-state">No lessons yet. Build one from a lecture on the left.</div>';
+    : '<div class="empty-state">No lessons yet. Build one on the left.</div>';
 }
 
 // "Questions to review (N)" links to the review queue only when there are some; an old dashboard
@@ -390,9 +423,11 @@ async function retryBuild() {
   notice('');
   const job = lastJob;
   try {
-    const result = await call('/api/lessons/create', postJson({
-      class_code: job.class_code, start: job.start, end: job.end, voice: job.voice,
-      focus: job.focus || '', minutes: job.minutes ? String(job.minutes) : '' }));
+    const minutesText = job.minutes ? String(job.minutes) : '';
+    const result = await call('/api/lessons/create', postJson(job.topic
+      ? { topic: job.topic, voice: job.voice, minutes: minutesText }
+      : { class_code: job.class_code, start: job.start, end: job.end, voice: job.voice,
+          focus: job.focus || '', minutes: minutesText }));
     if (result.ok) { jobStarted = Date.now(); track(result.data.job_id); }
     else notice(failureText(result), 'error');
   } finally {
@@ -456,6 +491,13 @@ $('focus').oninput = () => {
   const n = $('focus').value.length;
   $('focus-count').textContent = n > 450 ? `${n}/600` : '';
 };
+$('topic').oninput = () => {
+  const n = $('topic').value.length;
+  $('topic-count').textContent = n > 1200 ? `${n}/1500` : '';
+  updateSummary();
+};
+$('mode-notes').onclick = () => setMode('notes');
+$('mode-free').onclick = () => setMode('free');
 document.querySelectorAll('[data-quick]').forEach(b => b.onclick = () => quick(b.dataset.quick));
 $('job-actions').onclick = event => {
   const button = event.target.closest('[data-action]');
@@ -466,9 +508,10 @@ $('build').onclick = async () => {
   try {
     const { job_id } = await api('/api/lessons/create', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ class_code: $('class').value, start: $('start').value, end: $('end').value,
-                             voice: $('voice').value, focus: $('focus').value.trim(),
-                             minutes: $('minutes').value.trim() }),
+      body: JSON.stringify(mode === 'free'
+        ? { topic: $('topic').value.trim(), voice: $('voice').value, minutes: $('minutes').value.trim() }
+        : { class_code: $('class').value, start: $('start').value, end: $('end').value,
+            voice: $('voice').value, focus: $('focus').value.trim(), minutes: $('minutes').value.trim() }),
     });
     jobStarted = Date.now(); track(job_id);
   } catch (error) { notice(error.message, 'error'); }
@@ -485,6 +528,12 @@ $('build').onclick = async () => {
     $('voice').value = info.voices[recall('lessonVoice')] ? recall('lessonVoice') : info.default_voice;
     if (!info.narration) notice('Narration is unavailable (' + info.narration_reason + '). Lessons will still be built, without audio.');
     fillDates();
+    if (!info.freestyle) {   // a dashboard that was started before this feature existed
+      $('mode-free').disabled = true;
+      $('mode-free').title = 'Restart the dashboard to turn this on';
+      mode = 'notes';
+    }
+    setMode(mode);
     await loadLessons();
     const running = recall('lessonJob'); if (running) track(running);
   } catch (error) { notice(error.message, 'error'); }
