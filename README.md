@@ -14,6 +14,17 @@ The dashboard reports launch/command errors rather than silently ignoring them.
 The dashboard and recorder remain separate processes, so restarting or closing the
 dashboard does not stop a recording. Restart the dashboard after installing this update.
 
+While the action menu is open, the recorder prepares its transcription imports in the
+background. Choosing Record reuses that preparation, then runs the normal preflight
+checks and loads the model weights. All four menu actions remain available. Explicit
+commands such as `--list` and `--dashboard` skip this preparation. Word export loads
+`python-docx` on the first document save. These changes work with the existing Python 3.13
+environment; an interpreter upgrade is not required.
+
+For a model startup measurement without opening the microphone, stop any live recording
+and run `python tools/recorder_startup_benchmark.py --menu-seconds 3`. It reports time to
+the menu and the model load wait after choosing Record, with RAM and timeout limits.
+
 ## Correcting a lecture
 
 Open **Corrections** in the dashboard, or **Correct this lecture** in Recordings.
@@ -121,7 +132,7 @@ appended to that class's ongoing notes file.
 Note formatting is tried in this order, each falling back to the next if unavailable:
 1. **Claude Code CLI** (`claude -p`) — uses your logged-in Pro/Max subscription, no per-token billing
 2. **Claude API** (`ANTHROPIC_API_KEY`) — only used if the CLI isn't installed/logged in
-3. **Local GPU model** (Qwen2.5-3B via llama.cpp, on the discrete GPU) — real LLM formatting, fully offline, used if neither the CLI nor API is available
+3. **Local GPU model** (shared lean Bonsai 27B via dashboard-managed llama.cpp) — real LLM formatting, fully offline, used if neither the CLI nor API is available
 4. **Heuristic local formatter** — regex-based topic/bullet formatting + glossary correction, last resort if the local model isn't set up either
 
 Also:
@@ -511,11 +522,11 @@ The app is currently tuned for accuracy over live-update frequency:
 - **Model**: Cohere Transcribe 03-2026, chosen by measurement. In a three-way test on
   real PSYC 1300 and BIOL 1440 lectures it disagreed least with the other two models
   on both clips, ran several times faster than Whisper large-v3 or Qwen3-ASR, and got
-  technical terms right with no vocabulary prompt. It's the only model - the Whisper
+  technical terms right with no vocabulary prompt. It's the primary model - the Whisper
   fallback and its tuning tools were removed after Cohere ran every lecture without
-  failing (results kept in `state/model_ab/`). Cohere returns no word timings; each piece it decodes (up
-  to 35s) is one timed segment, so search jumps to the right half-minute of a
-  recording, not the exact word.
+  failing (results kept in `state/model_ab/`). Cohere itself returns no word timings; each piece it decodes (up
+  to 35s) is one timed segment during recording. The optional forced aligner now
+  adds word timings to the saved segment ledger at session end.
 - **Cohere settings** (`COHERE_*` in `src/transcribe.py`): tuned by
   `tools/cohere_tuning.py` against human-verified TED-LIUM transcripts, not other
   models. The app hands Cohere 2-minute windows, which its own splitter cuts at the
@@ -552,10 +563,10 @@ The app is currently tuned for accuracy over live-update frequency:
   (a read-only check; it never unmutes mid-recording), and reports when the signal
   returns and for how long it was lost. The dashboard's **Mic signal** tile turns
   red while it's out.
-- **Chunk size** (`--chunk`): defaults to Cohere's tuned 120s window. Accurate text arrives in 2-minute batches,
-  without an additional preview pass. A window is only
+- **Chunk size** (`--chunk`): defaults to Cohere's tuned 120s window. Canonical text arrives in 2-minute batches,
+  with a separate native streaming preview when its assets are installed. A window is only
   skipped as silent if every 20s slice of it is silent.
-- **No chunk overlap**: Cohere has no word timings to drop repeated words with, so
+- **No chunk overlap**: live Cohere output has no word timings to drop repeated words with, so
   windows run back to back - exactly how it was tested - and its splitter cuts each
   window at quiet points.
 - **Latin/technical vocabulary**: add terms to `vocab.json` under your class's code
@@ -582,71 +593,46 @@ Preflight prints the device the model loaded on (`cuda/bfloat16`).
 
 ## Local GPU note formatting
 
-Set up as the third formatting tier (`src/gpu_formatter.py`) — kicks in
-automatically when neither the Claude CLI nor API is available, before
-falling back further to the pure heuristic formatter. Runs a local LLM
-(**Qwen2.5-3B-Instruct**, GGUF Q8_0) via **llama.cpp's `llama-server`**, fully
-offline, actually reaching the discrete GPU (RTX 5070 Ti).
+`src/gpu_formatter.py` supplies the local LLM formatting tier. In `auto` mode,
+formatting tries the Claude CLI, then API, then this tier, then the heuristic
+formatter. In `local` mode, it tries this tier and the heuristic formatter
+without contacting the CLI or API. `heuristic` mode skips LLM formatting.
 
-This reuses the already-installed llama.cpp build at
-`C:/AI/Tools/llama-native/bin/llama-server.exe` **read-only, as a completely
-separate process on its own port (8090)** — it does not touch, reconfigure,
-or share anything with any other personal llama.cpp/model setup on this
-machine. The model file lives in this project's own `state/llama_model/`,
-never in a shared models folder. The app starts its own server automatically
-on first use each run and shuts it down explicitly when the recorder finishes. An
-`atexit` hook covers ordinary interpreter shutdown, and on Windows the owned child is
-also placed in a kill-on-close Job Object so closing the recorder console cannot leave
-`llama-server.exe` orphaned. The cleanup targets only the process Lecture Notes starts;
-it never stops an independently launched server. This means it doesn't
-sit in the background holding ~3.6GB of VRAM between lecture sessions.
+The local tier uses the existing saved **lean Bonsai 27B** profile,
+`Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf`, from `C:/AI/Config/models.json`
+and `C:/AI/models/`. Inference goes through the **shared dashboard-managed
+llama.cpp server on port 10000**, with the manager on port 9090. There is no
+project-private model download or independent inference server.
 
-Setup (one-time, ~3.6GB download into this project only):
-```python
-from huggingface_hub import hf_hub_download
-hf_hub_download("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-instruct-q8_0.gguf",
-                 local_dir="state/llama_model")
-```
-(If the Hugging Face download fails with a Xet/CDN error, retry with
-`HF_HUB_DISABLE_XET=1` set - a more reliable plain-HTTP fallback.)
+- An existing server is reused only after checking the exact model path, at
+  least 32768 tokens of context, idle slots, process identity, and required RAM
+  safety arguments (`--load-mode none --cache-ram 0`). A different, busy, or
+  unverifiable model is left alone and formatting falls back to heuristics.
+- When no inference server is present, a new load requires the saved RAM floor
+  (at least 3.3 GiB of available physical RAM) and the manager's admission check.
+  The recorder requests the saved profile with `persist: false`, `onlyIfIdle: true`,
+  and a 32768-token context; it does not change saved settings. If the manager is
+  absent, a guarded bootstrap can start only the fixed `C:/AI/dashboard-server.ps1`
+  controller after checking that the relevant listeners/processes are absent and
+  that available RAM is sufficient.
+- Completion requests have a 180-second deadline and a RAM watchdog. RAM below
+  0.8 GiB for 3 seconds aborts the request and can ask the manager to stop only the
+  exact original, verified model process. Truncated completions are rejected.
+- Ordinary recorder shutdown leaves the shared server and manager running. The
+  manager owns the server's idle policy. Closing the recorder does not imply that
+  shared GPU memory returns to zero.
+- Missing files, failed admission, unavailable or busy services, and failed
+  completions use the heuristic formatter. The glossary correction pass is also
+  applied to successful local LLM output.
 
-**Why this backend, not OpenVINO/NPU:** an NPU-based tier (Phi-3.5-mini via
-OpenVINO GenAI) was built and evaluated first. It was rolled back after two
-real reliability failures on the actual pipeline (not hand-picked test
-prompts): default (greedy) decoding produced degenerate repetition - 9
-near-duplicate paraphrased bullets for one simple two-sentence transcript -
-and adding a `repetition_penalty` to fix that instead caused incoherent
-rambling that invented content never in the transcript. A "GPU" comparison
-via OpenVINO was also tried, but OpenVINO's GPU plugin only targets Intel
-graphics (oneAPI/Level Zero) - it silently ran on the integrated GPU, never
-the RTX 5070 Ti, and was no faster than the NPU. Switching to llama.cpp (which
-does reach NVIDIA GPUs via CUDA) fixed all three problems at once: **~90-110
-tok/s** vs. NPU's effective ~1-2 tok/s, no repetition (llama.cpp's sampling
-defaults + explicit `repeat_penalty`/`temperature` tuning), and no
-hallucination in per-chunk formatting testing.
+The local LLM prompt requires preserving the transcript's original wording,
+facts, attribution, quantities, negations, and uncertainty. Generated notes still
+need review against the source. Historical speed and quality results for the
+retired private Qwen2.5-3B setup do not establish this shared profile's behavior.
 
-**Why the Ctrl+C condense pass doesn't use this tier:** per-chunk formatting
-tested reliably, but the harder multi-section merge/dedup task didn't -
-across repeated test runs, it would inconsistently drop one genuinely
-distinct bullet (which one varied by generation parameters) while satisfying
-the notes' other instructions. That's a real content-loss risk that matters
-more for condensing (which rewrites/replaces existing notes) than for
-per-chunk formatting (which only appends), so `condense_session()` stays
-CLI/API-only - see the comment in `src/notes.py` for the full reasoning.
-
-Notes:
-- Cold start (server spawn + model load) takes a few seconds; the app reuses
-  the same server process for the rest of that run.
-- Still noticeably less capable than Claude (3B params vs. a frontier model) -
-  it inconsistently catches mis-transcribed vocabulary, so the same
-  `vocab.json` glossary fix-up the heuristic formatter uses is applied to its
-  output too.
-- If the llama.cpp binary or the model file isn't found, this tier is
-  silently skipped and the app falls straight to the heuristic formatter -
-  nothing else breaks.
-- VRAM check: `nvidia-smi --query-gpu=memory.used --format=csv` should show
-  ~0MiB before a run and ~3.6GB while `llama-server.exe` is running for this
-  app; it should return to ~0MiB after the app exits.
+`condense_session()` remains CLI/API-only: it replaces an existing session's
+notes, and the local LLM tier is not used for that merge/deduplication step.
+`local` and `heuristic` modes skip it.
 
 ## Running unattended (minimized / long sessions)
 
@@ -657,7 +643,7 @@ theoretical hardening:
 
 - **Threaded audio capture** (`src/capture.py`) - the biggest one. Audio
   capture runs on its own dedicated background thread, continuously draining
-  the microphone/system-audio buffer into an in-memory queue, completely
+  the microphone/system-audio buffer into a queue of references to persisted audio, completely
   decoupled from transcription and saving. This replaced an earlier
   single-threaded design where any slow step in the main loop (a stuck API
   call, and especially the diarization pass, which used to run every autosave)
@@ -701,6 +687,114 @@ theoretical hardening:
 - The capture thread also **auto-recovers from audio-device errors** (a
   dropout after a resume, a USB mic hiccup): it logs the error (surfaced in
   the console) and reopens the recorder instead of capture dying silently.
+
+## Recorder efficiency experiments
+
+Measured results, accuracy checks, and the decisions about defaults are in
+[the October 11 efficiency report](docs/recorder-efficiency-2026-10-11.md).
+
+The transcription backend now skips quiet pieces before generation, using the
+existing silence threshold and the processor's exact piece mapping. Speech keeps
+its original feature padding and timestamps. Mapping mismatches decode the whole
+batch. The repetition repair and final silence guards still run. The telemetry
+field `guard_skipped_silent` counts avoided decodes separately from discarded text.
+
+WASAPI discontinuity warnings are counted per capture thread and across device
+reconnects. `capture_discontinuities` and dashboard events expose reported gaps;
+the driver flag does not tell us how much audio was lost. Capture still persists
+each block before inference. Mono remains the default; stereo can be compared
+without changing the recorder's configuration:
+
+```powershell
+.\venv\Scripts\python.exe -B tools/capture_diagnostics.py --source mic --seconds 6 --output state/efficiency_experiment/capture_new.json
+```
+
+Offline experiments have RAM/VRAM gates, process-tree cleanup, hard timeouts,
+and distinct output paths. Close the recorder normally before running them.
+They preserve live telemetry, notes, and recordings. The model comparisons use
+the installed checkpoint. VAD remains experiment-only; the pinned Nano runtime is
+now integrated with bounded loading and reference fallback (see below). Raw benchmark artifacts and public
+experiment dependencies are under ignored `state/efficiency_experiment/`.
+
+```powershell
+.\venv\Scripts\python.exe -B tools/prepare_recorder_experiments.py
+.\venv\Scripts\python.exe -B tools/recorder_efficiency_benchmark.py --baseline state/efficiency_experiment/baseline --output state/efficiency_experiment/silence_new.json
+.\venv\Scripts\python.exe -B tools/vad_benchmark.py --ami-limit 843 --output state/efficiency_experiment/vad_new.json
+.\venv\Scripts\python.exe -B tools/decoder_benchmark.py --backend hf --dataset validation --output state/efficiency_experiment/hf_new.json
+.\venv\Scripts\python.exe -B tools/decoder_benchmark.py --backend nano --dataset validation --output state/efficiency_experiment/nano_new.json
+.\venv\Scripts\python.exe -B tools/formatter_benchmark.py --output state/efficiency_experiment/formatter_new.json
+```
+
+The silence comparison requires a `transcribe.py` working-tree snapshot from
+before the change. VAD requires the pinned Silero ONNX model. Nano requires the
+pinned upstream package and license in the experiment directory. See the
+`assets_manifest.json` and `provenance.json` files for commit IDs and file hashes.
+The preparation tool downloads only hash-pinned public code/model assets; it does
+not install packages or change the recorder's environment. Validation also requires
+the cached human-reference TED-LIUM/AMI data and `state/eval/normalizer.json`.
+The formatting comparison uses the existing configured CLI model and synthetic
+fixtures only; it never saves notes. Pattern checks require semantic review.
+
+## Recorder priority implementation (October 12)
+
+The six priorities are integrated in the requested order. See
+[the implementation and verification report](docs/recorder-priorities-2026-10-12.md)
+for timings, fidelity checks, and the decisions about defaults.
+
+1. **Bounded loader:** `auto` uses the pinned Nano runtime with the same Cohere
+   checkpoint, prompt, piece boundaries, silence checks and repetition repairs.
+   Two 64 MiB pinned buffers stream the checkpoint to one GPU allocation. A failed
+   bulk allocation falls back to tensor-at-a-time loading; a failed runtime load
+   falls back to the reference Transformers backend. Use `--asr-runtime hf` to
+   select the reference implementation explicitly.
+2. **Lean formatting:** Claude gets a dedicated source-fidelity system prompt,
+   no tools, no session persistence, and `--safe-mode` to skip coding customization
+   while keeping subscription authentication. Proofreading and note writing remain
+   two passes. Bare mode failed authentication here; it is available only through
+   `NOTE_RECORDER_CLAUDE_BARE=1` for a separately configured job.
+3. **Capture during preparation:** once class and source are selected, the WAV
+   starts recording while the model loads and the remaining prompt is answered.
+   Audio validation observes the first three persisted seconds from that same
+   capture thread. Queued blocks refer to the WAV instead of accumulating audio
+   arrays in RAM. Startup failure or Ctrl+C closes capture and preserves the WAV
+   for `--resume`.
+4. **Word alignment:** the local Qwen forced aligner adds validated word timestamps
+   at session end. It preserves source words and punctuation, and speaker attribution
+   can split a long transcript piece at word boundaries. Invalid alignment retains
+   the original piece. Use `--word-alignment off` to skip it.
+5. **Compiled encoder:** `--encoder compile-bf16` compiles single-piece batches and
+   keeps larger batches eager, following the measured speed difference. It recovers
+   eagerly on compiler failure. Compilation is opt-in because a new cache costs time.
+   `--encoder compile-fp8` is experimental: it changes some recognized words and did
+   not show a consistent speed win. The normal default remains `eager`.
+6. **Streaming and vocabulary retries:** an isolated native CPU process provides
+   provisional captions in Diagnostics while Cohere continues producing the final
+   transcript. Capture never waits for it. A bounded queue resets the preview across
+   a dropped interval; the WAV remains complete. At shutdown, selected glossary near
+   misses get two local Qwen decodes. A correction requires their agreement, exactly
+   one known glossary-word change, and every other word unchanged. The original and
+   both candidates remain in the segment ledger. Accepted corrections refresh the
+   complete session's notes. Use `--captions off` or `--vocabulary-retry off` to skip
+   these paths.
+
+Public assets are pinned in the project-owned `state/` directories:
+
+```powershell
+.\venv\Scripts\python.exe -B tools/prepare_priority_assets.py aligner
+.\venv\Scripts\python.exe -B tools/prepare_priority_assets.py native
+.\venv\Scripts\python.exe -B tools/prepare_priority_assets.py vocabulary
+```
+
+Those assets are already prepared on this machine. Optional compilation uses the
+installed CUDA Torch 2.11 build and the matching Windows compiler:
+
+```powershell
+.\venv\Scripts\python.exe -m pip install -r requirements-encoder.txt
+.\venv\Scripts\python.exe -B src/main.py --encoder compile-bf16
+```
+
+Python remains 3.13.15 so the existing narration stack stays compatible. Model
+verification tools run in bounded offline children and never open the microphone.
 
 ## Notes on system audio
 

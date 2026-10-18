@@ -1,10 +1,13 @@
 """Mirrors the markdown notes into a matching .docx file, appending each lecture's
 section the same way notes.py appends to the .md file, so both stay in sync."""
+from __future__ import annotations
+
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+if TYPE_CHECKING:
+    from docx.document import Document
 
 NOTES_DIR = Path(__file__).resolve().parent.parent / "notes"
 
@@ -30,6 +33,8 @@ def _add_inline_runs(paragraph, text: str):
 
 
 def _append_markdown(doc: Document, markdown: str):
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
     markdown = re.sub(r"<!-- /?session:[A-Za-z0-9_-]+ -->", "", markdown)
     for raw_line in markdown.split("\n"):
         line = raw_line.rstrip()
@@ -57,6 +62,8 @@ def _append_markdown(doc: Document, markdown: str):
 
 def append_section(class_code: str, class_title: str, section_markdown: str):
     """Appends one lecture's formatted section to notes/<CODE>.docx, creating it if needed."""
+    from docx import Document
+
     path = docx_path(class_code)
     if path.exists():
         doc = Document(str(path))
@@ -78,6 +85,8 @@ def save_study_guide(class_code: str, class_title: str, guide_markdown: str):
     """Writes a class's consolidated study guide as its own .docx, separate from the
     per-lecture notes.docx - always a full rewrite, there's no incremental append case
     for this (a study guide is regenerated from scratch each time, not built up)."""
+    from docx import Document
+
     doc = Document()
     _append_markdown(doc, guide_markdown)
     path = study_guide_docx_path(class_code)
@@ -89,6 +98,8 @@ def rebuild(class_code: str, class_title: str, full_markdown: str):
     """Rebuilds notes/<CODE>.docx from scratch to match `full_markdown` exactly. Used
     after condensing a session's notes, since incremental append can't handle edits
     or removals to already-written content - only a full rebuild can."""
+    from docx import Document
+
     doc = Document()
     _append_markdown(doc, full_markdown)
     path = docx_path(class_code)

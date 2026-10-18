@@ -103,6 +103,17 @@ Output ONLY the corrected transcript text, same structure/tags, no preamble or e
 """
 
 
+_NOTES_FIDELITY_RULES = """- Preserve every stated fact, negation, qualifier, and uncertainty.
+- Preserve the scope of quantities exactly as stated. If it is ambiguous, retain
+  the source wording instead of inferring rates, totals, or counts per person/item.
+- Do not add factual assertions to explain compliance with these instructions,
+  including assertions about how many readings were taken or how a measurement
+  was obtained unless the transcript supplies them.
+- Supplementary definitions may explain a mentioned term, but must not invent
+  an experimental setup, an unreported measurement, or a causal explanation.
+"""
+
+
 def _build_notes_prompt(class_title: str, class_code: str, session_date: str,
                          transcript: str, prior_tail: str) -> str:
     return f"""You are turning a cleaned-up speech-to-text lecture transcript into clean study notes.
@@ -144,6 +155,7 @@ session itself. Requirements:
   summary.
 - Use bullet points and sub-bullets for concepts, bold key terms
 - Fix obvious speech-to-text errors and filler words, but don't invent content that wasn't said
+{_NOTES_FIDELITY_RULES}
 - Group related points under short level-3 headings if the lecture covered multiple topics
 - Where a technical term or concept is mentioned but not fully explained in the transcript,
   you may add a brief one-line background definition from general knowledge of the subject
@@ -195,6 +207,14 @@ def _looks_like_assistant_chatter(text: str) -> bool:
 
 last_cli_failure: str | None = None  # why the most recent CLI call returned None (None after a success)
 
+_FORMATTER_SYSTEM = (
+    "Transform only the supplied lecture material into the requested artifact. "
+    "Return the artifact alone, with no preface. Preserve quantities, units, scope, "
+    "negation, questions and answers, quiz cues, and explicit uncertainty flags. "
+    "Never invent missing context or silently repair uncertain scientific claims. "
+    "Follow the source-fidelity rules and output contract in the user prompt."
+)
+
 
 def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> str | None:
     """Returns clean markdown via the Claude Code CLI (subscription usage), or None if unusable.
@@ -208,8 +228,13 @@ def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> s
         last_cli_failure = "the Claude CLI isn't installed (claude.exe was not found)"
         return None
     try:
+        # Bare mode bypasses the normal subscription authentication on this CLI.
+        # Use it only when explicitly configured for an independently authenticated job.
+        bare = ["--bare"] if os.environ.get("NOTE_RECORDER_CLAUDE_BARE") == "1" else ["--safe-mode"]
         result = subprocess.run(
-            [cli, "-p", "--model", CLAUDE_MODEL, "--disallowedTools", " ".join(_CLI_NO_TOOLS)],
+            [cli, "-p", "--model", CLAUDE_MODEL, *bare, "--tools", "",
+             "--system-prompt", _FORMATTER_SYSTEM, "--no-session-persistence",
+             "--disallowedTools", " ".join(_CLI_NO_TOOLS)],
             input=prompt,
             capture_output=True,
             text=True,
@@ -299,15 +324,9 @@ def _detect_corrections(original: str, corrected: str) -> set[str]:
 
 def _build_combined_prompt(class_title: str, class_code: str, session_date: str,
                             transcript: str, prior_tail: str) -> str:
-    """Same end result as running _build_proofread_prompt then _build_notes_prompt as
-    two separate CLI/API calls, but as ONE call/prompt instead. Used for the expensive
-    full-session-diarization save at Ctrl+C (a large, latency-sensitive transcript,
-    where two sequential round-trips over the whole thing was the dominant cost -
-    measured ~200s vs. a much smaller per-chunk save where the extra round-trip barely
-    matters). Trades away the separate proofread-only output that vocab-learning
-    diffs against - that's fine here since it's a one-shot, whereas the smaller
-    per-chunk path (which keeps the two-call version) already gets plenty of chances
-    to learn vocabulary over the course of a session."""
+    """Proofreading and notes instructions in one call. Used for the final diarized
+    save; ordinary saves retain the two-pass default. Outputs need source-fidelity
+    evaluation before changing that default. Vocabulary auto-learning is disabled."""
     terms = vocab_module.terms_for_class(class_code)
     glossary_line = ("Known vocabulary for this class (fix mis-transcriptions toward these "
                       f"when it's clearly the intended word): {', '.join(terms)}\n\n") if terms else ""
@@ -356,6 +375,9 @@ session itself. Requirements:
 - Use bullet points and sub-bullets for concepts, bold key terms
 - Don't invent content that wasn't said, and don't drop content just because it's long -
   this may be a full lecture's worth of material, cover all of it
+{_NOTES_FIDELITY_RULES}
+- Preserve existing inline "[FLAG: possible transcription error - please verify]"
+  markers on their associated claim, as a trailing "⚠️ *verify*" note.
 - Group related points under short level-3 headings for each topic covered
 - Where a technical term or concept is mentioned but not fully explained in the transcript,
   you may add a brief one-line background definition from general knowledge of the subject
@@ -370,9 +392,8 @@ session itself. Requirements:
 
 def _proofread(class_title: str, class_code: str, transcript: str) -> str:
     """Runs the transcript through a proofread/flag pass via CLI or API. Returns the
-    original transcript unchanged if neither is available (local-only mode). Also
-    detects likely vocabulary corrections and persists them to vocab.json (best-effort,
-    never lets a failure here affect the actual proofreading result)."""
+    original transcript unchanged if neither is available (local-only mode).
+    Vocabulary corrections are not learned automatically."""
     prompt = _build_proofread_prompt(class_title, class_code, transcript)
     cleaned = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
     # Automatic vocabulary learning from this diff is deliberately OFF. It ran for two

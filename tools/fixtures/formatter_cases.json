@@ -1,0 +1,72 @@
+[
+  {
+    "id": "terms_numbers_qa_flags",
+    "title": "Synthetic Chemistry Fixture",
+    "date": "Sunday, October 11, 2026",
+    "prior_tail": "## Previous fixture\n- The previous example used a blue indicator.",
+    "transcript": "[Speaker 1] These are fictional laboratory observations for a formatting test. Sample A had a pH of seven point four. Sample B had a pH of five point two. The concentration was zero point one five molar, not one point five molar. The incubation lasted fifteen minutes, not fifty. The instrument read twelve point six millivolts. Electron negativity is the ability of an atom in a bond to attract shared electrons. An an eye on has gained electrons and has a negative charge; a cat eye on has lost electrons and has a positive charge. The reagent label sounded like feenol red [FLAG: possible transcription error - please verify]. Preserve that uncertainty because the label has not been checked. The new observation uses a yellow indicator, different from the previous blue example.\n[Speaker 2] Does Sample A have the lower pH?\n[Speaker 1] No. Sample B has the lower pH, five point two. A is seven point four.\n[Speaker 2] Should we memorize the instrument's brand for the quiz?\n[Speaker 1] No. Know the charge signs and the two measured pH values. The brand is not required.\n[Speaker 1] Do not combine the two samples or round their readings to whole numbers.",
+    "checks": [
+      {"name": "sample_a_ph", "pattern": "7\\.4"},
+      {"name": "sample_b_ph", "pattern": "5\\.2"},
+      {"name": "concentration", "pattern": "0\\.15"},
+      {"name": "incubation", "pattern": "15.{0,35}min|fifteen.{0,35}min"},
+      {"name": "voltage", "pattern": "12\\.6"},
+      {"name": "electronegativity", "pattern": "electronegativity"},
+      {"name": "anion", "pattern": "anion"},
+      {"name": "cation", "pattern": "cation"},
+      {"name": "yellow_indicator", "pattern": "yellow"},
+      {"name": "claim_local_uncertainty", "pattern": "(?:phenol|feenol).{0,180}(?:verify|FLAG)"},
+      {"name": "qa_section", "pattern": "### Q&A"},
+      {"name": "student_question", "pattern": "Q \\(Student\\)"},
+      {"name": "instructor_answer", "pattern": "A \\(Instructor\\)"}
+    ]
+  },
+  {
+    "id": "negation_contrast_quiz",
+    "title": "Synthetic Psychology Fixture",
+    "date": "Sunday, October 11, 2026",
+    "prior_tail": "",
+    "transcript": "[Speaker 1] This is a fictional experiment. Group Cedar contains twenty four participants. Group Maple contains eighteen participants. Participants were randomly assigned to the groups. Cedar completed six trials, Maple completed four. Each trial lasted ninety seconds. One participant withdrew from Maple; do not call that an exclusion from Cedar. The independent variable is trial condition. The dependent variable is response time. We measured response time, not accuracy. The control condition used an empty screen. Cedar's average response time was three hundred ten milliseconds. Maple's average was three hundred eighty milliseconds. Those numbers are sample means, not proof of a population difference. We have not computed a significance test. Correlation does not establish causation. A confounding variable can offer another explanation for an association.\n[Speaker 2] Can we say the effect is statistically significant?\n[Speaker 1] No, because we have not computed the test. Keep that distinction on the quiz.\n[Speaker 2] Are accuracy scores available?\n[Speaker 1] No. Only response times were measured.\n[Speaker 1] For the quiz, identify the independent and dependent variables and explain what the missing test prevents us from concluding.",
+    "checks": [
+      {"name": "cedar_count", "pattern": "24|twenty.four"},
+      {"name": "maple_count", "pattern": "18|eighteen"},
+      {"name": "cedar_trials", "pattern": "6.{0,25}trial|six.{0,25}trial"},
+      {"name": "maple_trials", "pattern": "4.{0,25}trial|four.{0,25}trial"},
+      {"name": "trial_duration", "pattern": "90.{0,25}second|ninety.{0,25}second"},
+      {"name": "response_time_a", "pattern": "310"},
+      {"name": "response_time_b", "pattern": "380"},
+      {"name": "confounding", "pattern": "confound"},
+      {"name": "no_significance_claim", "pattern": "not.{0,80}(?:comput|test|significan)|no.{0,80}(?:test|significan)|cannot.{0,80}significan"},
+      {"name": "quiz_instruction", "pattern": "quiz"},
+      {"name": "no_inferred_per_person_counts", "pattern": "(?:\\b[64]\\b|six|four)[^\\n]{0,25}trials?[^\\n]{0,12}(?:\\beach\\b|per (?:person|participant))", "forbidden": true},
+      {"name": "qa_section", "pattern": "### Q&A"}
+    ]
+  },
+  {
+    "id": "many_distinct_observations",
+    "title": "Synthetic Observation Fixture",
+    "date": "Sunday, October 11, 2026",
+    "prior_tail": "",
+    "transcript": "The following fictional observations are all distinct and all must remain in the notes. Station Amber recorded 17 droplets at 08:10. Station Birch recorded 23 droplets at 08:15. Station Coral recorded 31 droplets at 08:20. Station Delta recorded 11 droplets at 08:25. Station Elm recorded 29 droplets at 08:30. Station Fern recorded 37 droplets at 08:35. Station Grove recorded 13 droplets at 08:40. Station Hazel recorded 19 droplets at 08:45. Station Iris recorded 41 droplets at 08:50. Station Juniper recorded 43 droplets at 08:55. Station Kelp recorded 47 droplets at 09:00. Station Laurel recorded 53 droplets at 09:05. Amber and Coral were exposed to light. All other stations were shaded. No station was heated. Birch and Elm had transparent containers; the rest had opaque containers. Delta used a five milliliter container. Every other station used a ten milliliter container. Only Hazel had its lid open. Kelp was checked twice, and its reading remained 47 both times. This does not mean there were two different Kelp samples. The temperature sensor failed at Juniper, so no temperature should be invented for that station. The station named Iris sounded like either Iris or Ibis [FLAG: possible transcription error - please verify]. Keep its count 41 even though the name needs verification. For the quiz, compare container transparency separately from light exposure; the two factors are not interchangeable. The instructor gave no causal interpretation of these observations.",
+    "checks": [
+      {"name": "amber", "pattern": "Amber.{0,80}17"},
+      {"name": "birch", "pattern": "Birch.{0,80}23"},
+      {"name": "coral", "pattern": "Coral.{0,80}31"},
+      {"name": "delta", "pattern": "Delta.{0,80}11"},
+      {"name": "elm", "pattern": "Elm.{0,80}29"},
+      {"name": "fern", "pattern": "Fern.{0,80}37"},
+      {"name": "grove", "pattern": "Grove.{0,80}13"},
+      {"name": "hazel", "pattern": "Hazel.{0,80}19"},
+      {"name": "iris", "pattern": "(?:Iris|Ibis).{0,80}41"},
+      {"name": "juniper", "pattern": "Juniper.{0,80}43"},
+      {"name": "kelp", "pattern": "Kelp.{0,80}47"},
+      {"name": "laurel", "pattern": "Laurel.{0,80}53"},
+      {"name": "last_timestamp", "pattern": "09:05|9:05"},
+      {"name": "failed_temperature", "pattern": "temperature.{0,80}(?:fail|unavailable|missing)|(?:fail|unavailable|missing).{0,80}temperature"},
+      {"name": "uncertainty", "pattern": "verify|FLAG"},
+      {"name": "quiz", "pattern": "quiz"},
+      {"name": "no_unstated_setup", "pattern": "condens|transpir|evaporat", "forbidden": true},
+      {"name": "no_inferred_single_reading", "pattern": "(?:each|every|all) station.{0,55}single reading", "forbidden": true}
+    ]
+  }
+]

@@ -16,8 +16,10 @@ comtypes>=1.4.0
 # accept its terms on https://huggingface.co/CohereLabs/cohere-transcribe-03-2026 with the
 # account behind HUGGINGFACE_TOKEN, then:
 #   python -c "import os; from huggingface_hub import snapshot_download; snapshot_download('CohereLabs/cohere-transcribe-03-2026', local_dir='state/cohere_transcribe', token=os.environ['HUGGINGFACE_TOKEN'])"
-# It's the only model: without it (or without a CUDA GPU) preflight won't start a recording.
-transformers>=5.4.0
+# This is the required primary ASR model. Without it (or without CUDA), preflight
+# rejects the session; any audio already captured during preparation remains recoverable.
+transformers>=5.17.0
+safetensors>=0.8.0
 sentencepiece>=0.2.0
 accelerate>=1.0.0
 # Cohere's feature extractor builds its mel filters with librosa (transformers declares the

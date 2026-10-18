@@ -118,13 +118,35 @@ def assign_speakers(transcript_segments: list[dict], diarization_segments: list[
     Returns the same list with a "speaker" key added (best-overlap match, or None)."""
     labeled = []
     for seg in transcript_segments:
-        best_speaker, best_overlap = None, 0.0
-        for d in diarization_segments:
-            overlap = min(seg["end"], d["end"]) - max(seg["start"], d["start"])
-            if overlap > best_overlap:
-                best_overlap, best_speaker = overlap, d["speaker"]
-        labeled.append({**seg, "speaker": best_speaker})
+        words = seg.get('words')
+        if words:
+            turns = []
+            for word in words:
+                speaker = _speaker_for(word, diarization_segments)
+                if not turns or turns[-1]['speaker'] != speaker:
+                    turns.append({'start': word['start'], 'end': word['end'], 'speaker': speaker,
+                                  'char_start': word['char_start'], 'char_end': word['char_end']})
+                else:
+                    turns[-1]['end'] = word['end']
+                    turns[-1]['char_end'] = word['char_end']
+            for index, turn in enumerate(turns):
+                # Source slices retain punctuation, including any standalone punctuation.
+                begin = 0 if index == 0 else turn['char_start']
+                end = turns[index + 1]['char_start'] if index + 1 < len(turns) else len(seg['text'])
+                labeled.append({'start': turn['start'], 'end': turn['end'],
+                                'text': seg['text'][begin:end].strip(), 'speaker': turn['speaker']})
+            continue
+        labeled.append({**seg, "speaker": _speaker_for(seg, diarization_segments)})
     return labeled
+
+
+def _speaker_for(span, turns):
+    best, overlap = None, 0.0
+    for turn in turns:
+        shared = min(span['end'], turn['end']) - max(span['start'], turn['start'])
+        if shared > overlap:
+            best, overlap = turn['speaker'], shared
+    return best
 
 
 def to_labeled_transcript(labeled_segments: list[dict]) -> str:

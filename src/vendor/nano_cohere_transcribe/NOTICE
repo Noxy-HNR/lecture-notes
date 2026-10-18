@@ -1,0 +1,2 @@
+Vendored nano-cohere-transcribe, Apache-2.0. Upstream commit f8e1cd94554a812f35d56dbdc42c461c681da774.
+Local changes: injectable bounded loader and per-model graph cache; generation telemetry; configurable encoder runtime.

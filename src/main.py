@@ -154,6 +154,7 @@ def choose_action(args) -> str:
     print("  2. Generate a study guide from a class's notes so far")
     print("  3. Quiz yourself with flashcards")
     print("  4. Open the dashboard (browse/search notes, live diagnostics)")
+    transcribe.start_dependency_preparation()
     choice = input("Choose [1]: ").strip() or "1"
     return {"2": "study_guide", "3": "flashcards", "4": "dashboard"}.get(choice, "record")
 
@@ -515,9 +516,14 @@ class CaptureWatchdog:
         self.capture = make_capture()
         self.capture.start()
         self.restarts = 0
+        self._retired_discontinuities = 0
         self._last_check = clock()
         self._last_restart = None
         self._reconnecting = False
+
+    @property
+    def discontinuities(self):
+        return self._retired_discontinuities + getattr(self.capture, "discontinuities", 0)
 
     def check(self) -> tuple[list[tuple[str, str]], "np.ndarray | None"]:
         """(messages to show as (level, text), audio recovered from an abandoned capture)."""
@@ -539,6 +545,7 @@ class CaptureWatchdog:
             messages.append(("error", f"No audio has arrived from the {self._source_label} for {stalled:.0f}s - "
                                       f"the audio device stopped responding (this can happen after sleep). "
                                       f"Reconnecting..."))
+            self._retired_discontinuities += getattr(self.capture, "discontinuities", 0)
             recovered = self.capture.abandon()
             self.capture = self._make_capture()
             self.capture.start()
@@ -546,6 +553,19 @@ class CaptureWatchdog:
             self._last_restart = now
             self._reconnecting = True
         return messages, recovered
+
+
+class PersistedBlock:
+    """A queue entry backed by the durable WAV, so a slow start cannot grow RAM."""
+    def __init__(self, reader, offset, frames):
+        self.reader, self.offset, self.frames = reader, offset, frames
+
+    def __len__(self):
+        return self.frames
+
+    def __array__(self, dtype=None, copy=None):
+        result = self.reader(self.offset, self.frames)
+        return np.asarray(result, dtype=dtype)
 
 
 class Session:
@@ -587,9 +607,11 @@ class Session:
 
     def persist_audio(self, block):
         with self._lock:
+            offset = self.total_frames
             self._sf.write(block)
             self._sf.flush()  # update the WAV header as well as the samples
             self.total_frames += len(block)
+            return PersistedBlock(self.read_audio, offset, len(block))
 
     def read_audio(self, offset, frames):
         with self._lock:
@@ -602,9 +624,13 @@ class Session:
 
     def record_segments(self, segments, chunk_offset):
         with self._lock:
-            entries = [{"start": chunk_offset + seg["start"],
-                        "end": chunk_offset + seg["end"], "text": seg["text"]}
-                       for seg in segments]
+            entries = []
+            for seg in segments:
+                entry = {**seg, 'start': chunk_offset + seg['start'], 'end': chunk_offset + seg['end']}
+                if seg.get('words'):
+                    entry['words'] = [{**word, 'start': chunk_offset + word['start'],
+                                      'end': chunk_offset + word['end']} for word in seg['words']]
+                entries.append(entry)
             with self.segments_path.open("a", encoding="utf-8") as handle:
                 for entry in entries:
                     handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -688,14 +714,17 @@ PREFLIGHT_AUDIO_SAMPLE_SECONDS = 3.0  # long enough that a natural pause between
                                        # doesn't get mistaken for a dead/muted mic
 
 
-def _check_audio_device(source: str) -> tuple[bool, str]:
+def _check_audio_device(source: str, capture=None) -> tuple[bool, str]:
     """Returns (blocks_startup, message). Runs concurrently with the other preflight
     checks - safe because it only touches the audio subsystem (WASAPI), no shared
     state with the GPU/model or filesystem checks."""
     try:
-        test_recorder = audio.get_recorder(source)
-        with test_recorder:
-            test_clip = audio.record_chunk(test_recorder, PREFLIGHT_AUDIO_SAMPLE_SECONDS)
+        if capture is not None:
+            test_clip = capture.startup_sample(PREFLIGHT_AUDIO_SAMPLE_SECONDS)
+        else:
+            test_recorder = audio.get_recorder(source)
+            with test_recorder:
+                test_clip = audio.record_chunk(test_recorder, PREFLIGHT_AUDIO_SAMPLE_SECONDS)
         peak = float(np.max(np.abs(test_clip))) if test_clip.size else 0.0
         source_label = "microphone" if source == "mic" else "system audio"
         # Check sub-windows individually rather than the RMS of the whole sample - a
@@ -739,24 +768,20 @@ def _check_transcription_model() -> tuple[bool, str]:
         return True, c.error(f"  Transcription model FAILED to load: {e}")
 
 
-class PreflightRunner:
-    """Same sanity checks as before (audio device, disk space, transcription model load, and -
-    "local" mode only - the local GPU formatter's warm-up), but started as early as
-    possible instead of all at once right before recording. The interactive prompts
-    between "record a lecture" and actually starting (which class, which audio source,
-    which formatting mode) involve real wall-clock time spent waiting on the user to
-    type an answer - dead time that was previously wasted, since none of these checks
-    used to start until every prompt had already been answered.
+class PreflightFailed(RuntimeError):
+    pass
 
-    __init__ kicks off the two checks that don't depend on any user choice (disk space,
-    and transcription model load - the slowest of the four, especially cold) immediately.
-    start_audio_check()/start_gpu_warmup() kick off the other two as soon as their own
-    answer (source / formatting_mode) is known, rather than waiting for every remaining
-    prompt too. finish() is the only thing that prints anything - it starts any check
-    that didn't get an early opportunity (so this class is still correct and safe to use
-    even if a caller skips the early start_*() calls entirely), then waits for and prints
-    every result together in the same fixed order as before, so the visible checks-then-
-    result output is unchanged; only the wall-clock time to get there shrinks."""
+
+class PreflightRunner:
+    """Prepare model/disk checks during the class and source prompts.
+
+    The recorder attaches its already-running capture thread before the audio
+    check. Its first three persisted seconds provide device and signal validation,
+    without opening a second device or discarding the sample. Local formatting
+    warm-up still runs only when explicitly selected. finish() joins the checks,
+    prints their results, and blocks transcription on a model/device failure;
+    startup cleanup preserves the captured WAV for recovery.
+    """
 
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=4)
@@ -765,17 +790,23 @@ class PreflightRunner:
         self._audio_future = None
         self._gpu_future = None
 
-    def start_audio_check(self, source: str):
-        if self._audio_future is not None:
-            return
-        if source == "mic":
+    def prepare_source(self, source: str):
+        """Clear OS mute before the capture thread opens its one recording device."""
+        if source == "mic" and not getattr(self, '_source_unmuted', False):
             # Synchronous, and must happen before the mic gets opened by the audio-device
             # check below - if muted at the OS level, this clears it first so that check
             # actually picks up real audio instead of reporting silence. Only covers
             # OS-level mute (see mic_mute.py docstring for what it can't see).
             if mic_mute.check_and_unmute() == "unmuted":
                 print(c.warning("  Microphone was muted at the system level - unmuted it automatically."))
-        self._audio_future = self._executor.submit(_check_audio_device, source)
+        self._source_unmuted = True
+
+    def start_audio_check(self, source: str):
+        if self._audio_future is not None:
+            return
+        self.prepare_source(source)
+        capture = getattr(self, '_startup_capture', None)
+        self._audio_future = self._executor.submit(_check_audio_device, source, capture)
 
     def start_gpu_warmup(self, formatting_mode: str):
         if self._gpu_future is not None:
@@ -1307,6 +1338,16 @@ def run():
                          help="Quiz yourself with an interactive multiple-choice flashcard session "
                               "generated from all of a class's notes so far, and exit. Same CLI/API "
                               "requirement as --study-guide.")
+    parser.add_argument("--asr-runtime", choices=["auto", "nano", "hf"], default=None,
+                        help="Cohere runtime (auto uses the bounded lean runtime, with reference fallback)")
+    parser.add_argument("--word-alignment", choices=['auto', 'off'], default='auto',
+                        help="Add local word timestamps at session end when aligner assets are installed")
+    parser.add_argument("--encoder", choices=['eager', 'compile-bf16', 'compile-fp8'], default=None,
+                        help="Encoder runtime (BF16 compiles single-piece batches; experimental FP8 changes some words)")
+    parser.add_argument('--captions', choices=['auto', 'off'], default='auto',
+                        help='Fast local provisional captions when native assets are installed')
+    parser.add_argument('--vocabulary-retry', choices=['auto', 'off'], default='auto',
+                        help='Retry selected glossary near misses locally after recording')
     parser.add_argument("--diarize", action="store_true",
                          help="Enable speaker diarization (off by default: measured at ~0.55x "
                               "realtime on the whole session at Ctrl+C - ~27 min for a 50 min "
@@ -1319,6 +1360,12 @@ def run():
                          help="Open the web dashboards (notes browser + live diagnostics) and exit. "
                               "Runs as its own process - safe to leave open during a recording.")
     args = parser.parse_args()
+    if args.asr_runtime is not None:
+        os.environ['NOTE_RECORDER_ASR'] = args.asr_runtime
+    if args.encoder is not None:
+        os.environ['NOTE_RECORDER_ENCODER'] = args.encoder
+    import alignment
+    alignment.MODE = args.word_alignment
     diarize.ENABLED = args.diarize  # opt-in; see diarize.py for why it's off by default
 
     if args.list:
@@ -1377,18 +1424,57 @@ def run():
     # once every prompt is already answered.
     preflight = PreflightRunner()
 
-    cls = choose_class(args)
-    source = choose_source(args)
-    preflight.start_audio_check(source)  # don't wait for the formatting-mode prompt too
-    formatting_mode = choose_formatting_mode(args)
-    preflight.start_gpu_warmup(formatting_mode)
-
-    print()
-    if not preflight.finish(source, formatting_mode):
-        print(c.error("Preflight checks failed - fix the issue above before recording "
-                       "(this prevents starting a session that would silently fail)."))
-        sys.exit(1)
-    resolve_chunk_seconds(args)  # the model is loaded by now (preflight), so this is instant
+    session = watchdog = None
+    caption_holder = {'worker': None}
+    def persist_for_capture(block):
+        durable = session.persist_audio(block)
+        worker = caption_holder['worker']
+        if worker is not None:
+            try:
+                worker.submit(block)
+            except Exception:
+                pass  # provisional captions must never interrupt the durable recorder
+        return durable
+    try:
+        cls = choose_class(args)
+        source = choose_source(args)
+        preflight.prepare_source(source)
+        now = datetime.now()
+        session_date = f"{now.strftime('%A, %B')} {now.day}, {now.strftime('%Y')}"
+        ts = now.strftime("%Y%m%d_%H%M%S")
+        raw_log_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}_raw.txt"
+        wav_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}.wav"
+        existing_notes_path = notes.notes_path(cls["code"])
+        session_start_offset = len(existing_notes_path.read_text(encoding="utf-8")) if existing_notes_path.exists() else 0
+        session = Session(wav_path)
+        keep_awake.prevent_sleep()
+        watchdog = CaptureWatchdog(lambda: capture_module.CaptureThread(source, on_block=persist_for_capture),
+                                   source_label="microphone" if source == "mic" else "system audio")
+        capture = watchdog.capture
+        preflight._startup_capture = capture
+        print(c.info(f"Audio backup is recording while the model prepares: {wav_path}"))
+        preflight.start_audio_check(source)
+        formatting_mode = choose_formatting_mode(args)
+        preflight.start_gpu_warmup(formatting_mode)
+        print()
+        if not preflight.finish(source, formatting_mode):
+            raise PreflightFailed("Preflight checks failed; captured audio is preserved for --resume.")
+        resolve_chunk_seconds(args)
+    except BaseException as error:
+        if watchdog is not None:
+            watchdog.capture.stop()
+            watchdog.capture.abandon()  # suppress a late driver response after closing the WAV
+        if session is not None:
+            session.close()
+            print(c.warning(f"Audio preserved. Recover with --resume \"{session.wav_path}\""))
+        keep_awake.allow_sleep()
+        executor = getattr(preflight, '_executor', None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if isinstance(error, PreflightFailed):
+            print(c.error(str(error)))
+            raise SystemExit(1) from None
+        raise
 
     mode_descriptions = {
         "auto": "auto (Claude CLI/API -> local GPU model -> heuristic)",
@@ -1403,33 +1489,10 @@ def run():
                       f"(also resets the autosave timer)." if msvcrt is not None else "")
     print(c.heading(f"Press Ctrl+C to stop and save notes.{save_now_hint}\n"))
 
-    now = datetime.now()
-    session_date = f"{now.strftime('%A, %B')} {now.day}, {now.strftime('%Y')}"
     last_autosave = time.time()
-
-    existing_notes_path = notes.notes_path(cls["code"])
-    session_start_offset = len(existing_notes_path.read_text(encoding="utf-8")) if existing_notes_path.exists() else 0
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    raw_log_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}_raw.txt"
-    wav_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}.wav"
-    session = Session(wav_path)
     transcriber = RollingTranscriber()
     silence_warned = False
-    SILENCE_WARNING_SECONDS = 45  # warn once if this much continuous silence is seen
-
-    keep_awake.prevent_sleep()  # a system sleep mid-recording silently kills the whole
-                                 # process, not just the display - block that for the
-                                 # duration of the session, released in the finally below
-
-    # Audio capture runs on its own thread, continuously draining the OS buffer into a
-    # queue - decoupled from transcription/saving below, so no matter how long any
-    # processing step takes (a slow API call, diarization, anything), capture itself
-    # never stalls and the OS buffer never gets a chance to silently overflow and drop
-    # audio. See capture.py for the full story (this was a real, confirmed bug).
-    watchdog = CaptureWatchdog(lambda: capture_module.CaptureThread(source, on_block=session.persist_audio),
-                               source_label="microphone" if source == "mic" else "system audio")
-    capture = watchdog.capture
+    SILENCE_WARNING_SECONDS = 45
 
     save_listener = SaveNowListener()
     save_listener.start()
@@ -1442,13 +1505,45 @@ def run():
                        formatting_mode=formatting_mode, model_device=transcribe.device_info(),
                        notes_path=str(notes.notes_path(cls["code"])), wav_path=str(wav_path))
     tel.add_event("info", f"Recording started: {cls['code']} ({source})")
+    import streaming
+    if args.captions != 'off' and streaming.available():
+        import vocab
+        preview_completed = []
+        preview_flush = {'at': 0.0}
+        def caption_event(event):
+            kind = event['type']
+            if kind == 'caption':
+                text = event.get('text', '')
+                if event.get('final'):
+                    preview_completed.append(text)
+                    del preview_completed[:-4]
+                    current = ''
+                else:
+                    current = text
+                tel.update(caption_preview=(' '.join(preview_completed) + ' ' + current).strip()[-2000:],
+                           caption_state='ready')
+            elif kind == 'reset':
+                preview_completed.clear()
+                tel.update(caption_preview='', caption_state='restarted')
+                tel.add_event('warning', 'Live preview fell behind and restarted; the audio backup remains complete.')
+            elif kind == 'error':
+                tel.update(caption_state='unavailable')
+                tel.add_event('warning', 'Live preview: ' + event['message'])
+            elif kind == 'ready':
+                tel.update(caption_state='ready')
+            if time.monotonic() - preview_flush['at'] >= .5:
+                tel.flush()
+                preview_flush['at'] = time.monotonic()
+        caption_holder['worker'] = streaming.Captions(caption_event, vocab.terms_for_class(cls['code']))
+        tel.update(caption_state='preparing')
 
     # Collect short slices for controls and silence checks; transcribe only full windows.
     collect_seconds = min(5.0, args.chunk)
     window_parts = []
     # Failure-guard counters live on the loaded backend; report this session's share.
     _model = transcribe.get_model()
-    guard = {"repaired": getattr(_model, "repaired_pieces", 0), "silent": getattr(_model, "silent_pieces", 0)}
+    guard = {"repaired": getattr(_model, "repaired_pieces", 0), "silent": getattr(_model, "silent_pieces", 0),
+             "skipped": getattr(_model, "skipped_silent_pieces", 0)}
     guard_base = dict(guard)
     token_stats = {"previous": getattr(_model, "generated_tokens", 0)}
 
@@ -1475,8 +1570,10 @@ def run():
         if silent > guard["silent"]:
             tel.add_event("warning", f"Transcript guard: discarded invented text for {silent - guard['silent']} "
                                      f"silent piece(s) in the audio from {window_start}")
-        guard.update(repaired=repaired, silent=silent)
+        skipped = getattr(model, "skipped_silent_pieces", 0)
+        guard.update(repaired=repaired, silent=silent, skipped=skipped)
         tel.update(guard_repaired=repaired - guard_base["repaired"], guard_silent=silent - guard_base["silent"])
+        tel.update(guard_skipped_silent=skipped - guard_base["skipped"])
         tel.update(consecutive_silent_chunks=transcriber.consecutive_silent_chunks,
                     queue_transcription=transcription_worker.pending_count(),
                     queue_saves=save_worker.pending_count())
@@ -1510,6 +1607,7 @@ def run():
     if lid.start():
         tel.add_event("info", "Lid watch on: closing the lid will stop the recording and save the notes")
     silent_seconds = 0.0
+    reported_discontinuities = 0
     dropout = DropoutMonitor(audio.SAMPLE_RATE,
                              muted_check=getattr(mic_mute, "is_muted", None) if source == "mic" else None)
     try:
@@ -1529,6 +1627,12 @@ def run():
                 print({"error": c.error, "warning": c.warning}.get(level, c.success)(message))
                 tel.add_event(level, message)
             tel.update(audio_stalled_seconds=round(capture.seconds_since_audio(), 1))
+            discontinuities = watchdog.discontinuities
+            if discontinuities > reported_discontinuities:
+                tel.add_event("warning", f"Audio device reported {discontinuities - reported_discontinuities} "
+                                         "capture gap(s); the amount of missing audio is unknown.")
+                reported_discontinuities = discontinuities
+            tel.update(capture_discontinuities=discontinuities)
             if chunk_audio is not None:
                 step = int(SILENCE_CHECK_SECONDS * audio.SAMPLE_RATE)
                 for start in range(0, len(chunk_audio), step):
@@ -1605,6 +1709,9 @@ def run():
 
             _step("Stopping audio capture...")
             capture.stop()
+            if caption_holder['worker'] is not None:
+                caption_holder['worker'].close()
+                caption_holder['worker'] = None
             print(c.dim("  capture thread stopped."))
 
             # Drain any chunks still queued for background transcription before touching
@@ -1629,10 +1736,41 @@ def run():
             save_worker.wait_idle()  # nothing below this point may run against the notes file
                                       # until every prior background autosave has actually written it
 
+            import vocab
+            import vocabulary_retry
+            accepted_retries = 0
+            if args.vocabulary_retry != 'off' and session.all_segments:
+                terms = vocab.terms_for_class(cls['code'])
+                if terms and any(vocabulary_retry.target(s['text'], terms) for s in session.all_segments):
+                    _step('Checking selected vocabulary against the saved audio...')
+                    _model = None
+                    transcribe.unload_model()
+                    retry_result = vocabulary_retry.retry_session(session, terms)
+                    accepted_retries = retry_result['accepted']
+                    tel.add_event('warning' if retry_result['reason'] else 'info',
+                                  f"Vocabulary retry: {retry_result['accepted']} accepted out of "
+                                  f"{retry_result['attempted']}. {retry_result['reason'] or ''}")
+
+            if alignment.available() and session.all_segments:
+                _step('Adding word timestamps to the saved transcript...')
+                _model = None
+                transcribe.unload_model()  # inference is drained; alignment gets its own GPU budget
+                alignment_result = alignment.align_session(session)
+                tel.add_event('warning' if alignment_result['failed'] else 'info',
+                              f"Word alignment: {alignment_result['aligned']} pieces, "
+                              f"{alignment_result['failed']} skipped. {alignment_result['reason'] or ''}")
+
             used_full_diarization = False
             if diarize.available() and session.all_segments:
                 used_full_diarization = try_full_session_diarization(
                     cls, session, session_date, session_start_offset, formatting_mode)
+            if accepted_retries and not used_full_diarization:
+                _step('Saving the complete transcript with verified vocabulary corrections...')
+                notes.format_and_save(cls['code'], cls['title'],
+                    ' '.join(s['text'] for s in session.all_segments), session_date,
+                    mode=formatting_mode, session_id=session.session_id, replace_session=True)
+                session.pending_segments = []
+                used_full_diarization = True
 
             if not used_full_diarization:
                 if session.pending_segments:
@@ -1649,7 +1787,7 @@ def run():
             print(c.success(f"\nRecording done - captured ~{elapsed_min:.1f} minutes of lecture."))
 
             if used_full_diarization:
-                print(c.dim("Skipped condense pass: full-session diarization already wrote one clean "
+                print(c.dim("Skipped condense pass: full-session formatting already wrote one clean "
                              "section covering the whole lecture - nothing left to merge."))
             elif formatting_mode != "auto":
                 print(c.dim(f"Skipped condense pass: formatting mode is '{formatting_mode}' (no CLI/API calls)."))
@@ -1680,6 +1818,9 @@ def run():
             auto_prune_audio()  # last, so it can never delay or endanger saving the notes
         finally:
             capture.stop()
+            if caption_holder['worker'] is not None:
+                caption_holder['worker'].close()
+                caption_holder['worker'] = None
             session.close()
             # The local formatter is a child owned by this recorder run.  Stop it
             # explicitly after all final saves/condensing are complete; its Windows

@@ -112,7 +112,7 @@ class TestCohereFailureGuards:
         backend.decode_calls = []
         repairs = list(repair_texts)
 
-        def decode(samples, sample_rate):
+        def decode(samples, sample_rate, **kwargs):
             backend.decode_calls.append(round(len(samples) / sample_rate, 2))
             return list(window_texts) if len(backend.decode_calls) == 1 else [repairs.pop(0)]
 
@@ -167,6 +167,57 @@ class TestCohereFailureGuards:
         mostly_zero[10 * self.SR:12 * self.SR] = 0.1  # 2s of sound inside 30s of zeros
         assert transcribe.is_silent_audio(np.zeros(30 * self.SR, dtype=np.float32), self.SR)
         assert not transcribe.is_silent_audio(mostly_zero, self.SR)
+
+
+class TestPredecodeSilence:
+    def backend(self, total, texts=None):
+        from types import SimpleNamespace
+        backend = object.__new__(transcribe._CohereBackend)
+        features = np.arange(total * 4).reshape(total, 4)
+        backend._torch = None
+        backend.processor = lambda *a, **kw: {"input_features": features, "audio_chunk_index": [0]}
+        backend.selected = []
+        def decode_rows(inputs, rows):
+            assert inputs["input_features"] is features  # retain original feature padding
+            backend.selected.append(list(rows))
+            return [f"piece {i}" for i in rows] if texts is None else texts
+        backend._decode_rows = decode_rows
+        return backend
+
+    def test_skips_quiet_middle_without_shifting_last_speech(self):
+        sr = audio.SAMPLE_RATE
+        samples = np.concatenate([_speech(5), np.zeros(5 * sr), _speech(5)])
+        backend = self.backend(3)
+        backend._piece_lengths = lambda _: [5 * sr] * 3
+        segments = backend.transcribe(samples, sr)
+        assert backend.selected == [[0, 2]]
+        assert [(s["text"], s["start"], s["end"]) for s in segments] == [
+            ("piece 0", 0, 5), ("piece 2", 10, 15)]
+        assert backend.skipped_silent_pieces == 1
+        assert backend.silent_pieces == 0
+
+    def test_all_quiet_never_generates(self):
+        backend = self.backend(2)
+        assert backend._decode(np.zeros(10 * audio.SAMPLE_RATE), audio.SAMPLE_RATE,
+                               piece_samples=[5 * audio.SAMPLE_RATE] * 2) == ["", ""]
+        assert backend.selected == [[]]
+        assert backend.skipped_silent_pieces == 2
+
+    @pytest.mark.parametrize("lengths", [[5 * audio.SAMPLE_RATE], [1, 1], [0, 10 * audio.SAMPLE_RATE]])
+    def test_uncertain_mapping_keeps_all_rows(self, lengths):
+        backend = self.backend(2)
+        assert backend._decode(np.zeros(10 * audio.SAMPLE_RATE), audio.SAMPLE_RATE,
+                               piece_samples=lengths) == ["piece 0", "piece 1"]
+        assert backend.selected == [[0, 1]]
+        assert backend.skipped_silent_pieces == 0
+
+    def test_unexpected_decoder_count_retries_all_rows(self):
+        backend = self.backend(2, texts=["one", "two", "three"])
+        samples = np.concatenate([_speech(5), np.zeros(5 * audio.SAMPLE_RATE)])
+        assert backend._decode(samples, audio.SAMPLE_RATE,
+                               piece_samples=[5 * audio.SAMPLE_RATE] * 2) == ["one", "two", "three"]
+        assert backend.selected == [[0], [0, 1]]
+        assert backend.skipped_silent_pieces == 0
 
 
 class TestVocabAutoLearningOff:

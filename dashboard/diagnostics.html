@@ -216,6 +216,10 @@
           </label>
         </div>
         <div class="stream" id="transcript"></div>
+        <div id="caption-preview" hidden style="margin-top:10px">
+          <div class="muted" style="font-size:12px;margin-bottom:4px">Live preview · final transcription may revise this text</div>
+          <div id="caption-text" style="white-space:pre-wrap"></div>
+        </div>
       </div>
       <div>
         <div class="section-label">Events</div>
@@ -374,6 +378,8 @@ async function poll() {
     `<span class="chip ${serviceClass(v)}">${esc(k.replace(/_/g,' '))}: ${esc(v)}</span>`).join('');
 
   const t = document.getElementById('transcript');
+  document.getElementById('caption-preview').hidden = !data.caption_preview;
+  document.getElementById('caption-text').textContent = data.caption_preview || '';
   const lines = data.transcript || [];
   const transcriptVersion = JSON.stringify(lines);
   if (transcriptVersion !== lastTranscriptCount) {

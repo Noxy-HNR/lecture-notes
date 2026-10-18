@@ -92,6 +92,7 @@ class TestStartupMenu:
     ])
     def test_menu_choice_maps_to_the_right_action(self, keystroke, expected, monkeypatch):
         import main
+        monkeypatch.setattr(main.transcribe, "start_dependency_preparation", lambda: None)
         monkeypatch.setattr("builtins.input", lambda *a: keystroke)
 
         class Args:

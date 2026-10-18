@@ -46,6 +46,9 @@ class FakeModel:
 
 
 class FakePreflight:
+    def prepare_source(self, source):
+        pass
+
     def start_audio_check(self, source):
         pass
 

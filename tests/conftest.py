@@ -25,4 +25,11 @@ def isolate_live_state_files(tmp_path_factory):
     telemetry.STATUS_PATH = state / "status.json"
     telemetry.COMMAND_PATH = state / "command.json"
     performance.PATH = state / "timings.jsonl"
+    # Installed optional assets must not turn mocked recorder tests into GPU jobs.
+    import alignment
+    alignment.available = lambda: False
+    import native_speech
+    native_speech.available = lambda: False
+    import vocabulary_retry
+    vocabulary_retry.available = lambda: False
     yield

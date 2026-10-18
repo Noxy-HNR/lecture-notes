@@ -1,17 +1,52 @@
 """Audio capture: microphone or system-audio (WASAPI loopback) via the `soundcard` library."""
 import warnings
+import threading
+from contextlib import contextmanager
 
 import numpy as np
 import soundcard as sc
 
 SAMPLE_RATE = 16000  # what Cohere Transcribe wants
-BLOCKSIZE = 4096      # smaller WASAPI buffer periods -> fewer discontinuity warnings
+BLOCKSIZE = 4096
+_capture_warnings = threading.local()
 
-# soundcard/WASAPI occasionally reports "data discontinuity" (a few dropped ms of audio)
-# when the system briefly can't keep up with the capture buffer. It's a known, mostly
-# harmless quirk for speech transcription (loses a syllable at worst, not the recording) -
-# silence it so it doesn't spam the console.
-warnings.filterwarnings("ignore", message="data discontinuity in recording")
+
+class _SoundcardWarnings:
+    """Route just WASAPI's discontinuity warning to the current capture's counter.
+
+    A catch_warnings context changes global filters on Python 3.13. This proxy is
+    local to SoundCard's Windows backend and uses thread-local ownership instead.
+    Other warnings, and captures without a counter, retain normal warning behavior.
+    """
+    def __init__(self, original, category):
+        self.original, self.category = original, category
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+    def warn(self, message, category=None, stacklevel=1, source=None):
+        counter = getattr(_capture_warnings, "counter", None)
+        if (str(message) == "data discontinuity in recording"
+                and category is self.category and counter is not None):
+            counter()
+            return
+        self.original.warn(message, category, stacklevel=stacklevel + 1, source=source)
+
+
+if hasattr(sc, "mediafoundation"):
+    _wasapi = sc.mediafoundation
+    if not isinstance(_wasapi.warnings, _SoundcardWarnings):
+        _wasapi.warnings = _SoundcardWarnings(_wasapi.warnings, _wasapi.SoundcardRuntimeWarning)
+
+
+@contextmanager
+def count_discontinuities(counter):
+    previous = getattr(_capture_warnings, "counter", None)
+    _capture_warnings.counter = counter
+    try:
+        yield
+    finally:
+        _capture_warnings.counter = previous
 
 
 def pick_microphone():
@@ -23,18 +58,18 @@ def pick_loopback_speaker():
     return sc.default_speaker()
 
 
-def get_recorder(source: str):
+def get_recorder(source: str, *, channels: int = 1):
     """
     source: "mic" or "system"
     Returns an object with a `.record(numframes)` method via a context-manager-friendly wrapper.
     """
     if source == "mic":
         mic = pick_microphone()
-        return mic.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=BLOCKSIZE)
+        return mic.recorder(samplerate=SAMPLE_RATE, channels=channels, blocksize=BLOCKSIZE)
     elif source == "system":
         speaker = pick_loopback_speaker()
         loopback_mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-        return loopback_mic.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=BLOCKSIZE)
+        return loopback_mic.recorder(samplerate=SAMPLE_RATE, channels=channels, blocksize=BLOCKSIZE)
     else:
         raise ValueError(f"Unknown audio source: {source}")
 

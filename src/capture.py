@@ -124,6 +124,11 @@ class CaptureThread:
         self._abandoned = False
         self.started_at = None
         self.last_audio_at = None  # wall-clock time the device last delivered a block
+        self.discontinuities = 0  # WASAPI reported gaps; not a duration estimate
+        self._startup_ready = threading.Event()
+        self._startup_lock = threading.Lock()
+        self._startup_parts = []
+        self._startup_frames = 0
         self._thread = threading.Thread(target=self._run, name="audio-capture", daemon=True)
         # Blocks already pulled off audio_queue by collect_chunk() but not yet returned
         # (because it's still accumulating toward target_seconds). Kept on self, not a
@@ -139,6 +144,23 @@ class CaptureThread:
     def stop(self, timeout: float = 5.0):
         self._stop_event.set()
         self._thread.join(timeout=timeout)
+
+    def startup_sample(self, seconds=3.0, timeout=10.0):
+        """Observe persisted first audio without consuming the transcription queue."""
+        if not self._startup_ready.wait(timeout):
+            raise RuntimeError(self.fatal_error or 'audio device did not deliver its startup sample')
+        with self._startup_lock:
+            return np.concatenate(self._startup_parts)[:int(seconds * audio.SAMPLE_RATE)]
+
+    def _observe_startup(self, block):
+        target = int(3.0 * audio.SAMPLE_RATE)
+        with self._startup_lock:
+            if self._startup_frames < target:
+                part = block[:target - self._startup_frames].copy()
+                self._startup_parts.append(part)
+                self._startup_frames += len(part)
+                if self._startup_frames >= target:
+                    self._startup_ready.set()
 
     def seconds_since_audio(self, now: float | None = None) -> float:
         """Wall-clock seconds since the device last delivered audio (or since start)."""
@@ -242,6 +264,13 @@ class CaptureThread:
         return errors
 
     def _run(self):
+        with audio.count_discontinuities(self._count_discontinuity):
+            self._capture_loop()
+
+    def _count_discontinuity(self):
+        self.discontinuities += 1
+
+    def _capture_loop(self):
         while not self._stop_event.is_set():
             try:
                 recorder = audio.get_recorder(self.source)
@@ -257,15 +286,19 @@ class CaptureThread:
                         if self._abandoned:
                             return  # replaced while blocked in the driver: its successor owns the WAV now
                         self.last_audio_at = time.time()
+                        queued = block
                         if self.on_block is not None:
                             try:
-                                self.on_block(block)  # persist before any inference queue
+                                persisted = self.on_block(block)  # persist before any inference queue
+                                if persisted is not None:
+                                    queued = persisted
                             except Exception as error:
                                 self.fatal_error = error
                                 self.error_queue.put(error)
                                 self._stop_event.set()
                                 return
-                        self.audio_queue.put(block)
+                        self._observe_startup(block)
+                        self.audio_queue.put(queued)
             except Exception as e:
                 # Device dropped out (sleep/resume hiccup, USB mic unplugged, etc.) -
                 # log it and loop back around to reopen a fresh recorder rather than
