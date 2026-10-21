@@ -1,5 +1,15 @@
 # Lecture Notes App
 
+Schedule lecture recordings, transcribe speech with local Whisper, and turn the results into organized study notes. Optional AI-assisted workflows support speaker-aware Q&A, corrections, and review materials.
+
+## Quick navigation
+
+- [Start a recording](#starting-notes-from-diagnostics)
+- [Install and run the app](#one-time-setup)
+- [Recover an interrupted session](#recovering-a-crashedinterrupted-session)
+- [Improve transcription accuracy](#improving-accuracy)
+- [Use meaning search](#meaning-search)
+
 ## Starting Notes from diagnostics
 
 Open the dashboard's **Diagnostics** page and click **Start Notes**. It opens the
@@ -206,7 +216,7 @@ cache, so a general cache cleanup can't delete it. It's the only transcription m
 says why and won't start the recording. After that everything runs fully offline.
 
 **Recommended:** the Claude Code CLI is already installed
-(`C:\Users\braxt\.local\bin\claude.exe`, on PATH as `claude`). Log in once with
+(`%USERPROFILE%\.local\bin\claude.exe`, on PATH as `claude`). Log in once with
 your Pro/Max account so note formatting uses your subscription instead of
 paid API credits:
 
