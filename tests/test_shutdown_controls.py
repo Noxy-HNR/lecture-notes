@@ -367,13 +367,16 @@ def test_autosave_and_manual_save_keep_snapshot_order(monkeypatch):
             self.first_taken = threading.Event()
             self.resume_first = threading.Event()
 
-        def pop_pending_text(self, run_diarization=False):
+        def note_saved(self, method):
+            pass
+
+        def take_pending(self, run_diarization=False):
             self.snapshots += 1
             if self.snapshots == 1:
                 self.first_taken.set()
                 assert self.resume_first.wait(3)
-                return "earlier speech"
-            return "later speech"
+                return "earlier speech", None
+            return "later speech", None
 
     saved = []
     monkeypatch.setattr(main.notes, "format_and_save",

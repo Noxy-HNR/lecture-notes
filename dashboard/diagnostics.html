@@ -318,8 +318,14 @@ async function poll() {
     document.getElementById('banner-sub').textContent = 'Complete setup in the recorder window. Preflight may take a moment before recording begins.';
   }
 
-  document.getElementById('btn-save').disabled = !active || stale;
-  document.getElementById('btn-stop').disabled = !active || stale;
+  // Once a stop is underway the recorder no longer reads commands, so neither button is offered
+  // again until the session has ended (a second Stop used to wait on disk for the next recording).
+  const stopping = !!data.stopping || (Date.now() - stopSentAt < 15000);
+  document.getElementById('btn-save').disabled = !active || stale || stopping;
+  document.getElementById('btn-stop').disabled = !active || stale || stopping;
+  if (active && !stale && data.stopping) {
+    document.getElementById('banner-title').textContent = `Stopping · saving notes for ${data.class_code}`;
+  }
 
   document.getElementById('session-metrics').innerHTML =
     metric('Elapsed', active ? duration(data.elapsed) : '—') +
@@ -396,6 +402,7 @@ async function poll() {
     .join('') || '<div class="muted">No events yet.</div>';
 }
 
+let stopSentAt = 0;
 async function send(action, btn) {
   btn.disabled = true;
   const status=document.getElementById('command-status');
@@ -407,6 +414,7 @@ async function send(action, btn) {
     });
     const result=await response.json();
     if(!response.ok || !result.ok)throw new Error(result.error||'The command could not be delivered.');
+    if(action==='stop')stopSentAt=Date.now();  // until the recorder reports it is stopping
     status.textContent=result.message||(action==='stop'?'Stop requested. Notes will finish saving.':'Save requested.');
   } catch(error) { status.textContent=error.message; }
   finally { await poll(); }

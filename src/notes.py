@@ -262,8 +262,13 @@ def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> s
         return None
 
 
-def _try_claude_api_format(prompt: str, max_tokens: int = 4000) -> str | None:
-    """Returns clean markdown via the Anthropic API, or None if the API isn't usable right now."""
+API_MAX_TOKENS = 16000  # the most a non-streaming request should ask for (larger needs streaming)
+
+
+def _try_claude_api_format(prompt: str, max_tokens: int = API_MAX_TOKENS) -> str | None:
+    """Returns clean markdown via the Anthropic API, or None if the API isn't usable right now.
+    A reply that was cut off at max_tokens (or declined) also counts as unusable: saved, a
+    truncated reply would replace a whole session's notes with the first part of them."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -279,7 +284,9 @@ def _try_claude_api_format(prompt: str, max_tokens: int = 4000) -> str | None:
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(block.text for block in resp.content if hasattr(block, "text")).strip()
+        if resp.stop_reason in ("max_tokens", "refusal"):
+            return None
+        text = "".join(block.text for block in resp.content if block.type == "text").strip()
         if not text or _looks_like_assistant_chatter(text):
             return None
         return text
@@ -407,6 +414,9 @@ def _proofread(class_title: str, class_code: str, transcript: str) -> str:
 
 
 FORMATTING_MODES = ("auto", "local", "heuristic")
+KEPT_EXISTING = "kept"  # format_and_save's method when it left the session's notes untouched
+METHOD_RANK = {"local": 1, "gpu": 2, "api": 3, "cli": 3}  # heuristic < local model < Claude
+HEURISTIC_MARKER = "*(auto-formatted locally"  # the heuristic formatter's note under its heading
 # auto:      CLI -> API -> GPU model -> heuristic (default - best available each step)
 # local:     GPU model -> heuristic only (no network calls - CLI/API never contacted)
 # heuristic: heuristic only (no LLM anywhere - fastest, fully deterministic)
@@ -415,13 +425,19 @@ FORMATTING_MODES = ("auto", "local", "heuristic")
 def format_and_save(class_code: str, class_title: str, transcript: str,
                      session_date: str | None = None, mode: str = "auto",
                      combine_proofread: bool = False, session_id: str | None = None,
-                     replace_session: bool = False) -> tuple[Path, str]:
+                     replace_session: bool = False, existing_method: str | None = None) -> tuple[Path, str]:
     """Formats `transcript` into notes and appends them to notes/<CODE>.md. Returns the file path.
     `mode` controls which formatting tiers are allowed - see FORMATTING_MODES above.
     `combine_proofread`: do proofreading + notes-formatting as one CLI/API call instead
     of two sequential ones (see _build_combined_prompt) - worth it for a large,
     latency-sensitive transcript (e.g. the full-session-diarization save at Ctrl+C),
-    available for comparison on normal saves; vocabulary auto-learning is disabled."""
+    available for comparison on normal saves; vocabulary auto-learning is disabled.
+    `existing_method` (with replace_session): the best formatter that already wrote this
+    session's notes ("cli", "api", "gpu" or "local"). If the rewrite only reaches a lower tier
+    (heuristic bullets replacing model notes, or the local model replacing Claude's), the
+    existing notes are left as they are and KEPT_EXISTING is returned. The end-of-lecture
+    rewrites pass it; a --resume recovery doesn't, since there the existing notes are the
+    incomplete part."""
     if mode not in FORMATTING_MODES:
         raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
     if not session_date:
@@ -474,6 +490,10 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
 
     path = notes_path(class_code)
     existing = _read_existing(class_code)  # re-read after the potentially slow formatter
+    if (replace_session and session_id and existing_method
+            and METHOD_RANK.get(method, 0) < METHOD_RANK.get(existing_method, 0)
+            and session_bounds(existing, session_id)):
+        return path, KEPT_EXISTING
     before_save = existing
     if not existing:
         existing = f"# {class_title} ({class_code})\n\n"
@@ -494,7 +514,12 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
     return path, method
 
 
-def _build_condense_prompt(class_title: str, class_code: str, session_markdown: str) -> str:
+def _build_condense_prompt(class_title: str, class_code: str, session_markdown: str,
+                           lecture_day: str | None = None) -> str:
+    heading_rule = (f'- Produce exactly ONE heading, "## {lecture_day}" (this lecture\'s date; use it exactly '
+                    "as written, even if the notes below don't repeat it)"
+                    if lecture_day else
+                    '- Produce exactly ONE "## <date>" heading (reuse the date already present, don\'t invent one)')
     return f"""You are reviewing the notes generated during ONE lecture recording session for
 {class_title} ({class_code}) and cleaning them up before they're finalized. During the session,
 notes may have been saved multiple times (autosaves), which can result in:
@@ -507,7 +532,7 @@ notes may have been saved multiple times (autosaves), which can result in:
 Your job: merge everything below into ONE clean, well-organized section for this lecture.
 
 Requirements:
-- Produce exactly ONE "## <date>" heading (reuse the date already present, don't invent one)
+{heading_rule}
 - Merge duplicate/overlapping points into a single clean bullet - don't just concatenate them
 - Fix any broken markdown (unclosed bold/italic, inconsistent bullet indentation/nesting,
   stray or misapplied headings)
@@ -758,6 +783,52 @@ def export_flashcards_anki(class_code: str, class_title: str, questions: list[di
     return path
 
 
+CONDENSE_MIN_WORD_SHARE = 0.5   # merging duplicate autosaves never halves a real lecture's notes
+CONDENSE_CHECK_MIN_WORDS = 80   # below this a short section can legitimately shrink a lot
+_DAY_HEADING_RE = re.compile(r"^## +(.+?)\s*$", re.MULTILINE)
+
+
+_NOTES_LINE_START = re.compile(r"^\s*(#|[-*+>|]|\d+[.)])")
+
+
+def _lecture_day(content: str, session_start: int, session_part: str) -> str | None:
+    """The '## <date>' heading a session's notes belong under: its own, or, for a later recording
+    the same day (whose repeated heading dedupe_day_headings removed), the one above it."""
+    own = _DAY_HEADING_RE.findall(session_part)
+    if own:
+        return own[0].strip()
+    above = _DAY_HEADING_RE.findall(content[:session_start])
+    return above[-1].strip() if above else None
+
+
+def _condensed_problem(original: str, condensed: str, lecture_day: str | None = None) -> str | None:
+    """Why a condensed section can't replace the original, or None when it can. The condense
+    pass rewrites notes that already exist, so a reply that opens with a message, invents or
+    loses the lecture's date heading, or drops most of the content is refused rather than
+    written over them."""
+    first_line = next((line for line in condensed.splitlines() if line.strip()), "")
+    if not _NOTES_LINE_START.match(first_line):
+        return "it starts with a message instead of notes"
+    if not any(line.strip() and not line.lstrip().startswith("#") for line in condensed.splitlines()):
+        return "it has no notes under its headings"
+    original_days = [h.strip() for h in _DAY_HEADING_RE.findall(original)]
+    condensed_days = [h.strip() for h in _DAY_HEADING_RE.findall(condensed)]
+    allowed_days = set(original_days) | ({lecture_day} if lecture_day else set())
+    if len(condensed_days) > 1:
+        return f"it has {len(condensed_days)} date headings instead of one"
+    if condensed_days and condensed_days[0] not in allowed_days:
+        return f"it changed the date heading to {condensed_days[0]!r}"
+    if original_days and not condensed_days:
+        return "it lost the lecture's date heading"
+    # Heuristic bullets are close to the raw transcript, so turning them into real notes
+    # legitimately shrinks them a lot; only model-written notes are held to the word share.
+    original_words = len(original.split())
+    if (HEURISTIC_MARKER not in original and original_words >= CONDENSE_CHECK_MIN_WORDS
+            and len(condensed.split()) < CONDENSE_MIN_WORD_SHARE * original_words):
+        return f"it kept only {len(condensed.split())} of {original_words} words"
+    return None
+
+
 def condense_session(class_code: str, class_title: str, before_length: int,
                       mode: str = "auto", session_id: str | None = None) -> tuple[bool, str | None]:
     """Re-reviews everything written to this class's notes since `before_length`
@@ -800,6 +871,7 @@ def condense_session(class_code: str, class_title: str, before_length: int,
 
     header_part = content[:preserve_length]
     session_part = content[preserve_length:]
+    session_start = preserve_length
     if session_id:
         bounds = session_bounds(content, session_id)
         if not bounds:
@@ -807,13 +879,18 @@ def condense_session(class_code: str, class_title: str, before_length: int,
         left, right = bounds
         start_marker, end_marker = session_markers(session_id)
         session_part = content[left + len(start_marker):right - len(end_marker)]
+        session_start = left
     if not session_part.strip():
         return False, "nothing new to condense"
 
-    prompt = _build_condense_prompt(class_title, class_code, session_part)
+    lecture_day = _lecture_day(content, session_start, session_part)
+    prompt = _build_condense_prompt(class_title, class_code, session_part, lecture_day)
     condensed = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
     if not condensed:
         return False, "Claude CLI/API unavailable"
+    problem = _condensed_problem(session_part, condensed, lecture_day)
+    if problem:
+        return False, f"kept the notes as they were ({problem})"
 
     new_content = header_part.rstrip("\n") + "\n\n" + condensed.strip() + "\n"
     if session_id:

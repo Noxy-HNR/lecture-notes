@@ -17,6 +17,7 @@ import difflib
 import re
 from collections import Counter
 
+import spelling
 import vocab as vocab_module
 
 _STOPWORDS = {
@@ -49,8 +50,13 @@ _SPEAKER_LINE_RE = re.compile(r"^\[(Speaker \d+)\]\s*(.*)$")
 # ---------------------------------------------------------------------------
 
 def correct_with_glossary(text: str, class_code: str | None) -> str:
-    """Fuzzy-matches individual words against the class's vocab.json glossary
-    and fixes near-misses (e.g. "amigdala" transcribed for "amygdala")."""
+    """Fixes near-miss spellings of the class's vocab.json glossary terms (e.g. "amigdala"
+    transcribed for "amygdala").
+
+    A word only changes when Windows' spell checker says it is misspelled, the term starts with
+    the same letter, and the word isn't just the term with a prefix or suffix. Real words are
+    never swapped for a look-alike term: "action" is not "cation", "dehydration" is not
+    "hydration", and "molecules" stays plural. Without a spell checker nothing changes."""
     if not class_code:
         return text
     terms = vocab_module.terms_for_class(class_code)
@@ -59,17 +65,28 @@ def correct_with_glossary(text: str, class_code: str | None) -> str:
         return text
 
     lower_lookup = {t.lower(): t for t in single_word_terms}
+    decided = {}  # one decision per distinct word
+
+    def correction_for(word):
+        lw = word.lower()
+        if lw in lower_lookup:
+            return None  # already correct
+        close = difflib.get_close_matches(lw, lower_lookup.keys(), n=1, cutoff=0.82)
+        if not close:
+            return None
+        term_lower = close[0]
+        if term_lower[0] != lw[0] or term_lower in lw or lw in term_lower:
+            return None
+        if spelling.is_english_word(word) is not False:
+            return None  # a real word, or no way to tell
+        term = lower_lookup[term_lower]
+        return term[0].upper() + term[1:] if word[0].isupper() else term
 
     def repl(match):
         word = match.group(0)
-        lw = word.lower()
-        if lw in lower_lookup:
-            return word  # already correct
-        close = difflib.get_close_matches(lw, lower_lookup.keys(), n=1, cutoff=0.82)
-        if close:
-            corrected = lower_lookup[close[0]]
-            return corrected.capitalize() if word[0].isupper() else corrected
-        return word
+        if word not in decided:
+            decided[word] = correction_for(word)
+        return decided[word] or word
 
     return re.sub(r"[A-Za-z][A-Za-z\-]{3,}", repl, text)
 

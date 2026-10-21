@@ -79,6 +79,9 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 STATE_DIR.mkdir(exist_ok=True)
 
 AUTOSAVE_EVERY_SECONDS = 5 * 60  # flush partial notes periodically, not just at the end
+FINAL_SAVE_ATTEMPTS = 3
+FINAL_SAVE_RETRY_SECONDS = 2.0
+CAPTION_POWER_CHECK_SECONDS = 30  # --captions auto follows plugging in and unplugging
 
 # Silence gate granularity: a long window is only skipped if every slice of this length is
 # silent, so 110s of dead air around 10s of speech still gets transcribed.
@@ -593,6 +596,7 @@ class Session:
         self.last_save_elapsed = 0.0
         self.pending_segments = []  # [{"start","end","text"}] since the last save - cleared on save
         self.all_segments = []      # every segment for the whole session - never cleared
+        self.best_save_method = None  # "cli"/"api" > "gpu" > "local"; see note_saved()
         self.session_start = time.time()
 
     def elapsed(self):
@@ -646,7 +650,42 @@ class Session:
             self.record_segments(segments, offset)
 
     def pop_pending_text(self, run_diarization: bool = False) -> str:
-        """Returns speaker-labeled (if diarization succeeds and run_diarization=True) or
+        """Text-only form of take_pending(), for callers that never need to hand it back."""
+        return self.take_pending(run_diarization)[0]
+
+    def restore_pending(self, taken):
+        """Puts a save window back after its save failed, so the next save writes that text
+        instead of the notes silently missing it. `taken` is take_pending()'s second value."""
+        if not taken:
+            return
+        with self._lock:
+            # Sorted, because a later window may have been taken (and put back too) meanwhile.
+            self.pending_segments = sorted(list(taken["segments"]) + self.pending_segments,
+                                           key=lambda seg: seg["start"])
+            self.last_save_frame = min(self.last_save_frame, taken["frame"])
+            self.last_save_elapsed = min(self.last_save_elapsed, taken["elapsed"])
+
+    def take_older_than(self, start: float) -> list:
+        """Pending segments from before `start`: text a failed save put back after a later window
+        was already queued. That later save writes them first, so the notes stay in lecture order."""
+        with self._lock:
+            older = [seg for seg in self.pending_segments if seg["start"] < start]
+            if older:
+                self.pending_segments = [seg for seg in self.pending_segments if seg["start"] >= start]
+            return older
+
+    def note_saved(self, method: str):
+        """Remembers the best formatter that has written this session's notes, so an end-of-lecture
+        rewrite that only reaches a lower tier leaves them alone."""
+        rank = notes.METHOD_RANK.get
+        if rank(method, 0) > rank(self.best_save_method, 0):
+            self.best_save_method = method
+
+    def take_pending(self, run_diarization: bool = False):
+        """Returns (text, taken): the text pop_pending_text describes, plus what was taken
+        so a failed save can hand it back via restore_pending().
+
+        Returns speaker-labeled (if diarization succeeds and run_diarization=True) or
         plain transcript text for everything recorded since the last save, and resets
         the save window.
 
@@ -666,11 +705,12 @@ class Session:
         after recording has already stopped."""
         with self._lock:
             if not self.pending_segments:
-                return ""
+                return "", None
             window_start_sec = self.last_save_elapsed
             window_start_frame = self.last_save_frame
             window_end_frame = self.total_frames
             pending_snapshot = self.pending_segments
+            taken = {"segments": pending_snapshot, "frame": window_start_frame, "elapsed": window_start_sec}
             text = " ".join(seg["text"] for seg in pending_snapshot)
             self.last_save_frame = self.total_frames
             self.last_save_elapsed = self.elapsed()
@@ -701,7 +741,7 @@ class Session:
             finally:
                 clip_path.unlink(missing_ok=True)
 
-        return text
+        return text, taken
 
     def close(self):
         with self._lock:
@@ -1280,7 +1320,9 @@ def try_full_session_diarization(cls, session: Session, session_date, session_st
 
     Returns True if this path was used (caller should skip the normal tail-save +
     condense flow entirely); False if diarization isn't available/failed, in which
-    case the caller should fall back to the standard flow."""
+    case the caller should fall back to the standard flow; notes.KEPT_EXISTING if the
+    rewrite only reached heuristic formatting and the autosaved notes were kept, in which
+    case the caller saves the tail normally and doesn't try another whole-session rewrite."""
     if not diarize.available() or not session.all_segments:
         return False
 
@@ -1301,9 +1343,20 @@ def try_full_session_diarization(cls, session: Session, session_date, session_st
     print(c.dim(f"  Diarization complete ({time.time() - diar_start:.1f}s)."))
 
     save_start = time.time()
-    path, method = notes.format_and_save(cls["code"], cls["title"], labeled_text, session_date,
-                                          mode=formatting_mode, combine_proofread=True,
-                                          session_id=session.session_id, replace_session=True)
+    try:
+        path, method = notes.format_and_save(cls["code"], cls["title"], labeled_text, session_date,
+                                              mode=formatting_mode, combine_proofread=True,
+                                              session_id=session.session_id, replace_session=True,
+                                              existing_method=session.best_save_method)
+    except Exception as error:
+        # Nothing was taken from the session, so the normal end-of-lecture save still has it all.
+        print(c.error(f"  The whole-lecture rewrite could not be saved ({type(error).__name__}: {error}). "
+                       "Saving the rest of the lecture normally."))
+        return False
+    if method == notes.KEPT_EXISTING:
+        print(c.warning("  The whole-lecture rewrite came out rougher than the notes saved during the "
+                         "lecture, so those were kept. Saving the rest of the lecture normally."))
+        return notes.KEPT_EXISTING
     print(c.success(f"  Full session formatted and saved as one clean section "
                      f"(method: {method}, {time.time() - save_start:.1f}s)."))
     return True
@@ -1427,7 +1480,7 @@ def run():
     preflight = PreflightRunner()
 
     session = watchdog = None
-    caption_holder = {'worker': None}
+    caption_holder = {'worker': None, 'token': None}
     def persist_for_capture(block):
         durable = session.persist_audio(block)
         worker = caption_holder['worker']
@@ -1509,16 +1562,15 @@ def run():
     tel.add_event("info", f"Recording started: {cls['code']} ({source})")
     import streaming
     import power
-    captions_wanted = args.captions == 'on' or (args.captions == 'auto' and not power.on_battery())
-    if args.captions == 'auto' and not captions_wanted and streaming.available():
-        tel.add_event('info', 'Live preview captions are off while on battery to save power '
-                              '(they keep about two CPU cores busy). The recording and final notes are unaffected; '
-                              'start with --captions on to keep them.')
-    if captions_wanted and streaming.available():
+
+    def start_captions():
         import vocab
         preview_completed = []
         preview_flush = {'at': 0.0}
+        token = caption_holder['token'] = object()
         def caption_event(event):
+            if caption_holder['token'] is not token:
+                return  # a worker already switched off; its last words don't belong on screen
             kind = event['type']
             if kind == 'caption':
                 text = event.get('text', '')
@@ -1544,6 +1596,40 @@ def run():
                 preview_flush['at'] = time.monotonic()
         caption_holder['worker'] = streaming.Captions(caption_event, vocab.terms_for_class(cls['code']))
         tel.update(caption_state='preparing')
+
+    def stop_captions():
+        worker = caption_holder['worker']
+        caption_holder['worker'] = None  # capture stops feeding it at once
+        caption_holder['token'] = None   # and its remaining events are ignored
+        tel.update(caption_state='off', caption_preview='')
+        if worker is not None:
+            # close() can wait several seconds for the worker process; never stall the loop on it.
+            threading.Thread(target=worker.close, daemon=True, name='caption-close').start()
+
+    captions_available = streaming.available()
+    captions_wanted = args.captions == 'on' or (args.captions == 'auto' and not power.on_battery())
+    if args.captions == 'auto' and not captions_wanted and captions_available:
+        tel.add_event('info', 'Live preview captions are off while on battery to save power '
+                              '(they keep about two CPU cores busy). They turn on when you plug in. '
+                              'The recording and final notes are unaffected; start with --captions on to keep them.')
+    if captions_wanted and captions_available:
+        start_captions()
+    caption_power_checked = time.monotonic()
+
+    def follow_power_for_captions():
+        """--captions auto: captions stop when the laptop is unplugged and come back on AC."""
+        on_battery = power.on_battery()
+        if on_battery and caption_holder['worker'] is not None:
+            stop_captions()
+            message = ('Unplugged: live preview captions turned off to save battery. '
+                       'The recording and final notes are unaffected.')
+        elif not on_battery and caption_holder['worker'] is None:
+            start_captions()
+            message = 'Plugged in: live preview captions turned back on.'
+        else:
+            return
+        print(c.dim(message))
+        tel.add_event('info', message)
 
     # Collect short slices for controls and silence checks; transcribe only full windows.
     collect_seconds = min(5.0, args.chunk)
@@ -1641,6 +1727,13 @@ def run():
                                          "capture gap(s); the amount of missing audio is unknown.")
                 reported_discontinuities = discontinuities
             tel.update(capture_discontinuities=discontinuities)
+            if (args.captions == 'auto' and captions_available
+                    and time.monotonic() - caption_power_checked >= CAPTION_POWER_CHECK_SECONDS):
+                caption_power_checked = time.monotonic()
+                try:
+                    follow_power_for_captions()
+                except Exception as error:  # an optional preview must never end the recording
+                    tel.add_event('warning', f'Live preview captions could not follow the power state: {error}')
             if chunk_audio is not None:
                 step = int(SILENCE_CHECK_SECONDS * audio.SAMPLE_RATE)
                 for start in range(0, len(chunk_audio), step):
@@ -1708,6 +1801,7 @@ def run():
     finally:
         try:
             shutdown_start = time.time()
+            tel.mark_stopping()  # the dashboard stops offering Save/Stop; nothing reads commands now
 
             def _step(msg):
                 print(c.heading(f"[{time.time() - shutdown_start:5.1f}s] ") + c.info(msg))
@@ -1769,24 +1863,55 @@ def run():
                               f"{alignment_result['failed']} skipped. {alignment_result['reason'] or ''}")
 
             used_full_diarization = False
+            full_rewrite_kept = False  # a rewrite fell back to heuristics; another would too
             if diarize.available() and session.all_segments:
-                used_full_diarization = try_full_session_diarization(
+                full_result = try_full_session_diarization(
                     cls, session, session_date, session_start_offset, formatting_mode)
-            if accepted_retries and not used_full_diarization:
+                full_rewrite_kept = full_result == notes.KEPT_EXISTING
+                used_full_diarization = full_result is True
+            if accepted_retries and not used_full_diarization and not full_rewrite_kept:
                 _step('Saving the complete transcript with verified vocabulary corrections...')
-                notes.format_and_save(cls['code'], cls['title'],
-                    ' '.join(s['text'] for s in session.all_segments), session_date,
-                    mode=formatting_mode, session_id=session.session_id, replace_session=True)
-                session.pending_segments = []
-                used_full_diarization = True
+                try:
+                    _, method = notes.format_and_save(cls['code'], cls['title'],
+                        ' '.join(s['text'] for s in session.all_segments), session_date,
+                        mode=formatting_mode, session_id=session.session_id, replace_session=True,
+                        existing_method=session.best_save_method)
+                except Exception as error:
+                    method = None
+                    message = (f"The corrected whole-lecture rewrite could not be saved ({type(error).__name__}: "
+                               f"{error}). Saving the rest of the lecture normally.")
+                    print(c.error("  " + message))
+                    tel.add_event("error", message)
+                if method == notes.KEPT_EXISTING:
+                    print(c.warning("  The rewrite came out rougher than the notes saved during the lecture, "
+                                     "so those were kept. Saving the rest of the lecture normally."))
+                elif method is not None:
+                    session.pending_segments = []
+                    used_full_diarization = True
 
             if not used_full_diarization:
                 if session.pending_segments:
                     n_pending = len(session.pending_segments)
                     _step(f"Formatting and saving the final segment ({n_pending} transcribed chunk(s))...")
                     save_start = time.time()
-                    _save(cls, session, session_date, formatting_mode, is_final=False, telemetry=tel)
-                    print(c.dim(f"  final save completed in {time.time() - save_start:.1f}s."))
+                    # A failed save keeps its text pending, so a retry writes the same window. Most
+                    # failures are brief: the notes file open in another program, or a busy lock.
+                    saved = False
+                    for attempt in range(FINAL_SAVE_ATTEMPTS):
+                        if attempt:
+                            _step(f"Retrying the final save ({attempt + 1} of {FINAL_SAVE_ATTEMPTS})...")
+                            time.sleep(FINAL_SAVE_RETRY_SECONDS)
+                        if _save(cls, session, session_date, formatting_mode, is_final=False, telemetry=tel):
+                            saved = True
+                            break
+                    if saved:
+                        print(c.dim(f"  final save completed in {time.time() - save_start:.1f}s."))
+                    else:
+                        message = (f"The final notes save failed, so part of this lecture is not in the notes yet. "
+                                   f"The transcript is safe in {raw_log_path}; rebuild the notes with "
+                                   f'--resume "{wav_path}".')
+                        print(c.error(message))
+                        tel.add_event("error", message)
                 else:
                     _step("Nothing pending to save (already flushed by the last autosave).")
             session.close()
@@ -1850,11 +1975,33 @@ def _save(cls, session: Session, session_date, mode, note="", is_final=False,
     so the main loop can immediately go back to transcribing instead of blocking on it.
     Pass save_worker=None (the final Ctrl+C save does this) to run it synchronously
     instead - at that point there's no more live output to keep flowing anyway, and the
-    caller needs it to have actually finished before moving on to condensing."""
+    caller needs it to have actually finished before moving on to condensing.
+
+    A synchronous save returns whether it was written. A failed save hands its text back to
+    the session, so the next save (or the final one) writes it rather than leaving a hole."""
     def do_save():
         save_started = time.time()
-        path, method = notes.format_and_save(cls["code"], cls["title"], full_text, session_date, mode=mode,
-                                             session_id=session.session_id)
+        text, window = full_text, taken
+        if window:
+            # An earlier save that failed after this window was taken put its text back; it is
+            # older than this window, so it goes in front of it.
+            older = session.take_older_than(window["segments"][0]["start"])
+            if older:
+                text = " ".join(seg["text"] for seg in older) + " " + text
+                window = {**window, "segments": older + list(window["segments"])}
+        try:
+            path, method = notes.format_and_save(cls["code"], cls["title"], text, session_date, mode=mode,
+                                                 session_id=session.session_id)
+        except Exception as error:
+            session.restore_pending(window)
+            message = (f"Notes save failed ({type(error).__name__}: {error}). That part of the "
+                       "transcript is kept and goes into the next save.")
+            print(c.error(message))
+            if telemetry is not None:
+                telemetry.add_event("error", message)
+                telemetry.flush()
+            return False
+        session.note_saved(method)
         if telemetry is not None:
             telemetry.record_save(method, time.time() - save_started)
             telemetry.add_event("success" if method in ("cli", "api") else "warning",
@@ -1872,16 +2019,17 @@ def _save(cls, session: Session, session_date, mode, note="", is_final=False,
         }[method]
         note_colored = c.autosave(note) if note else ""
         print(colorize(f"Saved notes to {path}{tag}") + (f" {note_colored}" if note_colored else ""))
+        return True
 
     # Taking the pending text and queueing its save is one step. Autosave runs on the main
     # loop and a manual save on the transcription worker; if one were preempted between
     # the two, a later snapshot could be queued first and write newer notes above older.
     with _SAVE_ORDER_LOCK:
-        full_text = session.pop_pending_text(run_diarization=is_final)
+        full_text, taken = session.take_pending(run_diarization=is_final)
         if save_worker is not None:
             save_worker.submit(do_save)
-            return
-    do_save()
+            return None
+    return do_save()
 
 
 _SAVE_ORDER_LOCK = threading.Lock()

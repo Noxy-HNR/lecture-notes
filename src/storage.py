@@ -12,6 +12,23 @@ class RevisionConflict(ValueError):
     """The file changed after the caller read it."""
 
 
+# Windows refuses to replace a file another program has open without delete sharing (an
+# editor, a viewer, antivirus or OneDrive). That usually clears within a second or two.
+REPLACE_ATTEMPTS = 10
+REPLACE_RETRY_SECONDS = 0.1
+
+
+def _replace_with_retry(source, destination):
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(REPLACE_RETRY_SECONDS * (attempt + 1))
+
+
 @contextmanager
 def file_lock(path, timeout=10):
     """Coordinate read/modify/write across the recorder and dashboard processes."""
@@ -73,7 +90,7 @@ def _atomic_write(path, text, backup=True, expected=None):
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
 

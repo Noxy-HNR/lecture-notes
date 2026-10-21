@@ -139,10 +139,9 @@ def course_label(code: str) -> str:
 def course_terms(code: str) -> list[str]:
     try:
         import vocab
-        terms = vocab.load_vocab().get(code, [])
+        return vocab.class_only_terms(code)[:TERMS_LIMIT]
     except Exception:
         return []
-    return [str(t) for t in terms if isinstance(t, str)][:TERMS_LIMIT]
 
 
 def segment_states(code: str, segments: list[dict]) -> list[dict]:

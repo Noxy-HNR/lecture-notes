@@ -92,7 +92,7 @@ def test_condense_keeps_other_session_and_revision(tmp_path, monkeypatch):
     text = storage.update_session(text, "second", "Condense me")
     path = notes.notes_path("TEST")
     path.write_text(text)
-    monkeypatch.setattr(notes,"_try_claude_cli_format",lambda prompt:"Condensed")
+    monkeypatch.setattr(notes,"_try_claude_cli_format",lambda prompt:"- Condensed")
     ok, _ = notes.condense_session("TEST","Test",0,session_id="second")
     assert ok
     assert "Keep me" in path.read_text()

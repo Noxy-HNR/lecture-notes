@@ -665,6 +665,10 @@ class Handler(BaseHTTPRequestHandler):
         if action not in ("save_now", "stop"):
             self._json({"ok": False, "error": "unknown action"}, 400)
             return
+        refusal = telemetry.command_refusal(telemetry.read_status())
+        if refusal:
+            self._json({"ok": False, "error": refusal}, 409)
+            return
         self._json({"ok": telemetry.send_command(action)})
 
     def _jev_settings_post(self):

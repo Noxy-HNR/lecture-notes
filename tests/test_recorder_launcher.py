@@ -2,6 +2,7 @@ import http.client
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 from unittest.mock import Mock
@@ -81,6 +82,9 @@ def test_command_api_success_error_and_origin_protection(clean,monkeypatch):
         assert post({'action':'start'},{**headers,'Origin':'https://example.com'})[0]==403
         assert start.call_count==0
         assert post({'action':'start'},headers)==(200,{'ok':True,'message':'Startup opened'})
+        # No recording listening: the click is refused instead of waiting on disk for the next one.
+        assert post({'action':'stop'},headers)[0]==409;save.assert_not_called()
+        monkeypatch.setattr(dashboard.telemetry,'read_status',lambda:{'active':True,'updated_at':time.time()})
         assert post({'action':'stop'},headers)[1]['ok'];save.assert_called_with('stop')
         assert post([],headers)[0]==400
         start.side_effect=OSError('Could not start Python')

@@ -26,6 +26,10 @@ COMMAND_PATH = STATE_DIR / "command.json"
 
 MAX_TRANSCRIPT_LINES = 300   # what the dashboard mirrors from the terminal's live view
 MAX_EVENT_LINES = 120        # saves, warnings, device errors
+# The recorder checks for commands every few seconds, so a real click is always younger than
+# this. Anything older was left over (e.g. a second Stop during shutdown) and must never act.
+COMMAND_MAX_AGE_SECONDS = 60
+HEARTBEAT_STALE_SECONDS = 30  # same threshold the Diagnostics page uses for "no heartbeat"
 
 
 class Telemetry:
@@ -42,6 +46,7 @@ class Telemetry:
         self._events = deque(maxlen=MAX_EVENT_LINES)
         self._state = {
             "active": False,
+            "stopping": False,   # shutdown has begun; the final save can take minutes
             "class_code": "",
             "class_title": "",
             "source": "",
@@ -87,9 +92,11 @@ class Telemetry:
     # -- writes from the recorder ------------------------------------------------
 
     def start_session(self, **fields):
+        clear_command()  # a command left from an earlier session must not stop this one
         with self._lock:
             self._state.update(fields)
             self._state["active"] = True
+            self._state["stopping"] = False
             self._state["started_at"] = time.time()
         self.flush()
 
@@ -100,13 +107,22 @@ class Telemetry:
         self._heartbeat_thread = threading.Thread(target=heartbeat, daemon=True, name="notes-heartbeat")
         self._heartbeat_thread.start()
 
+    def mark_stopping(self):
+        """Shutdown has begun. The dashboard stops offering Save/Stop from here on, so a second
+        click can't leave a command behind that nothing will read."""
+        with self._lock:
+            self._state["stopping"] = True
+        self.flush()
+
     def end_session(self):
         self._heartbeat_stop.set()
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=2)
         with self._lock:
             self._state["active"] = False
+            self._state["stopping"] = False
         self.flush()
+        clear_command()
 
     def update(self, **fields):
         with self._lock:
@@ -202,17 +218,52 @@ def send_command(action: str) -> bool:
         return False
 
 
-def take_command() -> str | None:
+def take_command(max_age: float = COMMAND_MAX_AGE_SECONDS) -> str | None:
     """Called by the recorder each loop. Consumes and returns any pending action, so a
-    single dashboard click can't be executed twice."""
+    single dashboard click can't be executed twice. The file is claimed by renaming it first:
+    a click that lands while this one is being read writes a fresh file for the next loop
+    instead of being deleted unseen. Commands older than max_age are dropped unread."""
+    claimed = COMMAND_PATH.with_suffix(".json.taken")
     try:
-        if not COMMAND_PATH.exists():
-            return None
-        action = json.loads(COMMAND_PATH.read_text(encoding="utf-8")).get("action")
-        COMMAND_PATH.unlink(missing_ok=True)
-        return action
+        os.replace(COMMAND_PATH, claimed)
+    except OSError:
+        return None  # nothing pending, or the dashboard is mid-write: try again next loop
+    try:
+        command = json.loads(claimed.read_text(encoding="utf-8"))
     except Exception:
         return None
+    finally:
+        try:
+            claimed.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not isinstance(command, dict):
+        return None
+    at = command.get("at")
+    if not isinstance(at, (int, float)) or abs(time.time() - at) > max_age:
+        return None
+    return command.get("action")
+
+
+def clear_command():
+    """Drops any pending command. Best-effort, like every other write here."""
+    try:
+        COMMAND_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def command_refusal(status: dict) -> str | None:
+    """Why the recorder can't take a Save/Stop right now, or None when it can. The dashboard
+    checks this before writing a command, so a click with nobody listening is refused
+    instead of waiting on disk for the next recording."""
+    if not status.get("active"):
+        return "No recording is running."
+    if time.time() - float(status.get("updated_at") or 0) > HEARTBEAT_STALE_SECONDS:
+        return "The recorder has stopped responding, so the command was not sent."
+    if status.get("stopping"):
+        return "The recording is already stopping. Your notes are being saved."
+    return None
 
 
 def read_status() -> dict:
