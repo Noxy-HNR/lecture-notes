@@ -157,9 +157,28 @@ def choose_action(args) -> str:
     print("  2. Generate a study guide from a class's notes so far")
     print("  3. Quiz yourself with flashcards")
     print("  4. Open the dashboard (browse/search notes, live diagnostics)")
+    print("  5. Record a lecture for a class you pick (ignores the schedule)")
     transcribe.start_dependency_preparation()
     choice = input("Choose [1]: ").strip() or "1"
-    return {"2": "study_guide", "3": "flashcards", "4": "dashboard"}.get(choice, "record")
+    return {"2": "study_guide", "3": "flashcards", "4": "dashboard",
+            "5": "record_pick"}.get(choice, "record")
+
+
+def pick_class() -> dict:
+    """Lists every class and returns the one chosen, whatever the schedule says right now."""
+    codes = sched.list_all_classes()
+    print(c.heading("Which class is this lecture for?"))
+    for i, (code, title) in enumerate(codes, 1):
+        print(f"  {i}. {code} - {title}")
+    while True:
+        choice = input("Class number: ").strip()
+        try:
+            code, title = codes[int(choice) - 1]
+            if int(choice) < 1:
+                raise IndexError
+            return {"code": code, "title": title, "status": "manual"}
+        except (ValueError, IndexError):
+            print(c.error(f"Enter a number from 1 to {len(codes)}."))
 
 
 def choose_notes_class(args) -> str:
@@ -1491,7 +1510,7 @@ def run():
                 pass  # provisional captions must never interrupt the durable recorder
         return durable
     try:
-        cls = choose_class(args)
+        cls = pick_class() if action == "record_pick" else choose_class(args)
         source = choose_source(args)
         preflight.prepare_source(source)
         now = datetime.now()

@@ -89,6 +89,7 @@ class TestStartupMenu:
         ("4", "dashboard"),
         ("99", "record"),        # unrecognised input must not do something surprising
         ("  3  ", "flashcards"),  # whitespace tolerated
+        ("5", "record_pick"),    # record for a class picked by hand
     ])
     def test_menu_choice_maps_to_the_right_action(self, keystroke, expected, monkeypatch):
         import main
@@ -99,6 +100,14 @@ class TestStartupMenu:
             klass = None
 
         assert main.choose_action(Args()) == expected
+
+    def test_pick_class_ignores_the_schedule_and_reprompts_on_bad_input(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main.sched, "list_all_classes", lambda: [("BIOL 1440", "Bio"), ("CHEM 1450", "Chem")])
+        monkeypatch.setattr(main.sched, "find_current_class", lambda: {"code": "BIOL 1440"})
+        answers = iter(["0", "x", "9", "2"])
+        monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+        assert main.pick_class() == {"code": "CHEM 1450", "title": "Chem", "status": "manual"}
 
 
 # ---------------------------------------------------------------------------
