@@ -498,7 +498,9 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._send(b"not found", "text/plain", 404)
                 return
-            content_type = {".ogg": "audio/ogg", ".svg": "image/svg+xml"}.get(path.suffix, "image/webp")
+            content_type = {".ogg": "audio/ogg", ".svg": "image/svg+xml", ".gif": "image/gif",
+                            ".webm": "video/webm",
+                            ".mp4": "video/mp4"}.get(path.suffix, "image/webp")
             self._send_file_range(path, content_type)
         elif route.startswith("/api/lessons"):
             import lessons

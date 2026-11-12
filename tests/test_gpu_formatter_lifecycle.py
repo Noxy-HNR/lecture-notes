@@ -120,7 +120,7 @@ def test_manager_load_only_when_idle_no_persistence(monkeypatch, offline):
     monkeypatch.setattr(gpu, "_server_healthy", lambda: True)
     assert gpu.warm_up()
     assert calls[1][2] == {"filename": gpu.MODEL_FILENAME, "persist": False,
-                           "onlyIfIdle": True, "settings": {"contextSize": 32768}}
+                           "onlyIfIdle": True, "settings": {"contextSize": 32768, "loraFile": ""}}
     assert calls[1][3]["timeout"] == gpu.LOAD_TIMEOUT_SECONDS
     assert offline.read_bytes() == original
 
@@ -260,8 +260,10 @@ def test_emergency_stop_uses_manager_expected_pid(monkeypatch):
 def test_source_fidelity_prompt_and_public_formatting(monkeypatch):
     after = (ROOT / "src/gpu_formatter.py").read_text(encoding="utf-8")
     # Root strengthened this prompt after live semantic review found added facts.
-    assert 'Preserve every stated fact, negation' in gpu._FORMAT_SYSTEM_PROMPT
-    assert 'Do not add definitions, classifications' in gpu._FORMAT_SYSTEM_PROMPT
+    assert 'Keep every fact, number, unit, negation and uncertainty' in gpu._FORMAT_SYSTEM_PROMPT
+    assert 'Do not add facts, definitions, examples or explanations from your own knowledge' in gpu._FORMAT_SYSTEM_PROMPT
+    assert 'Cover every distinct point' in gpu._FORMAT_SYSTEM_PROMPT
+    assert 'Never use LaTeX' in gpu._FORMAT_SYSTEM_PROMPT
     assert '**Q (Student):**' in gpu._FORMAT_SYSTEM_PROMPT
     monkeypatch.setattr(gpu, "_chat", lambda system, user, max_tokens: "- **Source** stays.")
     assert gpu.format_transcript("Biology", "2026-10-16", "Source") == "## 2026-10-16\n\n- **Source** stays."
@@ -290,10 +292,23 @@ def test_listener_table_avoids_windows_delayed_connection_refusal(monkeypatch):
     monkeypatch.setattr(psutil,'net_connections',lambda **kw:[])
     monkeypatch.setattr(socket,'create_connection',lambda *a,**kw:pytest.fail('No TCP timeout probe'))
     assert gpu._listening_port(10000) is False
-    listener=SimpleNamespace(status=psutil.CONN_LISTEN,laddr=SimpleNamespace(ip='0.0.0.0',port=9090))
+    listener=SimpleNamespace(status=psutil.CONN_LISTEN,laddr=SimpleNamespace(ip='0.0.0.0',port=9090),raddr=())
     monkeypatch.setattr(psutil,'net_connections',lambda **kw:[listener])
     assert gpu._listening_port(9090) is True
     assert gpu._listening_port(10000) is False
+
+
+@pytest.mark.parametrize('status',['NONE','CLOSE'])
+def test_a_listener_reported_with_the_wrong_status_still_counts(monkeypatch,status):
+    """Some Windows builds report a listening socket as NONE or CLOSE, never LISTEN."""
+    import psutil
+    from types import SimpleNamespace
+    listener=SimpleNamespace(status=status,laddr=SimpleNamespace(ip='0.0.0.0',port=10000),raddr=())
+    client=SimpleNamespace(status='ESTABLISHED',laddr=SimpleNamespace(ip='127.0.0.1',port=9090),
+                           raddr=SimpleNamespace(ip='127.0.0.1',port=51000))
+    monkeypatch.setattr(psutil,'net_connections',lambda **kw:[listener,client])
+    assert gpu._listening_port(10000) is True
+    assert gpu._listening_port(9090) is False
 
 
 def test_listener_inventory_failure_is_not_permission_to_launch(monkeypatch):
@@ -439,7 +454,7 @@ def _bootstrap_fixture(monkeypatch,tmp_path,*,ready=True,owned=True):
     monkeypatch.setattr(gpu,"_release_manager_bootstrap",lambda handle:None)
     def request(base,path,payload=None,**kw):
         assert base == gpu.MANAGER_URL and path == "/api/models/preflight"
-        assert payload == {"filename":gpu.MODEL_FILENAME}
+        assert payload == {"filename":gpu.MODEL_FILENAME,"settings":{"contextSize":32768,"loraFile":""}}
         if ready and started.is_set(): return _preflight_reply()
         raise ConnectionRefusedError("Fixture manager unavailable")
     monkeypatch.setattr(gpu,"_request_json",request)

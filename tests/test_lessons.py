@@ -216,6 +216,24 @@ class TestBuild:
         lesson_id = lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart")
         assert "not valid JSON" in fakes.prompts[1] and lessons.get_lesson(lesson_id)["title"] == "Functional groups"
 
+    def test_narration_is_cached_so_a_rebuild_skips_the_voice(self, library, fakes, monkeypatch):
+        calls = []
+
+        def tts(text, path, voice=speech.DEFAULT_VOICE, speed=1.0):
+            calls.append(text)
+            path.write_bytes(b"OggS")
+            return 10.0
+
+        monkeypatch.setattr(lessons.speech, "synthesize", tts)
+        fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}}),
+                         json.dumps(PLAN), json.dumps({"choices": {}})]
+        first = lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart")
+        import shutil
+        shutil.rmtree(lessons.LESSONS_DIR / first)   # ids are per second; make room for the next build
+        second = lessons.get_lesson(lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart"))
+        assert len(calls) == 5                       # the second build reused every cached clip
+        assert all(s["audio"] for s in second["slides"])
+
     def test_lesson_without_a_voice_is_still_built(self, library, fakes, monkeypatch):
         fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
         monkeypatch.setattr(lessons.speech, "available", lambda: (False, "voice model files not found"))
@@ -239,8 +257,9 @@ class TestBuild:
         monkeypatch.setattr(lessons.speech, "available", available)
         fakes.replies = [json.dumps({"choices": {}})]  # only the picture picker: no second lesson plan
         lesson_id = lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart")
-        # First build: plan + picture picker. Retry: the picker only - the plan came from the cache.
-        assert len(fakes.prompts) == 3 and "outstanding tutor" not in fakes.prompts[2]
+        # First build: the plan only - narration starts before the pictures, so it failed there.
+        # Retry: the picker only - the plan came from the cache.
+        assert len(fakes.prompts) == 2 and "outstanding tutor" not in fakes.prompts[1]
         assert lessons.get_lesson(lesson_id)["title"] == "Functional groups"
         assert not list((lessons.LESSONS_DIR / ".plans").glob("*.json"))  # cleared once built
 
@@ -263,7 +282,6 @@ class TestBuild:
             return original(self, data)
 
         monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=FakeKokoro))
-        monkeypatch.setattr(speech, "_engine", None)
         monkeypatch.setattr(soundfile.SoundFile, "write", spy)
         assert speech.synthesize("One long sentence.", tmp_path / "slide-01.ogg") == 40.0
         assert max(writes) <= speech.WRITE_BLOCK_FRAMES and sum(writes) == 24000 * 40
@@ -333,13 +351,13 @@ class TestBuild:
 
         fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
         unfocused = lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart")
-        assert "outstanding tutor" in fakes.prompts[2]  # wrote a fresh plan instead of reusing
+        assert "outstanding tutor" in fakes.prompts[1]  # wrote a fresh plan instead of reusing
         import shutil
         shutil.rmtree(lessons.LESSONS_DIR / unfocused)  # ids are per second; make room for the next build
 
         fakes.replies = [json.dumps({"choices": {}})]
         lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9), "af_heart", focus="alcohols")
-        assert len(fakes.prompts) == 5 and "outstanding tutor" not in fakes.prompts[4]  # same focus: reused
+        assert len(fakes.prompts) == 4 and "outstanding tutor" not in fakes.prompts[3]  # same focus: reused
 
     def test_builder_process_reports_a_failed_build(self, library, fakes):
         fakes.replies = ["not a plan", "still not a plan"]
@@ -455,7 +473,6 @@ class TestSpeech:
                 return np.ones(2400, dtype=np.float32), 24000
 
         monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=FakeKokoro))
-        monkeypatch.setattr(speech, "_engine", None)
         text = ("Water molecules stick together because oxygen pulls electrons closer than hydrogen does, "
                 "which leaves the oxygen end slightly negative and the hydrogen ends slightly positive. ") * 6
         seconds = speech.synthesize(text, tmp_path / "slide-01.ogg")
@@ -480,7 +497,6 @@ class TestSpeech:
                 return np.zeros(24000 * 2, dtype=np.float32), 24000
 
         monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=FakeKokoro))
-        monkeypatch.setattr(speech, "_engine", None)
         out = tmp_path / "slide-01.ogg"
         assert speech.synthesize("**Hello** there", out, voice="bf_emma") == 2.0
         assert out.read_bytes()[:4] == b"OggS"
@@ -528,6 +544,27 @@ class TestLessonLength:
         for bad in ("abc", "0", -5):
             with pytest.raises(ValueError):
                 lessons.clean_minutes(bad)
+
+    def test_speed_is_cleaned(self):
+        assert lessons.clean_speed(None) == 1.0 and lessons.clean_speed("") == 1.0
+        assert lessons.clean_speed("1.15") == 1.15
+        for bad in ("fast", "0.5", "2"):
+            with pytest.raises(ValueError):
+                lessons.clean_speed(bad)
+
+    def test_narration_speed_reaches_the_voice_and_is_saved(self, library, fakes, monkeypatch):
+        speeds = []
+
+        def tts(text, path, voice=speech.DEFAULT_VOICE, speed=1.0):
+            speeds.append(speed)
+            path.write_bytes(b"OggS")
+            return 10.0
+
+        monkeypatch.setattr(lessons.speech, "synthesize", tts)
+        fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
+        lesson = lessons.get_lesson(lessons.build_lesson("CHEM 1450", date(2026, 9, 9), date(2026, 9, 9),
+                                                         "af_heart", speed=1.15))
+        assert speeds == [1.15] * 5 and lesson["speed"] == 1.15
 
     def test_a_plan_in_the_tolerance_is_kept_without_asking_again(self, fakes):
         plan = _plan_of(310)  # about 2.07 minutes against a 2 minute request

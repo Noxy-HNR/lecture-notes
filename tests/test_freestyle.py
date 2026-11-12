@@ -90,6 +90,15 @@ class TestStarting:
         assert job["class_code"] == lessons.FREESTYLE_CODE and job["focus"] == ""
         assert job["start"] == job["end"] == TODAY.isoformat() and job["minutes"] == 10
 
+    def test_generation_speed_choices_are_kept_and_unknown_ones_fall_back(self, spawned):
+        lessons.start_lesson({"topic": TOPIC, "voice_power": "light", "claude_effort": "medium"})
+        job = json.loads(spawned[0].read_text(encoding="utf-8"))
+        assert job["voice_power"] == "light" and job["claude_effort"] == "medium"
+        spawned[0].unlink()
+        lessons.start_lesson({"topic": TOPIC, "voice_power": "turbo", "claude_effort": "low"})
+        job = json.loads(spawned[1].read_text(encoding="utf-8"))
+        assert job["voice_power"] == "max" and job["claude_effort"] == "high"
+
     def test_a_blank_or_bad_description_is_refused_before_any_job_exists(self, spawned):
         for payload in ({"topic": ""}, {"topic": "  "}, {"topic": 7}):
             with pytest.raises(ValueError):

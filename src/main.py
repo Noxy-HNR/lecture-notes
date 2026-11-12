@@ -769,6 +769,9 @@ class Session:
 
 
 MIN_FREE_DISK_GB = 2.0
+MODEL_LOAD_ATTEMPTS = 3
+MODEL_LOAD_RETRY_SECONDS = 5.0
+STARTUP_FAILURE_LOG = STATE_DIR / "startup_failures.log"
 PREFLIGHT_AUDIO_SAMPLE_SECONDS = 3.0  # long enough that a natural pause between words
                                        # doesn't get mistaken for a dead/muted mic
 
@@ -819,16 +822,59 @@ def _check_disk_space() -> str | None:
 
 def _check_transcription_model() -> tuple[bool, str]:
     """Loads Cohere Transcribe. Recording is blocked if it can't load - there's no fallback."""
-    try:
-        transcribe.get_model()
-        return False, c.success(f"  Transcription model OK ({transcribe.backend_name()}, "
-                                f"{transcribe.device_info()})")
-    except Exception as e:
-        return True, c.error(f"  Transcription model FAILED to load: {e}")
+    for attempt in range(MODEL_LOAD_ATTEMPTS):
+        try:
+            transcribe.get_model()
+            return False, c.success(f"  Transcription model OK ({transcribe.backend_name()}, "
+                                    f"{transcribe.device_info()})")
+        except MemoryError as e:
+            # RAM/VRAM headroom checks depend on what else is running this second (another
+            # app finishing a load, a model server releasing VRAM); a short wait often clears it.
+            if attempt + 1 < MODEL_LOAD_ATTEMPTS:
+                time.sleep(MODEL_LOAD_RETRY_SECONDS)
+                continue
+            return True, c.error(f"  Transcription model FAILED to load: {e}")
+        except Exception as e:
+            return True, c.error(f"  Transcription model FAILED to load: {e}")
 
 
 class PreflightFailed(RuntimeError):
     pass
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _record_startup_failure(reasons, wav_path=None):
+    """Keeps why a recording didn't start in state/startup_failures.log. The recorder window
+    can close before anyone reads it, and the failures are often intermittent (RAM or GPU
+    memory briefly short), so the reason has to outlive the window."""
+    clean = [_ANSI.sub("", str(r)).strip() for r in reasons]
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        from health import _read_memory
+        available, _ = _read_memory()
+        memory = f" (RAM available {available / 2**30:.1f} GiB)"
+    except Exception:
+        memory = ""
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        with STARTUP_FAILURE_LOG.open("a", encoding="utf-8") as log:
+            log.write(f"{stamp} recording did not start{memory}"
+                      + (f"; audio kept in {wav_path}" if wav_path else "") + "\n")
+            for reason in clean:
+                log.write(f"    {reason}\n")
+    except OSError:
+        pass
+
+
+def _pause_before_closing():
+    """Leaves the reason on screen when the recorder runs in its own window."""
+    if sys.stdin is not None and sys.stdin.isatty():
+        try:
+            input("Press Enter to close this window...")
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 
 class PreflightRunner:
@@ -883,10 +929,13 @@ class PreflightRunner:
 
         print(c.heading("Running preflight checks..."))
         ok = True
+        self.failures = []
 
         blocks, msg = self._audio_future.result()
         print(msg)
         ok = ok and not blocks
+        if blocks:
+            self.failures.append(msg)
 
         disk_msg = self._disk_future.result()
         if disk_msg is not None:
@@ -895,6 +944,8 @@ class PreflightRunner:
         blocks, msg = self._model_future.result()
         print(msg)
         ok = ok and not blocks
+        if blocks:
+            self.failures.append(msg)
 
         if self._gpu_future is not None:
             print(c.success("  Local GPU formatter warmed up and ready.")
@@ -1545,8 +1596,14 @@ def run():
         executor = getattr(preflight, '_executor', None)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        reasons = getattr(preflight, 'failures', None) or [f"{type(error).__name__}: {error}"]
+        _record_startup_failure(reasons, session.wav_path if session is not None else None)
         if isinstance(error, PreflightFailed):
             print(c.error(str(error)))
+        _pause_before_closing()
+        if isinstance(error, PreflightFailed):
             raise SystemExit(1) from None
         raise
 

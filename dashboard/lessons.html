@@ -119,6 +119,20 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
         <span class="hint"><span>Aims within about 10% of this. Blank means as long as the material needs.</span></span>
       </label>
       <label class="field">Narrator voice<select id="voice"></select></label>
+      <label class="field">Narration speed<select id="speed">
+        <option value="1">Normal</option>
+        <option value="1.15">A bit faster</option>
+        <option value="0.9">A bit slower</option>
+      </select></label>
+      <label class="field">Voice generation<select id="voice-power" title="How much of the CPU narration uses while the lesson builds">
+        <option value="max">Maximum (all cores, fastest)</option>
+        <option value="balanced">Balanced (about half the CPU)</option>
+        <option value="light">Light (few cores, easy on battery)</option>
+      </select></label>
+      <label class="field">Claude effort<select id="claude-effort" title="How much Claude deliberates while writing the lesson">
+        <option value="high">High</option>
+        <option value="medium">Medium (faster)</option>
+      </select></label>
       <button class="btn primary" id="build" style="width:100%">Build lesson</button>
       <div class="progress" id="progress" hidden>
         <div class="bar"><div id="bar"></div></div>
@@ -346,7 +360,9 @@ function showJob(job) {
   const started = job.created_at ? job.created_at * 1000 : jobStarted || now;
   $('progress').hidden = false;
   $('bar').style.width = Math.round((job.progress || 0) * 100) + '%';
-  $('stage').textContent = job.stage || '';
+  const narrating = job.narration && job.narration.total
+    ? ` · narration ${job.narration.done}/${job.narration.total}` : '';
+  $('stage').textContent = (job.stage || '') + narrating;
   $('elapsed').textContent = end ? clockCount((end - started) / 1000) : '';
   const wording = etaWording(job, now);
   $('eta').hidden = !wording;
@@ -425,9 +441,9 @@ async function retryBuild() {
   try {
     const minutesText = job.minutes ? String(job.minutes) : '';
     const result = await call('/api/lessons/create', postJson(job.topic
-      ? { topic: job.topic, voice: job.voice, minutes: minutesText }
+      ? { topic: job.topic, voice: job.voice, speed: job.speed || '', minutes: minutesText, ...retryPower(job) }
       : { class_code: job.class_code, start: job.start, end: job.end, voice: job.voice,
-          focus: job.focus || '', minutes: minutesText }));
+          focus: job.focus || '', speed: job.speed || '', minutes: minutesText, ...retryPower(job) }));
     if (result.ok) { jobStarted = Date.now(); track(result.data.job_id); }
     else notice(failureText(result), 'error');
   } finally {
@@ -490,6 +506,13 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden && jo
 $('class').onchange = () => { store('lessonClass', $('class').value); fillDates(); };
 $('start').onchange = updateSummary; $('end').onchange = updateSummary;
 $('voice').onchange = () => store('lessonVoice', $('voice').value);
+$('speed').onchange = () => store('lessonSpeed', $('speed').value);
+$('voice-power').onchange = () => store('lessonVoicePower', $('voice-power').value);
+$('claude-effort').onchange = () => store('lessonClaudeEffort', $('claude-effort').value);
+// Generation settings for a build; a retry keeps what the failed build used unless it predates them.
+const buildPower = () => ({ voice_power: $('voice-power').value, claude_effort: $('claude-effort').value });
+const retryPower = job => ({ voice_power: job.voice_power || $('voice-power').value,
+                             claude_effort: job.claude_effort || $('claude-effort').value });
 $('focus').oninput = () => {
   const n = $('focus').value.length;
   $('focus-count').textContent = n > 450 ? `${n}/600` : '';
@@ -512,9 +535,11 @@ $('build').onclick = async () => {
     const { job_id } = await api('/api/lessons/create', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(mode === 'free'
-        ? { topic: $('topic').value.trim(), voice: $('voice').value, minutes: $('minutes').value.trim() }
+        ? { topic: $('topic').value.trim(), voice: $('voice').value, speed: $('speed').value,
+            minutes: $('minutes').value.trim(), ...buildPower() }
         : { class_code: $('class').value, start: $('start').value, end: $('end').value,
-            voice: $('voice').value, focus: $('focus').value.trim(), minutes: $('minutes').value.trim() }),
+            voice: $('voice').value, focus: $('focus').value.trim(), speed: $('speed').value,
+            minutes: $('minutes').value.trim(), ...buildPower() }),
     });
     jobStarted = Date.now(); track(job_id);
   } catch (error) { notice(error.message, 'error'); }
@@ -529,6 +554,9 @@ $('build').onclick = async () => {
     const savedClass = recall('lessonClass'); if (classes.some(c => c.code === savedClass)) $('class').value = savedClass;
     $('voice').innerHTML = Object.entries(info.voices).map(([id, label]) => `<option value="${id}">${esc(label)}</option>`).join('');
     $('voice').value = info.voices[recall('lessonVoice')] ? recall('lessonVoice') : info.default_voice;
+    if ([...$('speed').options].some(o => o.value === recall('lessonSpeed'))) $('speed').value = recall('lessonSpeed');
+    for (const [id, key] of [['voice-power', 'lessonVoicePower'], ['claude-effort', 'lessonClaudeEffort']])
+      if ([...$(id).options].some(o => o.value === recall(key))) $(id).value = recall(key);
     if (!info.narration) notice('Narration is unavailable (' + info.narration_reason + '). Lessons will still be built, without audio.');
     fillDates();
     if (!info.freestyle) {   // a dashboard that was started before this feature existed

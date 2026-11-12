@@ -69,26 +69,33 @@ class TestTimeline:
         assert [s["name"] for s in steps] == [lessons.STEP_READ, lessons.STEP_PLAN, lessons.STEP_FIND,
                                               lessons.STEP_PICK, lessons.STEP_NARRATE, lessons.STEP_FINISH]
         assert all(s["finished_at"] is not None and s["finished_at"] >= s["started_at"] for s in steps)
-        assert all(a["finished_at"] <= b["started_at"] for a, b in zip(steps, steps[1:]))   # one step at a time
+        # one step at a time - except narration, which records while the picture steps run
+        for a, b in zip(steps, steps[1:]):
+            if b["name"] != lessons.STEP_NARRATE:
+                assert a["finished_at"] <= b["started_at"]
         assert job["stage"] == "Lesson ready" and job["progress"] == 1.0   # the older fields still work
 
-    def test_narration_is_one_step_whose_detail_advances(self, library, fakes, monkeypatch):
+    def test_narration_is_one_step_overlapping_the_picture_steps(self, library, fakes, monkeypatch):
         fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
         status = library / "job.json"
-        seen = []
+        calls = []
 
         def tts(text, path, voice=speech.DEFAULT_VOICE, speed=1.0):
-            current = read(status)["steps"][-1]
-            seen.append((current["name"], current["detail"], current["done"], current["total"]))
+            calls.append(text)
             path.write_bytes(b"OggS")
             return 10.0
 
         monkeypatch.setattr(lessons.speech, "synthesize", tts)
         status, _ = self.run_builder(library)
-        assert seen == [(lessons.STEP_NARRATE, f"{n} of 5 slides", n, 5) for n in range(5)]
-        narration = [s for s in read(status)["steps"] if s["name"] == lessons.STEP_NARRATE]
+        job = read(status)
+        assert len(calls) == 5
+        narration = [s for s in job["steps"] if s["name"] == lessons.STEP_NARRATE]
         assert len(narration) == 1 and narration[0]["detail"] == "5 of 5 slides"
+        assert narration[0]["done"] == 5 and narration[0]["total"] == 5
         assert narration[0]["updated_at"] >= narration[0]["started_at"]
+        # it was dispatched as soon as the plan was ready, so it started before the find step ended
+        find = next(s for s in job["steps"] if s["name"] == lessons.STEP_FIND)
+        assert narration[0]["started_at"] <= find["finished_at"]
 
     def test_the_plan_size_is_recorded_for_the_estimate(self, library, fakes):
         fakes.replies = [json.dumps(PLAN), json.dumps({"choices": {}})]
@@ -134,7 +141,7 @@ class TestTimeline:
         status, code = self.run_builder(library)
         job = read(status)
         assert code == 1 and job["status"] == "failed" and job["error"] == "disk full"
-        assert job["steps"][-1]["name"] == lessons.STEP_PICK and job["steps"][-1]["finished_at"] is not None
+        assert job["steps"][-1]["name"] == lessons.STEP_FIND and job["steps"][-1]["finished_at"] is not None
 
 
 class TestEstimate:

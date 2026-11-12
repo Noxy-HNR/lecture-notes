@@ -233,3 +233,32 @@ def test_a_good_condense_reply_is_saved(condense_file, monkeypatch):
     ok, _ = notes.condense_session("TEST", "Test", 0, session_id="s1")
     assert ok
     assert "- point 27 about membranes and transport" in condense_file.read_text(encoding="utf-8")
+
+
+# -- generation speed ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("chosen, expected", [
+    ("high", "high"), ("medium", "medium"), ("low", "high"), ("max", "high"), (None, "high"),
+])
+def test_claude_always_runs_sonnet_5_5_at_high_effort_unless_medium_is_chosen(monkeypatch, chosen, expected):
+    calls = []
+    monkeypatch.setattr(notes, "_find_claude_cli", lambda: "claude")
+    monkeypatch.setattr(notes.subprocess, "run",
+                        lambda args, **kw: (calls.append(args), types.SimpleNamespace(returncode=0, stdout="- note", stderr=""))[1])
+    monkeypatch.setattr(notes, "claude_effort", chosen)
+    assert notes._try_claude_cli_format("prompt") == "- note"
+    args = calls[0]
+    assert args[args.index("--model") + 1] == "claude-sonnet-5-5"
+    assert args.count("--effort") == 1 and args[args.index("--effort") + 1] == expected
+    assert "fastMode" not in " ".join(args)
+
+
+def test_voice_generation_power_sets_workers_and_threads():
+    import speech
+    try:
+        speech.configure("light")
+        assert (speech.SYNTHESIS_WORKERS, speech.SYNTHESIS_THREADS) == speech.GENERATION_POWERS["light"]
+        speech.configure("nonsense")
+        assert (speech.SYNTHESIS_WORKERS, speech.SYNTHESIS_THREADS) == speech.GENERATION_POWERS["max"]
+    finally:
+        speech.configure(speech.DEFAULT_GENERATION_POWER)

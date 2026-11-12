@@ -25,7 +25,7 @@ import vocab as vocab_module
 NOTES_DIR = Path(__file__).resolve().parent.parent / "notes"
 NOTES_DIR.mkdir(exist_ok=True)
 
-CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_MODEL = "claude-sonnet-5-5"
 TAIL_CONTEXT_CHARS = 3000  # how much of the existing notes file we show Claude for continuity
 CLI_TIMEOUT_SECONDS = 180
 
@@ -207,6 +207,19 @@ def _looks_like_assistant_chatter(text: str) -> bool:
 
 last_cli_failure: str | None = None  # why the most recent CLI call returned None (None after a success)
 
+_SEARCH_SYSTEM = (
+    "Use web search to find exactly what the user asks for. Only report results you actually "
+    "found in search results; never guess or reconstruct a URL. Reply only in the format requested."
+)
+
+# Claude CLI effort. Always high, passed explicitly, unless a lesson build chooses medium (the
+# "Claude effort" choice on the Lessons page; a builder process sets claude_effort once). Note
+# saves in the recorder always use high. Nothing goes lower, and fast mode is never used (it
+# bills to usage credits rather than the subscription's limits).
+CLAUDE_EFFORTS = ("high", "medium")
+DEFAULT_CLAUDE_EFFORT = "high"
+claude_effort = DEFAULT_CLAUDE_EFFORT
+
 _FORMATTER_SYSTEM = (
     "Transform only the supplied lecture material into the requested artifact. "
     "Return the artifact alone, with no preface. Preserve quantities, units, scope, "
@@ -216,11 +229,14 @@ _FORMATTER_SYSTEM = (
 )
 
 
-def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> str | None:
+def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS,
+                           web_search: bool = False) -> str | None:
     """Returns clean markdown via the Claude Code CLI (subscription usage), or None if unusable.
     `timeout` is only raised by long one-off jobs (lessons); note saves keep the default.
     When it returns None the reason is left in `last_cli_failure`, so a caller that has no
-    fallback can say what actually went wrong instead of guessing."""
+    fallback can say what actually went wrong instead of guessing.
+    `web_search` lets this one call use the WebSearch tool (and no other tool), with a system
+    prompt for finding things rather than the formatter's; lessons use it to find video clips."""
     global last_cli_failure
     last_cli_failure = None
     cli = _find_claude_cli()
@@ -231,10 +247,12 @@ def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS) -> s
         # Bare mode bypasses the normal subscription authentication on this CLI.
         # Use it only when explicitly configured for an independently authenticated job.
         bare = ["--bare"] if os.environ.get("NOTE_RECORDER_CLAUDE_BARE") == "1" else ["--safe-mode"]
+        effort = claude_effort if claude_effort in CLAUDE_EFFORTS else DEFAULT_CLAUDE_EFFORT
         result = subprocess.run(
-            [cli, "-p", "--model", CLAUDE_MODEL, *bare, "--tools", "",
-             "--system-prompt", _FORMATTER_SYSTEM, "--no-session-persistence",
-             "--disallowedTools", " ".join(_CLI_NO_TOOLS)],
+            [cli, "-p", "--model", CLAUDE_MODEL, "--effort", effort, *bare,
+             *(["--tools", "WebSearch", "--allowedTools", "WebSearch"] if web_search else ["--tools", ""]),
+             "--system-prompt", _SEARCH_SYSTEM if web_search else _FORMATTER_SYSTEM, "--no-session-persistence",
+             "--disallowedTools", " ".join(t for t in _CLI_NO_TOOLS if not (web_search and t == "WebSearch"))],
             input=prompt,
             capture_output=True,
             text=True,

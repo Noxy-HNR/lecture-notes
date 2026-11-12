@@ -51,3 +51,6 @@ pillow>=10.0
 # Draws molecule slides as crisp vectors from PubChem's structures (falls back to PubChem's
 # own small raster drawing without it).
 rdkit>=2024.3
+# Lesson video clips: yt-dlp downloads the chosen part of a YouTube video (needs ffmpeg and Node.js)
+yt-dlp
+yt-dlp-ejs

@@ -151,3 +151,38 @@ def test_lazy_word_exports_still_create_formatted_documents(export, tmp_path, mo
     bullet = next(paragraph for paragraph in document.paragraphs if paragraph.text == "Mitosis makes cells.")
     assert bullet.runs[0].bold
     assert bullet.style.name == "List Bullet"
+
+
+def test_model_load_retries_a_brief_memory_shortage(monkeypatch):
+    import main
+    calls = []
+
+    def load():
+        calls.append(1)
+        if len(calls) < 3:
+            raise MemoryError("Insufficient free VRAM for Cohere plus 1 GiB headroom")
+
+    monkeypatch.setattr(main.transcribe, "get_model", load)
+    monkeypatch.setattr(main.transcribe, "backend_name", lambda: "cohere")
+    monkeypatch.setattr(main.transcribe, "device_info", lambda: "cuda")
+    monkeypatch.setattr(main, "MODEL_LOAD_RETRY_SECONDS", 0)
+    blocks, _ = main._check_transcription_model()
+    assert not blocks and len(calls) == 3
+
+
+def test_a_lasting_memory_shortage_still_blocks_and_is_logged(tmp_path, monkeypatch):
+    import main
+
+    def load():
+        raise MemoryError("Less than 1 GiB RAM headroom remains")
+
+    monkeypatch.setattr(main.transcribe, "get_model", load)
+    monkeypatch.setattr(main, "MODEL_LOAD_RETRY_SECONDS", 0)
+    monkeypatch.setattr(main, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(main, "STARTUP_FAILURE_LOG", tmp_path / "startup_failures.log")
+    blocks, message = main._check_transcription_model()
+    assert blocks
+    main._record_startup_failure([message], tmp_path / "x.wav")
+    log = (tmp_path / "startup_failures.log").read_text(encoding="utf-8")
+    assert "recording did not start" in log and "Less than 1 GiB RAM headroom" in log
+    assert "\x1b[" not in log

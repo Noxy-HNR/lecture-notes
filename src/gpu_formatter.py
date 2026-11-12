@@ -36,6 +36,10 @@ STARTUP_TIMEOUT_SECONDS = 90
 CONTROL_TIMEOUT_SECONDS = 5
 LOAD_TIMEOUT_SECONDS = 45
 CONTEXT_SIZE = 32768
+# What this app asks the shared manager for, on top of the saved profile: its own context size,
+# and never the profile's LoRA adapter (e.g. an uncensored one meant for chat), so notes come
+# from the plain model and a missing adapter can't block loading.
+LOAD_OVERRIDES = {"contextSize": CONTEXT_SIZE, "loraFile": ""}
 REQUEST_TIMEOUT_SECONDS = 180
 IDLE_TIMEOUT_SECONDS = 600  # Public compatibility only; the manager owns server idle policy.
 _WATCHDOG_POLL_SECONDS = 1
@@ -193,12 +197,15 @@ def _port_open():
 def _listening_port(port):
     """Windows can delay closed-port refusal beyond a short TCP timeout.
 
-    Read the OS listener table instead; an inventory error still fails closed.
+    Read the OS listener table instead; an inventory error still fails closed. The status
+    field can't be trusted: on some Windows builds psutil reports a listening socket as
+    NONE or CLOSE, never LISTEN. A socket bound to the port with no remote address is a
+    listener whatever its reported status (connected sockets always have a remote end).
     """
     try:
         import psutil
-        return any(c.status == psutil.CONN_LISTEN and c.laddr.port == port and
-                   c.laddr.ip in ('127.0.0.1','0.0.0.0','::','::1')
+        return any(c.laddr and c.laddr.port == port and c.laddr.ip in ('127.0.0.1','0.0.0.0','::','::1')
+                   and not c.raddr
                    for c in psutil.net_connections(kind='tcp'))
     except Exception:
         return True
@@ -209,7 +216,8 @@ def _manager_port_open():
 
 
 def _manager_preflight(timeout=2):
-    result = _request_json(MANAGER_URL, "/api/models/preflight", {"filename": MODEL_FILENAME}, timeout=timeout)
+    result = _request_json(MANAGER_URL, "/api/models/preflight",
+                           {"filename": MODEL_FILENAME, "settings": LOAD_OVERRIDES}, timeout=timeout)
     if not isinstance(result, dict) or result.get("filename") != MODEL_FILENAME:
         raise ValueError("Management endpoint did not identify the requested saved model")
     if type(result.get("success")) is not bool or not isinstance(result.get("admission"), dict):
@@ -523,7 +531,7 @@ def _ensure_server_running() -> bool:
                 return False
             result = _request_json(MANAGER_URL, "/api/models/load", {
                 "filename": MODEL_FILENAME, "persist": False, "onlyIfIdle": True,
-                "settings": {"contextSize": CONTEXT_SIZE}}, timeout=LOAD_TIMEOUT_SECONDS)
+                "settings": LOAD_OVERRIDES}, timeout=LOAD_TIMEOUT_SECONDS)
             if result.get("success") is not True:
                 return False
             loaded_pid = result.get("pid")
@@ -705,23 +713,32 @@ def _close_windows_job(job):
         ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
 
 
-_FORMAT_SYSTEM_PROMPT = """Format only the facts explicitly stated in the supplied lecture transcript as markdown notes.
+_FORMAT_SYSTEM_PROMPT = """You turn a raw speech-to-text lecture transcript into clean, well-organized study notes in markdown. A student will review these notes later to learn the material.
 
-Rules:
-- Preserve every stated fact, negation, limitation, uncertainty, number, precision and unit. Preserve who said a claim; do not drop instructor or student attribution.
-- Keep the source's original sentences and wording. Change only punctuation, obvious mechanical transcription errors and Markdown formatting. Do not replace source sentences with explanatory headings, abstractions or paraphrases.
-- Use full bullet points and bold key terms. Any descriptive label must reuse wording from the source. Do not create a separate key-terms list.
-- Do not add definitions, classifications, mechanisms, causes, outcomes, materials, experimental context or textbook knowledge that the source did not state. A familiar scientific fact is still an addition.
-- Do not infer a positive claim from a negation, resolve an uncertain value, or turn an unmeasured outcome into an observed result.
-- Correct only obvious mechanical transcription errors. Preserve uncertain wording and any existing verification markers rather than guessing.
-- Keep explicit student/instructor exchanges separate under exactly "### Q&A", using standalone "**Q (Student):**" and "**A (Instructor):**" lines without bullet markers. Preserve their actual question and answer, including a refusal to conclude anything.
-- Do not add a title or date heading; the caller supplies the existing date. Respond only with notes, without commentary.
+How to write the notes:
+- Group the material by topic. Start each topic with a short level-3 heading ("### Topic name") taken from what the lecture covers. Use 2-6 topics for a few minutes of lecture.
+- Under each heading, write concise bullets. Merge sentences that make one point into one bullet; use indented sub-bullets for details, steps, examples and lists.
+- State the content directly and factually: "**Rubisco**: the enzyme that captures CO2 in carbon fixation". Never write "the professor said", "we covered" or "today we learned".
+- Define terms in the form "**Term**: meaning", using the lecture's own explanation. Bold key terms the first time they appear.
+- Write chemical formulas, charges and math as plain text with Unicode subscripts and superscripts (H₂CO₃, NADP⁺, CO₂, x²). Never use LaTeX or $...$.
+- Drop filler and speech habits (um, you know, so, like, okay, repeated words, false starts, jokes and asides that teach nothing).
+- Fix obvious mis-hearings of technical terms when the intended word is clear from context. If you are unsure, keep the original word and add " ⚠️ *verify*".
+- When the instructor says what will or won't be on an exam, or what students must know or need not memorize, put it in a bullet starting "**Exam note:**".
+- If a student asks a question and the instructor answers, put it under "### Q&A" as "**Q (Student):** ..." and "**A (Instructor):** ..." lines.
 
-Example of the style to match:
-Transcript: "the mitocondrion is the powerhouse of the cell. it produces energy through a process called cellular respiration."
+Accuracy rules (these matter more than style):
+- Use only what the transcript says. Do not add facts, definitions, examples or explanations from your own knowledge, even well-known ones.
+- Keep every fact, number, unit, negation and uncertainty. Do not drop content because it seems minor; condense the wording, not the information.
+- Cover every distinct point in the order it was taught, including each example, demonstration, observation and clarification the instructor uses ("Example: ..." as a sub-bullet, one line each), and anything the instructor says is NOT true or was NOT claimed.
+- Before you finish, check the transcript from start to end and add any point you skipped. Notes for a few minutes of lecture are usually 60-80% as long as the transcript.
+- Do not add a title or a date heading (no "#" or "##" headings). Output only the notes, with no preface or closing remarks.
+
+Example:
+Transcript: "okay so um the mitocondria, the mitochondria is the powerhouse of the cell, you've heard that a million times. it makes ATP through cellular respiration. you don't need to memorize every step of the krebs cycle but you should know what goes in and what comes out."
 Notes:
-- The **mitochondrion** is the powerhouse of the cell.
-- It produces energy through a process called **cellular respiration**."""
+### Mitochondria
+- **Mitochondrion**: the powerhouse of the cell; makes **ATP** through **cellular respiration**.
+- **Exam note:** you don't need to memorize every step of the Krebs cycle, but know its inputs and outputs."""
 
 
 def _scaled_max_tokens(transcript: str, floor: int = 400, ceiling: int = 8000) -> int:

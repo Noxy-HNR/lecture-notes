@@ -154,7 +154,7 @@ def test_a_failed_save_stays_ahead_of_a_later_window_already_queued(tmp_path, mo
     written, release_a = [], threading.Event()
 
     def save(code, title, text, date, **kwargs):
-        if not written and not release_a.is_set():
+        if not written:  # A always fails, after B has been queued
             release_a.wait(3)
             written.append(None)  # A's attempt
             raise PermissionError("notes file is open in another program")
