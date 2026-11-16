@@ -1,3 +1,4 @@
+import queue
 import sys
 from types import SimpleNamespace
 
@@ -66,8 +67,11 @@ def test_preparation_failure_or_interrupt_keeps_audio_and_closes_capture(tmp_pat
             assert sf.info(next(tmp_path.glob('*.wav'))).frames == 8000
             return False
     class Capture:
-        def __init__(self, source, on_block=None): self.persist = on_block
-        def start(self): self.persist(np.full(8000, .1, dtype=np.float32))
+        # The capture starts when the app opens, before there is a recording to write to; what
+        # it delivers then is held, and written and queued once the recording exists.
+        def __init__(self, source, on_block=None): self.persist = on_block; self.audio_queue = queue.Queue()
+        def start(self): assert self.persist(np.full(8000, .1, dtype=np.float32)) is capture.HOLD
+        def reset_startup_sample(self, recent=None): actions.append('sample restarted') if recent is None else None
         def stop(self): actions.append('stopped')
         def abandon(self): actions.append('abandoned')
     monkeypatch.setattr(main, 'STATE_DIR', tmp_path)
@@ -84,7 +88,7 @@ def test_preparation_failure_or_interrupt_keeps_audio_and_closes_capture(tmp_pat
         monkeypatch.setattr(main, 'choose_formatting_mode', interrupted)
     with pytest.raises(KeyboardInterrupt if interrupt else SystemExit):
         main.run()
-    assert actions == ['stopped', 'abandoned', 'sleep released']
+    assert actions == ['sample restarted', 'stopped', 'abandoned', 'sleep released']
     path = next(tmp_path.glob('*.wav'))
     with sf.SoundFile(path) as wav:
         assert len(wav.read()) == 8000

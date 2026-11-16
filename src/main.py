@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -146,10 +146,23 @@ def choose_action(args) -> str:
     print("  3. Quiz yourself with flashcards")
     print("  4. Open the dashboard (browse/search notes, live diagnostics)")
     print("  5. Record a lecture for a class you pick (ignores the schedule)")
+    print(c.dim("  (Already listening, so nothing is missed while you choose. Options 2-4 discard it.)"))
     transcribe.start_dependency_preparation()
     choice = input("Choose [1]: ").strip() or "1"
     return {"2": "study_guide", "3": "flashcards", "4": "dashboard",
             "5": "record_pick"}.get(choice, "record")
+
+
+def start_preroll(args):
+    """Opens audio capture for the source(s) that might be recorded, before the first prompt
+    (see capture.Preroll). Never raises: a failure here only means recording starts where it
+    used to, once the audio source has been chosen."""
+    sources = [args.source] if args.source in ("mic", "system") else ["mic", "system"]
+    try:
+        return capture_module.Preroll(
+            sources, lambda source, on_block: capture_module.CaptureThread(source, on_block=on_block))
+    except Exception:
+        return None
 
 
 def pick_class() -> dict:
@@ -519,12 +532,17 @@ class CaptureWatchdog:
     SLEEP_GAP_SECONDS = 45.0
     POLL_SECONDS = 3.0  # longest the recording loop waits for audio before checking in
 
-    def __init__(self, make_capture, source_label: str = "microphone", clock=time.time):
+    def __init__(self, make_capture, source_label: str = "microphone", clock=time.time, existing=None):
+        """`existing`: a capture that is already running (the one that has been recording
+        since the app opened, see capture.Preroll); replacements still come from make_capture."""
         self._make_capture = make_capture
         self._clock = clock
         self._source_label = source_label
-        self.capture = make_capture()
-        self.capture.start()
+        if existing is not None:
+            self.capture = existing
+        else:
+            self.capture = make_capture()
+            self.capture.start()
         self.restarts = 0
         self._retired_discontinuities = 0
         self._last_check = clock()
@@ -856,6 +874,30 @@ def _record_startup_failure(reasons, wav_path=None):
         pass
 
 
+STARTUP_TIMING_LOG = STATE_DIR / "startup_timings.jsonl"
+
+
+def _record_startup_timing(entry: dict):
+    """One line per launch in state/startup_timings.jsonl: how long each check took, which
+    transcription runtime loaded, and how much RAM was free. Launches are usually ready in
+    seconds; when one isn't, this says which part was slow. Never raises."""
+    try:
+        entry = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **entry}
+        try:
+            entry["runtime"] = transcribe.device_info() if entry.get("ok") else "not loaded"
+        except Exception:
+            pass
+        try:
+            from health import _read_memory
+            entry["ram_available_gib"] = round(_read_memory()[0] / 2**30, 1)
+        except Exception:
+            pass
+        with STARTUP_TIMING_LOG.open("a", encoding="utf-8") as log:
+            log.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 def _pause_before_closing():
     """Leaves the reason on screen when the recorder runs in its own window."""
     if sys.stdin is not None and sys.stdin.isatty():
@@ -878,10 +920,19 @@ class PreflightRunner:
 
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=4)
+        self._timings = {}
+        self._created = time.monotonic()
         self._disk_future = self._executor.submit(_check_disk_space)
-        self._model_future = self._executor.submit(_check_transcription_model)
+        self._model_future = self._executor.submit(self._timed, "model", _check_transcription_model)
         self._audio_future = None
         self._gpu_future = None
+
+    def _timed(self, name, check, *args):
+        started = time.monotonic()
+        try:
+            return check(*args)
+        finally:
+            self._timings[name] = round(time.monotonic() - started, 2)
 
     def prepare_source(self, source: str):
         """Clear OS mute before the capture thread opens its one recording device."""
@@ -892,14 +943,17 @@ class PreflightRunner:
             # OS-level mute (see mic_mute.py docstring for what it can't see).
             if mic_mute.check_and_unmute() == "unmuted":
                 print(c.warning("  Microphone was muted at the system level - unmuted it automatically."))
+                self._source_unmuted = True
+                return True  # audio captured before this moment was silence
         self._source_unmuted = True
+        return False
 
     def start_audio_check(self, source: str):
         if self._audio_future is not None:
             return
         self.prepare_source(source)
         capture = getattr(self, '_startup_capture', None)
-        self._audio_future = self._executor.submit(_check_audio_device, source, capture)
+        self._audio_future = self._executor.submit(self._timed, "audio_check", _check_audio_device, source, capture)
 
     def start_gpu_warmup(self, formatting_mode: str):
         if self._gpu_future is not None:
@@ -909,13 +963,14 @@ class PreflightRunner:
         # everything), so warming it up there would just burn VRAM/startup time for
         # nothing in the common case. See gpu_formatter.warm_up() for the full reasoning.
         if formatting_mode == "local" and gpu_formatter.available():
-            self._gpu_future = self._executor.submit(gpu_formatter.warm_up)
+            self._gpu_future = self._executor.submit(self._timed, "local_formatter", gpu_formatter.warm_up)
 
     def finish(self, source: str, formatting_mode: str) -> bool:
         self.start_audio_check(source)
         self.start_gpu_warmup(formatting_mode)
 
         print(c.heading("Running preflight checks..."))
+        wait_started = time.monotonic()
         ok = True
         self.failures = []
 
@@ -949,6 +1004,13 @@ class PreflightRunner:
             print(c.dim("  Speaker diarization: off (default - measured as not worth its cost "
                          "for single-speaker lectures; pass --diarize for seminars/discussions)"))
 
+        waited = time.monotonic() - wait_started
+        parts = ", ".join(f"{name.replace('_', ' ')} {seconds:.1f}s" for name, seconds in self._timings.items())
+        print(c.dim(f"  Checks finished {waited:.1f}s after your last answer ({parts}). "
+                     "Audio was being recorded the whole time."))
+        _record_startup_timing({"ok": ok, "waited_after_prompts": round(waited, 2),
+                                "since_record_chosen": round(time.monotonic() - self._created, 2),
+                                **self._timings})
         print()
         self._executor.shutdown(wait=False)
         return ok
@@ -1529,7 +1591,12 @@ def run():
         dashboard.serve()
         return
 
+    # Listening starts before the first question is asked, so a lecture that is already under
+    # way isn't lost while the menu is on screen. Choosing anything but Record drops it.
+    preroll = start_preroll(args)
     action = choose_action(args)
+    if action != "record" and action != "record_pick" and preroll is not None:
+        preroll.discard(everything=True)
     if action == "study_guide":
         run_study_guide(choose_notes_class(args))
         return
@@ -1565,8 +1632,11 @@ def run():
     try:
         cls = pick_class() if action == "record_pick" else choose_class(args)
         source = choose_source(args)
-        preflight.prepare_source(source)
-        now = datetime.now()
+        was_muted = preflight.prepare_source(source)
+        use_preroll = preroll is not None and preroll.has(source)
+        # The recording's name and clock times count from its first sample, which is now
+        # earlier than this moment by however much was captured while the prompts were up.
+        now = datetime.now() - timedelta(seconds=preroll.held_seconds(source) if use_preroll else 0.0)
         session_date = f"{now.strftime('%A, %B')} {now.day}, {now.strftime('%Y')}"
         ts = now.strftime("%Y%m%d_%H%M%S")
         raw_log_path = STATE_DIR / f"{cls['code'].replace(' ', '_')}_{ts}_raw.txt"
@@ -1575,11 +1645,24 @@ def run():
         session_start_offset = len(existing_notes_path.read_text(encoding="utf-8")) if existing_notes_path.exists() else 0
         session = Session(wav_path)
         keep_awake.prevent_sleep()
+        early = None
+        kept_seconds = 0.0
+        if use_preroll:
+            early, kept_seconds, recent = preroll.adopt(source, persist_for_capture)
+            session.session_start -= kept_seconds
+            # The audio check can use what was just captured instead of waiting 3 s for more,
+            # unless the microphone was muted until a moment ago (that audio is silence).
+            early.reset_startup_sample(None if was_muted else recent)
+        elif preroll is not None:
+            preroll.discard(everything=True)
         watchdog = CaptureWatchdog(lambda: capture_module.CaptureThread(source, on_block=persist_for_capture),
-                                   source_label="microphone" if source == "mic" else "system audio")
+                                   source_label="microphone" if source == "mic" else "system audio",
+                                   existing=early)
         capture = watchdog.capture
         preflight._startup_capture = capture
         print(c.info(f"Audio backup is recording while the model prepares: {wav_path}"))
+        if kept_seconds >= 1:
+            print(c.info(f"Kept the {kept_seconds:.0f}s recorded since the app opened."))
         preflight.start_audio_check(source)
         formatting_mode = choose_formatting_mode(args)
         preflight.start_gpu_warmup(formatting_mode)
@@ -1591,6 +1674,8 @@ def run():
         if watchdog is not None:
             watchdog.capture.stop()
             watchdog.capture.abandon()  # suppress a late driver response after closing the WAV
+        if preroll is not None:
+            preroll.discard(everything=watchdog is None)
         if session is not None:
             session.close()
             print(c.warning(f"Audio preserved. Recover with --resume \"{session.wav_path}\""))

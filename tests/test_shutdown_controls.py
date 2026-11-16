@@ -93,6 +93,9 @@ class FakeCapture:
     def stop(self):
         pass
 
+    def reset_startup_sample(self, recent=None):
+        pass
+
     last_audio_at = 1.0
 
     def seconds_since_audio(self, now=None):

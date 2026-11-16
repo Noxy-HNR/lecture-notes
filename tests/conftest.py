@@ -36,6 +36,7 @@ def isolate_live_state_files(tmp_path_factory):
     # state/startup_failures.log, next to genuine failures.
     import main
     main.STARTUP_FAILURE_LOG = state / "startup_failures.log"
+    main.STARTUP_TIMING_LOG = state / "startup_timings.jsonl"
     # The end of a recorded session starts a background cleanup (repair.py) and the dashboard
     # starts one on launch; from a test either would run against the real notes and state.
     import repair

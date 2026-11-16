@@ -30,6 +30,18 @@ checks and loads the model weights. All four menu actions remain available. Expl
 commands such as `--list` and `--dashboard` skip this preparation. These changes work with the existing Python 3.13
 environment; an interpreter upgrade is not required.
 
+**Recording starts when the window opens.** The recorder begins capturing the microphone and
+system audio as soon as its menu appears, and holds that audio in memory (the newest 10
+minutes at most). When you choose Record and an audio source, everything held for that
+source goes into the lecture's recording and is transcribed with the rest, with no gap; the
+other source is dropped. Choosing the study guide, flashcards or the dashboard discards all
+of it, and none is written to disk. Because that audio already exists, the audio check uses
+its last 3 seconds instead of waiting for 3 more.
+
+Each launch adds a line to `state/startup_timings.jsonl`: how long the model load and audio
+check took, which transcription runtime loaded, and how much RAM was free. A normal launch is
+ready 3-7 seconds after Record is chosen; when one is slow, that line says which part.
+
 For a model startup measurement without opening the microphone, stop any live recording
 and run `python tools/recorder_startup_benchmark.py --menu-seconds 3`. It reports time to
 the menu and the model load wait after choosing Record, with RAM and timeout limits.

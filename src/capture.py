@@ -18,6 +18,8 @@ diarization, a network call) gets, it only adds latency to when segments show up
 live view - it can never again cause audio to be silently dropped, because nothing
 downstream is on the same thread as the thing draining the hardware buffer.
 """
+import collections
+import functools
 import queue
 import threading
 import time
@@ -28,6 +30,15 @@ import audio
 
 READ_SECONDS = 0.5  # small blocks so the OS buffer gets drained frequently
 RECORDER_RETRY_SECONDS = 2
+STARTUP_SAMPLE_SECONDS = 3.0
+
+# What on_block returns to say "I'm keeping this block, don't queue it for transcription"
+# (see Preroll: audio captured before a session exists to write it to).
+HOLD = object()
+
+# The most audio kept from before Record was chosen. The app can sit at its menu for a long
+# time; a lecture that started while it did is worth keeping, an hour of hallway isn't.
+PREROLL_MAX_SECONDS = 600.0
 
 # Pause-aware chunking: end a chunk on a natural speech pause rather than a fixed timer,
 # so boundaries don't land mid-word. Implemented, measured, and left OFF by default -
@@ -145,15 +156,28 @@ class CaptureThread:
         self._stop_event.set()
         self._thread.join(timeout=timeout)
 
-    def startup_sample(self, seconds=3.0, timeout=10.0):
+    def startup_sample(self, seconds=STARTUP_SAMPLE_SECONDS, timeout=10.0):
         """Observe persisted first audio without consuming the transcription queue."""
         if not self._startup_ready.wait(timeout):
             raise RuntimeError(self.fatal_error or 'audio device did not deliver its startup sample')
         with self._startup_lock:
             return np.concatenate(self._startup_parts)[:int(seconds * audio.SAMPLE_RATE)]
 
+    def reset_startup_sample(self, recent=None):
+        """Takes the startup sample again from the audio that arrives next - or, given at least
+        STARTUP_SAMPLE_SECONDS of `recent` audio, uses the end of that, so a capture that has
+        been running since the app opened doesn't make the audio check wait another 3 s."""
+        target = int(STARTUP_SAMPLE_SECONDS * audio.SAMPLE_RATE)
+        with self._startup_lock:
+            self._startup_parts, self._startup_frames = [], 0
+            self._startup_ready.clear()
+            if recent is not None and len(recent) >= target:
+                self._startup_parts = [np.asarray(recent[-target:], dtype=np.float32).copy()]
+                self._startup_frames = target
+                self._startup_ready.set()
+
     def _observe_startup(self, block):
-        target = int(3.0 * audio.SAMPLE_RATE)
+        target = int(STARTUP_SAMPLE_SECONDS * audio.SAMPLE_RATE)
         with self._startup_lock:
             if self._startup_frames < target:
                 part = block[:target - self._startup_frames].copy()
@@ -298,10 +322,102 @@ class CaptureThread:
                                 self._stop_event.set()
                                 return
                         self._observe_startup(block)
-                        self.audio_queue.put(queued)
+                        if queued is not HOLD:
+                            self.audio_queue.put(queued)
             except Exception as e:
                 # Device dropped out (sleep/resume hiccup, USB mic unplugged, etc.) -
                 # log it and loop back around to reopen a fresh recorder rather than
                 # letting the capture thread die silently.
                 self.error_queue.put(e)
                 time.sleep(RECORDER_RETRY_SECONDS)
+
+
+class Preroll:
+    """Records from the moment the app opens, before anyone has said what to do with it.
+
+    The recorder asks what to do, then which audio source, and only then had a session to
+    write audio into - so whatever was said while those prompts were on screen was lost. A
+    Preroll opens the capture for each possible source straight away and holds what arrives
+    in memory (64 KB a second per source, the newest PREROLL_MAX_SECONDS at most). Then:
+
+      adopt(source, persist)  Record was chosen with this source. Everything held for it is
+                              written through `persist` (the session's durable WAV) and
+                              queued for transcription, in order, and the same capture
+                              keeps running straight into the session - no gap, no second
+                              device open. The other source is dropped.
+      discard()               Something other than recording was chosen. Every capture is
+                              stopped and the audio is dropped; none of it was written
+                              anywhere.
+
+    The lock makes the hand-over exact: a block is either held (and flushed by adopt) or
+    persisted directly, never both and never out of order."""
+
+    def __init__(self, sources, make_capture, max_seconds: float = PREROLL_MAX_SECONDS):
+        self._lock = threading.Lock()
+        self._max_frames = int(max_seconds * audio.SAMPLE_RATE)
+        self._held = {source: collections.deque() for source in sources}
+        self._frames = {source: 0 for source in sources}
+        self._persist = None
+        self._adopted = None
+        self.captures = {}
+        for source in sources:
+            self.captures[source] = make_capture(source, functools.partial(self._on_block, source))
+        for capture in self.captures.values():
+            capture.start()
+
+    def _on_block(self, source, block):
+        with self._lock:
+            if source == self._adopted:
+                return self._persist(block)
+            held = self._held.get(source)
+            if held is not None:
+                held.append(block)
+                self._frames[source] += len(block)
+                while len(held) > 1 and self._frames[source] - len(held[0]) >= self._max_frames:
+                    self._frames[source] -= len(held.popleft())
+            return HOLD
+
+    def has(self, source) -> bool:
+        return source in self.captures and self._adopted is None
+
+    def held_seconds(self, source) -> float:
+        with self._lock:
+            return self._frames.get(source, 0) / audio.SAMPLE_RATE
+
+    def adopt(self, source, persist):
+        """Returns (the running capture, seconds of audio kept from before now, the last
+        STARTUP_SAMPLE_SECONDS of that audio or None if there was less)."""
+        capture = self.captures[source]
+        with self._lock:
+            held = self._held.pop(source)
+            frames = self._frames.pop(source)
+            recent = None
+            if frames >= int(STARTUP_SAMPLE_SECONDS * audio.SAMPLE_RATE):
+                tail, have = [], 0
+                for block in reversed(held):
+                    tail.append(block)
+                    have += len(block)
+                    if have >= int(STARTUP_SAMPLE_SECONDS * audio.SAMPLE_RATE):
+                        break
+                recent = np.concatenate(list(reversed(tail)))
+            for block in held:
+                capture.audio_queue.put(persist(block))
+            self._persist, self._adopted = persist, source
+            capture.on_block = persist  # later blocks skip this class entirely
+        self.discard()
+        return capture, frames / audio.SAMPLE_RATE, recent
+
+    def discard(self, everything: bool = False):
+        """Stops every capture that wasn't adopted (all of them with `everything`) and drops
+        what they held. abandon() rather than stop(): a loopback device with nothing playing
+        can sit inside the driver, and nobody should wait on it to choose a menu option."""
+        with self._lock:
+            self._held.clear()
+            self._frames.clear()
+            doomed = [c for s, c in self.captures.items() if everything or s != self._adopted]
+            self.captures = {s: c for s, c in self.captures.items() if not everything and s == self._adopted}
+        for capture in doomed:
+            try:
+                capture.abandon()
+            except Exception:
+                pass
