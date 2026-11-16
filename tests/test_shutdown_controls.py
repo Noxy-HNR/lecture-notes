@@ -129,7 +129,7 @@ def recorder(tmp_path, monkeypatch):
     monkeypatch.setattr(telemetry, "STATUS_PATH", state / "status.json")
     monkeypatch.setattr(telemetry, "COMMAND_PATH", state / "command.json")
     monkeypatch.setattr(performance, "PATH", tmp_path / "timings.jsonl")
-    monkeypatch.setattr(main, "auto_prune_audio", lambda: None)
+    monkeypatch.setattr(main, "start_after_lecture_cleanup", lambda *args: None)
     monkeypatch.setattr(main.keep_awake, "prevent_sleep", lambda: None)
     monkeypatch.setattr(main.keep_awake, "allow_sleep", lambda: None)
     monkeypatch.setattr(main, "msvcrt", None)

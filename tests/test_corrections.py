@@ -27,8 +27,6 @@ def library(tmp_path,monkeypatch):
     monkeypatch.setattr(c,'NOTES_DIR',notes)
     monkeypatch.setattr(vocab,'VOCAB_PATH',tmp_path/'vocab.json')
     monkeypatch.setattr(telemetry,'read_status',lambda:{})
-    import docx_export
-    monkeypatch.setattr(docx_export,'rebuild',lambda *args:None)
     source='\n'.join(json.dumps(s) for s in [
         {'start':0,'end':4,'text':'The mitocondria produce energy.'},
         {'start':4,'end':8,'text':'Membranes control transport.'}])+'\n'

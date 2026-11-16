@@ -139,20 +139,6 @@ print(json.dumps([name for name in ('docx', 'torch', 'transformers') if name in 
     assert json.loads(result.stdout) == []
 
 
-@pytest.mark.parametrize("export", ["append_section", "save_study_guide", "rebuild"])
-def test_lazy_word_exports_still_create_formatted_documents(export, tmp_path, monkeypatch):
-    import docx_export
-    from docx import Document
-
-    monkeypatch.setattr(docx_export, "NOTES_DIR", tmp_path)
-    path = getattr(docx_export, export)("TEST 100", "Test", "## Lecture\n- **Mitosis** makes cells.")
-    document = Document(path)
-    assert any(paragraph.text == "Lecture" for paragraph in document.paragraphs)
-    bullet = next(paragraph for paragraph in document.paragraphs if paragraph.text == "Mitosis makes cells.")
-    assert bullet.runs[0].bold
-    assert bullet.style.name == "List Bullet"
-
-
 def test_model_load_retries_a_brief_memory_shortage(monkeypatch):
     import main
     calls = []

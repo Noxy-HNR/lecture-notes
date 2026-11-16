@@ -7,7 +7,6 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"src"))
 from storage import atomic_write
 import notes
-import docx_export
 
 
 def main():
@@ -29,10 +28,6 @@ def main():
     if not revision.is_file(): parser.error("Revision not found")
     text=revision.read_text(encoding="utf-8")
     atomic_write(target,text)
-    try:
-        docx_export.rebuild(args.code,args.code,text)
-    except Exception as error:
-        print(f"Markdown restored; Word mirror could not update: {error}")
     print(f"Restored {target}; the previous version is retained in .revisions")
 
 

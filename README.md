@@ -27,8 +27,7 @@ dashboard does not stop a recording. Restart the dashboard after installing this
 While the action menu is open, the recorder prepares its transcription imports in the
 background. Choosing Record reuses that preparation, then runs the normal preflight
 checks and loads the model weights. All four menu actions remain available. Explicit
-commands such as `--list` and `--dashboard` skip this preparation. Word export loads
-`python-docx` on the first document save. These changes work with the existing Python 3.13
+commands such as `--list` and `--dashboard` skip this preparation. These changes work with the existing Python 3.13
 environment; an interpreter upgrade is not required.
 
 For a model startup measurement without opening the microphone, stop any live recording
@@ -119,8 +118,7 @@ instantly from **Your lessons**.
   with those old notes, while subsequent recoveries replace the marked section.
 - Every replaced notes file is saved with an atomic write and a prior-version
   snapshot under `notes/.revisions/<filename>/`. Formatting failures no longer
-  truncate the old notes before replacement content is ready. The Word mirror is
-  rebuilt after saves and excludes the internal session comments.
+  truncate the old notes before replacement content is ready.
 - Recovery reads WAV data in chunks, and cleanup closes the recording even when
   final processing fails. A disk write failure stops capture and reports the error.
 
@@ -163,8 +161,8 @@ Also:
   section, fixing formatting bugs, and cleaning up anything that still looks
   like unformatted raw transcript. This pass is CLI/API-only by design (see
   "Local GPU note formatting" below for why the local model isn't used here).
-- Output is written as both **Markdown** (`notes/<CODE>.md`) and **Word** (`notes/<CODE>.docx`),
-  kept in sync, appended lecture by lecture.
+- Output is written as **Markdown** (`notes/<CODE>.md`), appended lecture by lecture, and read on
+  the dashboard. (A Word copy used to be rebuilt on every save; nothing read it, so it was removed.)
 - If speaker diarization is set up (see below), **Q&A exchanges get their own section**,
   separated from the main lecture content.
 - The live console view is color-coded: cyan timestamps, white transcript text,
@@ -353,8 +351,8 @@ python src/main.py --list-sessions              # see what's recoverable
 python src/main.py --resume "state/PSYC_1300_20260902_091439.wav"
 ```
 
-Point `--resume` at either the `.wav` or `_raw.txt` backup (it finds the
-matching pair automatically). If the audio backup exists, it's **re-transcribed
+Point `--resume` at the recording (`.wav`, or `.ogg` once it has been compressed) or
+the `_raw.txt` backup (it finds the matching pair automatically). If the audio backup exists, it's **re-transcribed
 from scratch** (not just replayed from the raw log) so diarization can run on
 it too - safe to do now since recording has already stopped, unlike during a
 live session. It's then formatted, saved, and condensed exactly like a normal
@@ -399,12 +397,62 @@ conclusion: **batch size isn't a real lever here** - left at the library
 default (32). The `128` result specifically should not be trusted as a clean
 measurement given what happened during that run; it wasn't safe to retest.
 
+## Cleanup: fixing notes after the fact
+
+Open a class on the dashboard and choose **Cleanup**. It lists every lecture whose
+notes need attention, with a button for each fix:
+
+- **Rough formatting** — the lecture was saved while Claude couldn't be reached, so it
+  fell back to the heuristic formatter. *Re-format with Claude* rebuilds it from the
+  saved transcript. If Claude still can't be reached, the notes stay as they are.
+- **Uncertain spots** — "⚠️ verify" marks on words the transcriber mis-heard. *Resolve
+  uncertain spots* has Claude work out what was meant from context and the subject,
+  and remove the marks. The result only replaces the lecture if no marks are left, the
+  date heading is unchanged and it kept at least 55% of the words.
+- **Sounds like another class** — the transcript matches another class's notes far
+  better than its own (`src/class_match.py`). *Move* puts the notes block into the other
+  class in date order and renames the recording's files to match. The recorder prints
+  the same warning during a lecture.
+
+Fixes run as one background job (`src/repair.py`, progress in
+`state/repair_job.json`, output in `state/repair_job.log`), so the page can be closed.
+The same job starts by itself:
+
+- **after every lecture** recorded in `auto` formatting mode: that lecture's uncertain
+  spots are resolved, and any lecture still in rough formatting is re-formatted
+- **when the dashboard starts**: it catches up on rough lectures Claude missed
+
+Nothing is repaired while a lecture is recording, a fix that failed is not retried
+automatically until those notes change (or a week passes), and the job stops early if
+Claude is unreachable. Every replaced version is kept in `notes/.revisions/`.
+
+A Claude call that times out is tried once more before falling back to a local
+formatter (the same prompt that hung for three minutes has finished in 87 seconds on
+the next try), and its time limit grows with the transcript's length. A rewrite of a
+lecture Claude already formatted never runs the local model at all: its result could
+not replace Claude's notes, and producing it once took 13 minutes.
+
+## Recording and revision housekeeping
+
+- **Recordings are compressed a day after the lecture.** The recorder writes a float32
+  `.wav` (about 230 MB an hour). `src/archive.py` turns finished ones into Ogg Opus
+  (`.ogg`, about 15 MB an hour), checks the copy reads back at the full length, and only
+  then deletes the `.wav`. Playback, search links, corrections, `--list-sessions` and
+  `--resume` all accept either. Compressed recordings older than 180 days are removed;
+  transcripts are never removed. It runs after each lecture and when the dashboard
+  starts, never while recording. (Re-transcribing from a compressed recording has not
+  been compared against the original audio.)
+- **Revision history is capped.** `notes/.revisions/<file>/` keeps the newest 30
+  versions, plus the last version of each day for 60 days.
+- **No Word copy.** Every save used to rebuild `notes/<CODE>.docx` from the whole notes file,
+  3-5 s of CPU per autosave late in a semester. The dashboard reads the Markdown, so the Word
+  copy and the `python-docx` dependency are gone.
+
 ## Pruning old backups
 
-`state/*.wav` files are large (tens to ~170MB+ for a long lecture) and
-accumulate with no expiry — they're only there so `--resume` can recover a
-crashed session, so once you're confident a lecture's notes are solid, the
-backup can go.
+Recordings in `state/` (`.wav`, or `.ogg` once compressed) are there so `--resume` can
+recover a crashed session and so search and highlights can play a moment back. To
+delete them sooner than the automatic 180 days:
 
 ```bash
 python src/main.py --prune-backups                    # dry run, default 30+ days old
@@ -427,8 +475,7 @@ freed; nothing is actually removed until you add `--confirm`.
   formatters catch the same term next time without needing an LLM at all.
   Deliberately conservative about what it learns (word-level, similarity-gated)
   to avoid picking up ordinary rewording as if it were a vocabulary term.
-- `notes/<CLASS_CODE>.md` / `.docx` — the running notes file per class, kept
-  in sync. New lectures are appended as dated sections, so each class builds
+- `notes/<CLASS_CODE>.md` — the running notes file per class. New lectures are appended as dated sections, so each class builds
   one continuous notes doc across the semester.
 - `state/*_raw.txt` — raw timestamped transcript backups per session.
 - `state/*.wav` — full audio backup per session (also what diarization runs

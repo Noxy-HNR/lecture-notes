@@ -26,6 +26,27 @@ def session_path(directory, session_id, suffix):
     return path
 
 
+# A recording is a .wav while it's fresh; finished ones are compressed to Ogg Opus
+# (archive.py), about a twentieth of the size. Everything that plays or re-reads a
+# recording looks for either.
+AUDIO_SUFFIXES = (".wav", ".ogg")
+
+
+def audio_path(directory, session_id):
+    """The session's recording (.wav, or its compressed .ogg), or None if neither exists."""
+    for suffix in AUDIO_SUFFIXES:
+        path = session_path(directory, session_id, suffix)
+        if path.is_file():
+            return path
+    return None
+
+
+def audio_name(directory, session_id):
+    """The recording's file name for the dashboard's /api/audio, or "" when there's none."""
+    path = audio_path(directory, session_id)
+    return path.name if path else ""
+
+
 def load_transcript(directory, session_id):
     source = session_path(directory, session_id, "_segments.jsonl")
     timed = source.exists()

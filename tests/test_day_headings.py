@@ -1,12 +1,9 @@
-"""One `## <date>` header per day in the notes, and nested bullets reach Word's third level."""
+"""One `## <date>` header per day in the notes."""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from docx import Document
-
-import docx_export
 from storage import dedupe_day_headings
 
 DAY = "## Monday, September 14, 2026"
@@ -40,9 +37,3 @@ def test_dedupe_is_idempotent():
     assert dedupe_day_headings(once) == once
     assert once.count(DAY) == 1
 
-
-def test_nested_bullets_use_word_levels_one_to_three():
-    doc = Document()
-    docx_export._append_markdown(doc, "- a\n  - b\n    - c\n      - d")
-    styles = [p.style.name for p in doc.paragraphs]
-    assert styles == ["List Bullet", "List Bullet 2", "List Bullet 3", "List Bullet 3"]

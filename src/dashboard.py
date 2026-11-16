@@ -134,7 +134,6 @@ def _class_files(code: str) -> dict:
     safe = code.replace(" ", "_")
     return {
         "notes": NOTES_DIR / f"{safe}.md",
-        "docx": NOTES_DIR / f"{safe}.docx",
         "study_guide": NOTES_DIR / f"{safe}_study_guide.md",
         "flashcards": NOTES_DIR / f"{safe}_flashcards_anki.txt",
     }
@@ -162,7 +161,6 @@ def list_classes() -> list[dict]:
             "updated": path.stat().st_mtime,
             "has_study_guide": files["study_guide"].exists(),
             "has_flashcards": files["flashcards"].exists(),
-            "has_docx": files["docx"].exists(),
         })
     return out
 
@@ -228,25 +226,45 @@ def list_sessions() -> list[dict]:
     if not STATE_DIR.exists():
         return []
     out = []
-    for wav in sorted(STATE_DIR.glob("*.wav"), reverse=True):
-        stem = wav.stem
+    # A finished recording may have been compressed to .ogg (archive.py); a stem with both
+    # (compression interrupted before the .wav was removed) is listed once, as the .wav.
+    recordings = {}
+    for suffix in (".ogg", ".wav"):
+        for path in STATE_DIR.glob("*" + suffix):
+            recordings[path.stem] = path
+    for stem in sorted(recordings, reverse=True):
+        wav = recordings[stem]
         match = re.match(r"^(.+)_(\d{8})_(\d{6})$", stem)
         if not match:
             continue
         raw = wav.with_name(f"{stem}_raw.txt")
         size = wav.stat().st_size
+        if wav.suffix == ".wav":
+            minutes = size / (4 * 16000) / 60  # float32 mono @16k
+        else:
+            minutes = _ogg_minutes(wav)
         out.append({
             "class_code": match.group(1).replace("_", " "),
             "date": f"{match.group(2)[:4]}-{match.group(2)[4:6]}-{match.group(2)[6:]}",
             "time": f"{match.group(3)[:2]}:{match.group(3)[2:4]}",
-            "minutes": round(size / (2 * 16000 * 2) / 60, 1),  # float32 mono @16k
+            "minutes": round(minutes, 1),
             "mb": round(size / 1e6, 1),
             "wav": wav.name,
+            "compressed": wav.suffix == ".ogg",
             "has_transcript": raw.exists(),
             "transcript_lines": len(raw.read_text(encoding="utf-8", errors="replace").splitlines())
                                  if raw.exists() else 0,
         })
     return out
+
+
+def _ogg_minutes(path: Path) -> float:
+    try:
+        import soundfile as sf
+        info = sf.info(str(path))
+        return info.frames / info.samplerate / 60
+    except Exception:
+        return 0.0
 
 
 def service_status() -> dict:
@@ -325,6 +343,8 @@ FEATURE_GETS = {
     "/api/quiz/review": ("quiz", "review"),         # review()
     "/api/health": ("health", "snapshot"),          # snapshot() - cheap, never calls a model
     "/api/cleanup": ("lesson_cleanup", "scan"),     # scan() - read-only
+    "/api/repair": ("repair", "overview"),          # overview(class_code) - read-only
+    "/api/repair/job": ("repair", "current_job"),   # current_job()
 }
 FEATURE_POSTS = {
     "/api/lessons/cancel": ("lessons", "cancel_job_request"),   # {job_id}
@@ -332,6 +352,9 @@ FEATURE_POSTS = {
     "/api/quiz/reset": ("quiz", "reset"),                        # {lesson_id?}
     "/api/health/test-claude": ("health", "test_claude"),        # {} - the one call that uses the model
     "/api/cleanup/delete": ("lesson_cleanup", "delete"),         # {items: [...], confirm: true}
+    "/api/repair/start": ("repair", "start_job"),                # {class_code, keys?, action?}
+    "/api/repair/cancel": ("repair", "cancel_job"),              # {}
+    "/api/repair/move": ("repair", "move_session"),              # {class_code, session_id, target}
 }
 
 
@@ -396,14 +419,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _audio(self, filename):
         # Only named recordings directly inside state/ may be streamed.
-        if not re.fullmatch(r"[A-Za-z0-9_-]+_\d{8}_\d{6}\.wav", filename):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+_\d{8}_\d{6}\.(wav|ogg)", filename):
             self._send(b"invalid recording", "text/plain", 400)
             return
         path = (STATE_DIR / filename).resolve()
         if path.parent != STATE_DIR.resolve() or not path.is_file():
-            self._send(b"recording not found", "text/plain", 404)
-            return
-        self._send_file_range(path, "audio/wav")
+            # A link made before the recording was compressed still names the .wav.
+            other = path.with_suffix(".ogg" if path.suffix == ".wav" else ".wav")
+            if path.parent != STATE_DIR.resolve() or not other.is_file():
+                self._send(b"recording not found", "text/plain", 404)
+                return
+            path = other
+        self._send_file_range(path, "audio/ogg" if path.suffix == ".ogg" else "audio/wav")
 
     def _send_file_range(self, path: Path, content_type: str):
         """Streams a file with HTTP Range support, so audio players can seek."""
@@ -727,7 +754,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             module_name, call = FEATURE_GETS[route]
             module = __import__(module_name)
-            argument = {"/api/quiz": lambda: (one("lesson", ""),)}.get(route, lambda: ())()
+            argument = {"/api/quiz": lambda: (one("lesson", ""),),
+                        "/api/repair": lambda: (one("class", ""),)}.get(route, lambda: ())()
             self._json(getattr(module, call)(*argument))
         except Exception as error:
             self._feature_error(error)
@@ -820,9 +848,27 @@ def start_scanner():
         print(f"Highlights scanner not started: {type(error).__name__}")
 
 
+AUTO_REPAIR_DELAY_SECONDS = 30  # after start-up, so opening the dashboard stays quick
+
+
+def start_auto_repair():
+    """Catches up on notes Claude couldn't format (repair.py) in its own process. A failure
+    here only costs the catch-up, never the dashboard."""
+    def launch():
+        try:
+            import repair
+            repair.spawn_auto()
+        except Exception as error:
+            print(f"Automatic note cleanup not started: {type(error).__name__}")
+    timer = threading.Timer(AUTO_REPAIR_DELAY_SECONDS, launch)
+    timer.daemon = True
+    timer.start()
+
+
 def serve(port: int = DEFAULT_PORT, open_browser: bool = True):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     start_scanner()
+    start_auto_repair()
     url = f"http://127.0.0.1:{port}"
     print(f"Lecture notes dashboard: {url}")
     print(f"Diagnostics:             {url}/diagnostics")

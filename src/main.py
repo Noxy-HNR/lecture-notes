@@ -51,7 +51,6 @@ import capture as capture_module
 import transcribe
 import notes
 from storage import atomic_write
-import docx_export
 import diarize
 import gpu_formatter
 import soundfile as sf
@@ -94,19 +93,8 @@ def resolve_chunk_seconds(args) -> float:
         args.chunk = transcribe.COHERE_WINDOW_SECONDS
     return args.chunk
 
-# Automatic retention for state/ backups, applied once at the end of each session.
-# Audio is essentially all of the disk cost (~70MB per lecture, ~1GB after two weeks)
-# while the raw transcript logs are a few KB each - so audio ages out and transcripts
-# are kept indefinitely. Transcripts are also the more useful half to keep long-term:
-# they're what --search reads, and they stay searchable years later for the price of
-# almost nothing.
-#
-# 30 days is deliberately far longer than the window in which the .wav actually matters.
-# Its job is recovery when a save goes wrong (which happened twice in real use, both
-# recovered from audio the same day) - notes are generated the day of the lecture, so
-# a month-old recording has long since done its job. Set AUDIO_RETENTION_DAYS = 0 to
-# turn automatic pruning off entirely.
-AUDIO_RETENTION_DAYS = 30
+# Finished recordings are compressed and aged out by archive.py (run in the background after
+# each lecture, see start_after_lecture_cleanup); transcripts are always kept.
 SAVE_NOW_KEY = b"s"
 
 
@@ -967,14 +955,14 @@ class PreflightRunner:
 
 
 def _resume_backup_paths(given: Path) -> tuple[Path, Path, str, str]:
-    """Given either a *_raw.txt or *.wav backup path from state/, returns
-    (raw_log_path, wav_path, class_code, session_date) - the sibling backup file (which
-    may or may not exist) and the class/date parsed from the shared filename stem
-    ("{CODE}_{YYYYMMDD_HHMMSS}")."""
+    """Given either a *_raw.txt or a recording (.wav, or the .ogg archive.py compresses it
+    to) from state/, returns (raw_log_path, audio_path, class_code, session_date) - the
+    sibling backup file (which may or may not exist; the .ogg when only that is left) and the
+    class/date parsed from the shared filename stem ("{CODE}_{YYYYMMDD_HHMMSS}")."""
     name = given.name
     if name.endswith("_raw.txt"):
         base = name[: -len("_raw.txt")]
-    elif name.endswith(".wav"):
+    elif name.endswith((".wav", ".ogg")):
         base = name[: -len(".wav")]
     else:
         raise ValueError(f"Not a recognized backup filename: {name}")
@@ -988,7 +976,10 @@ def _resume_backup_paths(given: Path) -> tuple[Path, Path, str, str]:
     session_date = f"{session_dt.strftime('%A, %B')} {session_dt.day}, {session_dt.strftime('%Y')}"
 
     directory = given.parent
-    return directory / f"{base}_raw.txt", directory / f"{base}.wav", class_code, session_date
+    audio_path = directory / f"{base}.wav"
+    if not audio_path.exists() and (directory / f"{base}.ogg").exists():
+        audio_path = directory / f"{base}.ogg"
+    return directory / f"{base}_raw.txt", audio_path, class_code, session_date
 
 
 def _find_date_section_boundary(content: str, session_date: str) -> int:
@@ -1016,7 +1007,7 @@ def _relative_time(dt: datetime) -> str:
 def list_session_backups():
     # A crash before the first successful transcription can leave only the WAV.
     by_session = {p.name.removesuffix("_raw.txt"): p for p in STATE_DIR.glob("*_raw.txt")}
-    by_session.update({p.stem: p for p in STATE_DIR.glob("*.wav")
+    by_session.update({p.stem: p for suffix in ("*.ogg", "*.wav") for p in STATE_DIR.glob(suffix)
                        if re.fullmatch(r".+_\d{8}_\d{6}", p.stem)})
     backups = sorted(by_session.values(), key=lambda p: p.stat().st_mtime, reverse=True)
     if not backups:
@@ -1034,7 +1025,10 @@ def list_session_backups():
 
         if wav_path.exists():
             size_mb = wav_path.stat().st_size / 1e6
-            duration_min = wav_path.stat().st_size / 4 / audio.SAMPLE_RATE / 60  # mono float32
+            if wav_path.suffix == ".ogg":
+                duration_min = sf.info(str(wav_path)).duration / 60
+            else:
+                duration_min = wav_path.stat().st_size / 4 / audio.SAMPLE_RATE / 60  # mono float32
             audio_note = c.success(f"~{duration_min:.0f} min audio, {size_mb:.0f}MB")
         else:
             audio_note = c.warning("no audio backup (raw transcript only)")
@@ -1043,33 +1037,43 @@ def list_session_backups():
         print(c.dim(f"    --resume \"{wav_path if wav_path.exists() else raw_path}\""))
 
 
-def auto_prune_audio() -> None:
-    """Ages out old .wav backups at the end of a session, keeping raw transcripts.
-    Announces exactly what it removed rather than doing it silently - this deletes real
-    recordings, so it should never be something the user discovers later and can't
-    account for. Never raises: this runs during shutdown, after the notes are already
-    safely written, and a housekeeping failure must not take the exit path down with it."""
-    if AUDIO_RETENTION_DAYS <= 0:
-        return
+def start_after_lecture_cleanup(class_code: str, session_id: str, formatting_mode: str) -> None:
+    """Hands the after-lecture cleanup to repair.py in its own process, so it never delays this
+    window closing: in "auto" mode the lecture's uncertain spots are resolved and any lecture
+    Claude missed is re-formatted; in every mode finished recordings are compressed. The
+    local-only modes never send notes to Claude, so they only get the housekeeping. Never
+    raises: this runs during shutdown, after the notes are already safely written."""
     try:
-        cutoff = time.time() - AUDIO_RETENTION_DAYS * 86400
-        old = [p for p in STATE_DIR.glob("*.wav") if p.stat().st_mtime < cutoff]
-        if not old:
-            return
-        freed = sum(p.stat().st_size for p in old)
-        removed = 0
-        for path in old:
-            try:
-                path.unlink()
-                removed += 1
-            except Exception:
-                pass  # locked/in use - it'll age out on a later run
-        if removed:
-            print(c.dim(f"Housekeeping: removed {removed} audio backup(s) older than "
-                         f"{AUDIO_RETENTION_DAYS} days, freeing {freed / 1e9:.2f}GB "
-                         f"(transcripts kept)."))
+        import repair
+        if formatting_mode == "auto":
+            repair.spawn_auto((class_code, session_id))
+        else:
+            repair.spawn_housekeeping()
+        print(c.dim("Note cleanup and recording compression continue in the background."))
     except Exception:
         pass
+
+
+def check_class(cls, session, tel, live=True) -> bool:
+    """Warns when what's being recorded sounds like a different class (class_match.py).
+    Returns True once it has warned, so the recording loop asks only until then."""
+    try:
+        import class_match
+        text = " ".join(s["text"] for s in list(session.all_segments))
+        # This lecture's own autosaved notes are already in its class's file; left in, they
+        # would make any lecture look like it belongs where it was filed.
+        found = class_match.suggest(text, cls["code"], exclude_session=session.session_id,
+                                    min_words=class_match.LIVE_MIN_WORDS if live else class_match.MIN_WORDS,
+                                    min_score=class_match.LIVE_MIN_SCORE if live else class_match.MIN_SCORE)
+    except Exception:
+        return False
+    if not found:
+        return False
+    message = (f"This lecture sounds like {found['code']}, not {cls['code']}. If it is, move it after "
+               f"the lecture: dashboard > {cls['code']} > Cleanup > Move.")
+    print(c.warning("\n" + message))
+    tel.add_event("warning", message)
+    return True
 
 
 def prune_backups(older_than_days: int, confirm: bool):
@@ -1078,7 +1082,7 @@ def prune_backups(older_than_days: int, confirm: bool):
     recovery path (--resume) for a crashed session, so deleting them isn't reversible."""
     cutoff = time.time() - older_than_days * 86400
     candidates = sorted(
-        p for pattern in ("*.wav", "*_raw.txt") for p in STATE_DIR.glob(pattern)
+        p for pattern in ("*.wav", "*.ogg", "*_raw.txt") for p in STATE_DIR.glob(pattern)
         if p.stat().st_mtime < cutoff
     )
     if not candidates:
@@ -1153,7 +1157,6 @@ def run_study_guide(code: str):
         sys.exit(1)
 
     print(c.success(f"Study guide saved to {path} ({time.time() - start:.1f}s)."))
-    print(c.info(f"Study guide (Word): {docx_export.study_guide_docx_path(cls['code'])}"))
     _pause_before_exit()
 
 
@@ -1375,7 +1378,6 @@ def run_resume(target: str, args):
         print(c.dim("Skipped condense: Claude CLI not available."))
 
     print(c.info(f"Notes (markdown): {notes.notes_path(class_code)}"))
-    print(c.info(f"Notes (Word): {docx_export.docx_path(class_code)}"))
 
 
 def try_full_session_diarization(cls, session: Session, session_date, session_start_offset, formatting_mode) -> bool:
@@ -1621,6 +1623,7 @@ def run():
     print(c.heading(f"Press Ctrl+C to stop and save notes.{save_now_hint}\n"))
 
     last_autosave = time.time()
+    class_warned = False  # check_class has warned that this sounds like another class
     transcriber = RollingTranscriber()
     silence_warned = False
     SILENCE_WARNING_SECONDS = 45
@@ -1872,6 +1875,8 @@ def run():
                 _save(cls, session, session_date, formatting_mode, note="(autosave)",
                       save_worker=save_worker, telemetry=tel)
                 last_autosave = time.time()
+                if not class_warned:
+                    class_warned = check_class(cls, session, tel)
     except KeyboardInterrupt:
         print(c.autosave("\nStopping - wrapping up your notes now, this can take a moment..."))
     finally:
@@ -2017,14 +2022,16 @@ def run():
             total_shutdown = time.time() - shutdown_start
             print(c.heading(f"\nAll done ({total_shutdown:.1f}s from Ctrl+C to finish)."))
             print(c.info(f"Notes (markdown): {notes.notes_path(cls['code'])}"))
-            print(c.info(f"Notes (Word): {docx_export.docx_path(cls['code'])}"))
             print(c.dim(f"Raw transcript backup: {raw_log_path}"))
             print(c.dim(f"Audio backup: {wav_path}"))
 
             tel.add_event("info", f"Session ended after {session.elapsed()/60:.1f} min")
             tel.end_session()  # dashboard flips to "idle" and disables its controls
 
-            auto_prune_audio()  # last, so it can never delay or endanger saving the notes
+            if not class_warned:
+                check_class(cls, session, tel, live=False)
+            start_after_lecture_cleanup(cls["code"], session.session_id, formatting_mode)  # last: it
+            # can never delay or endanger saving the notes
         finally:
             capture.stop()
             if caption_holder['worker'] is not None:

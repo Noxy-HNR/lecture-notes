@@ -64,7 +64,6 @@ def test_capture_persists_before_queueing_and_stops_on_disk_error(monkeypatch):
 def test_repeated_recovery_replaces_only_its_session(tmp_path, monkeypatch):
     monkeypatch.setattr(notes, "NOTES_DIR", tmp_path)
     monkeypatch.setattr(notes, "_local_format", lambda *a: "## Today\n\n" + a[2])
-    monkeypatch.setattr(notes.docx_export, "rebuild", lambda *a: None)
     notes.format_and_save("TEST", "Test", "Earlier lecture", "Today", mode="heuristic", session_id="first")
     for _ in range(2):
         notes.format_and_save("TEST", "Test", "Recovered lecture", "Today", mode="heuristic",
@@ -87,12 +86,11 @@ def test_atomic_replace_failure_preserves_original(tmp_path, monkeypatch):
 
 def test_condense_keeps_other_session_and_revision(tmp_path, monkeypatch):
     monkeypatch.setattr(notes,"NOTES_DIR",tmp_path)
-    monkeypatch.setattr(notes.docx_export,"rebuild",lambda *a:None)
     text = storage.update_session("# Test\n", "first", "Keep me")
     text = storage.update_session(text, "second", "Condense me")
     path = notes.notes_path("TEST")
     path.write_text(text)
-    monkeypatch.setattr(notes,"_try_claude_cli_format",lambda prompt:"- Condensed")
+    monkeypatch.setattr(notes,"_try_claude_cli_format",lambda prompt,timeout=None:"- Condensed")
     ok, _ = notes.condense_session("TEST","Test",0,session_id="second")
     assert ok
     assert "Keep me" in path.read_text()

@@ -452,26 +452,24 @@ class TestAudioRetention:
         os.utime(path, (when, when))
         return path
 
-    def test_prunes_old_audio_keeps_transcripts_and_recent_audio(self, tmp_path, monkeypatch):
-        import main
-        monkeypatch.setattr(main, "STATE_DIR", tmp_path)
-        monkeypatch.setattr(main, "AUDIO_RETENTION_DAYS", 30)
-        self._make(tmp_path, "OLD_20260101_120000.wav", 40)
-        self._make(tmp_path, "OLD_20260101_120000_raw.txt", 40)
-        self._make(tmp_path, "NEW_20260901_120000.wav", 1)
+    def test_prunes_old_compressed_audio_keeps_transcripts_and_recent_audio(self, tmp_path, monkeypatch):
+        import archive
+        monkeypatch.setattr(archive, "STATE_DIR", tmp_path)
+        self._make(tmp_path, "OLD_20260101_120000.ogg", archive.RETENTION_DAYS + 10)
+        self._make(tmp_path, "OLD_20260101_120000_raw.txt", archive.RETENTION_DAYS + 10)
+        self._make(tmp_path, "NEW_20260901_120000.ogg", 1)
 
-        main.auto_prune_audio()
+        assert archive.prune_old(log=lambda *a: None) == 1
         remaining = {p.name for p in tmp_path.iterdir()}
-        assert "OLD_20260101_120000.wav" not in remaining
+        assert "OLD_20260101_120000.ogg" not in remaining
         assert "OLD_20260101_120000_raw.txt" in remaining, "transcripts are kept forever"
-        assert "NEW_20260901_120000.wav" in remaining
+        assert "NEW_20260901_120000.ogg" in remaining
 
-    def test_zero_disables_pruning(self, tmp_path, monkeypatch):
-        import main
-        monkeypatch.setattr(main, "STATE_DIR", tmp_path)
-        monkeypatch.setattr(main, "AUDIO_RETENTION_DAYS", 0)
+    def test_uncompressed_audio_is_never_pruned_by_age(self, tmp_path, monkeypatch):
+        import archive
+        monkeypatch.setattr(archive, "STATE_DIR", tmp_path)
         self._make(tmp_path, "ANCIENT_20200101_120000.wav", 9999)
-        main.auto_prune_audio()
+        archive.prune_old(log=lambda *a: None)
         assert (tmp_path / "ANCIENT_20200101_120000.wav").exists()
 
 

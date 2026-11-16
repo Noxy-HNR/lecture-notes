@@ -17,7 +17,6 @@ from datetime import datetime
 from pathlib import Path
 
 from storage import atomic_write, update_session, session_bounds, session_markers, dedupe_day_headings
-import docx_export
 import gpu_formatter
 import local_formatter
 import vocab as vocab_module
@@ -282,6 +281,29 @@ def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS,
 
 API_MAX_TOKENS = 16000  # the most a non-streaming request should ask for (larger needs streaming)
 
+# A whole-lecture rewrite (7-8k words) normally takes Claude 1-2 minutes, but now and then a
+# call just hangs: one rewrite sat until the 3-minute limit, and the immediate retry of the
+# same prompt finished in 87 s. So longer transcripts get proportionally longer, and a call
+# that timed out gets one more try before the notes fall back to a local formatter.
+CLI_SECONDS_PER_WORD = 0.02      # +20 s per 1000 words on top of CLI_TIMEOUT_SECONDS
+CLI_TIMEOUT_RETRIES = 1
+
+
+def cli_timeout_for(text: str) -> int:
+    return CLI_TIMEOUT_SECONDS + int(len(text.split()) * CLI_SECONDS_PER_WORD)
+
+
+def _claude(prompt: str, timeout: int | None = None) -> str | None:
+    """CLI (retried once if it timed out), then the API. None when neither produced anything."""
+    timeout = timeout or cli_timeout_for(prompt)
+    for attempt in range(1 + CLI_TIMEOUT_RETRIES):
+        text = _try_claude_cli_format(prompt, timeout=timeout)
+        if text is not None:
+            return text
+        if not (last_cli_failure or "").startswith("the Claude CLI did not finish"):
+            break  # not signed in, not installed, a refusal: trying again won't change it
+    return _try_claude_api_format(prompt)
+
 
 def _try_claude_api_format(prompt: str, max_tokens: int = API_MAX_TOKENS) -> str | None:
     """Returns clean markdown via the Anthropic API, or None if the API isn't usable right now.
@@ -420,7 +442,7 @@ def _proofread(class_title: str, class_code: str, transcript: str) -> str:
     original transcript unchanged if neither is available (local-only mode).
     Vocabulary corrections are not learned automatically."""
     prompt = _build_proofread_prompt(class_title, class_code, transcript)
-    cleaned = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    cleaned = _claude(prompt)
     # Automatic vocabulary learning from this diff is deliberately OFF. It ran for two
     # weeks and mostly learned ordinary words ("really", "morning", "shark") plus
     # confident mis-corrections ("R-isomer", "antiemetic" in a lecture about anions and
@@ -479,12 +501,23 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
                 proofread_transcript = _proofread(class_title, class_code, transcript)
             prompt = _build_notes_prompt(class_title, class_code, session_date, proofread_transcript, prior_tail)
         with stage('format_cli'):
-            section = _try_claude_cli_format(prompt)
+            for attempt in range(1 + CLI_TIMEOUT_RETRIES):
+                section = _try_claude_cli_format(prompt, timeout=cli_timeout_for(prompt))
+                if section is not None or not (last_cli_failure or "").startswith("the Claude CLI did not finish"):
+                    break
         method = "cli"
         if section is None:
             with stage('format_api'):
                 section = _try_claude_api_format(prompt)
             method = "api"
+
+    # Rewriting a session whose notes came from a better formatter: a tier that can't beat
+    # them would be thrown away (KEPT_EXISTING below), so it isn't run at all. Running the
+    # local model for a rewrite that Claude already wrote once took 13 minutes for nothing.
+    floor = METHOD_RANK.get(existing_method, 0) if (replace_session and session_id and existing_method) else 0
+    if section is None and floor and session_bounds(_read_existing(class_code), session_id):
+        if METHOD_RANK["gpu"] < floor:
+            return notes_path(class_code), KEPT_EXISTING
 
     # An NPU tier (Phi-3.5-mini via OpenVINO) was tried here first and rolled back: on
     # the real pipeline it produced degenerate repetition with default decoding, and
@@ -501,6 +534,10 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
             # uses, as a safety net.
             section = local_formatter.correct_with_glossary(section, class_code)
         method = "gpu"
+
+    if (section is None and floor > METHOD_RANK["local"]
+            and session_bounds(_read_existing(class_code), session_id)):
+        return notes_path(class_code), KEPT_EXISTING  # heuristic bullets would lose to them too
 
     if section is None:
         section = _local_format(class_title, session_date, transcript, class_code)
@@ -521,14 +558,6 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
         updated = existing.rstrip() + "\n\n" + section.strip() + "\n"
     updated = dedupe_day_headings(updated)
     atomic_write(path, updated, expected=before_save)
-
-    try:
-        with stage('word_export'):
-            docx_export.rebuild(class_code, class_title, updated)
-    except Exception:
-        # .docx is a nice-to-have mirror of the .md; never let it block saving notes.
-        pass
-
     return path, method
 
 
@@ -642,12 +671,6 @@ def generate_study_guide(class_code: str, class_title: str,
 
     out_path = study_guide_path(class_code)
     out_path.write_text(guide.strip() + "\n", encoding="utf-8")
-
-    try:
-        docx_export.save_study_guide(class_code, class_title, guide.strip())
-    except Exception:
-        pass  # .docx is a mirror of the .md; never let it block saving the study guide
-
     return True, None, out_path
 
 
@@ -903,7 +926,7 @@ def condense_session(class_code: str, class_title: str, before_length: int,
 
     lecture_day = _lecture_day(content, session_start, session_part)
     prompt = _build_condense_prompt(class_title, class_code, session_part, lecture_day)
-    condensed = _try_claude_cli_format(prompt) or _try_claude_api_format(prompt)
+    condensed = _claude(prompt)
     if not condensed:
         return False, "Claude CLI/API unavailable"
     problem = _condensed_problem(session_part, condensed, lecture_day)
@@ -917,10 +940,4 @@ def condense_session(class_code: str, class_title: str, before_length: int,
     if path.read_text(encoding="utf-8") != content:
         return False, "notes changed during formatting; retry condensation"
     atomic_write(path, new_content, expected=content)
-
-    try:
-        docx_export.rebuild(class_code, class_title, new_content)
-    except Exception:
-        pass  # .docx is a mirror of the .md; never let it block the condensed save
-
     return True, None

@@ -11,7 +11,7 @@ they carry a wall-clock timestamp, which is the closest thing this app has to
 """
 import re
 import json
-from transcripts import load_transcript
+from transcripts import audio_name, load_transcript
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -111,6 +111,7 @@ def search_transcripts(query: str, class_code: str | None = None,
             continue
         session = f"{name_match.group(2)} {name_match.group(3)}"
         wav = path.with_name(path.name.removesuffix("_raw.txt") + ".wav")
+        recording = audio_name(STATE_DIR, wav.stem)  # the .wav, or its compressed .ogg
         sidecar = path.with_name(path.name.removesuffix("_raw.txt") + "_segments.jsonl")
         overlay = wav.with_name(wav.stem + "_corrections.json")
         if overlay.exists():
@@ -122,7 +123,7 @@ def search_transcripts(query: str, class_code: str | None = None,
                 hits.append(Hit(class_code=code, source="transcript", location=session,
                                 text=segment["text"], line_number=segment["index"]+1,
                                 timestamp=(f"{int(seconds)//60:02}:{int(seconds)%60:02}" if seconds is not None else ""),
-                                audio_file=wav.name if wav.exists() else "",audio_seconds=seconds))
+                                audio_file=recording,audio_seconds=seconds))
             continue
         if sidecar.exists():
             # Audio-relative offsets are independent of transcription latency.
@@ -137,7 +138,7 @@ def search_transcripts(query: str, class_code: str | None = None,
                     hits.append(Hit(class_code=code, source="transcript", location=session,
                                     text=text, line_number=i + 1,
                                     timestamp=f"{int(seconds)//60:02}:{int(seconds)%60:02}",
-                                    audio_file=wav.name if wav.exists() else "",
+                                    audio_file=recording,
                                     audio_seconds=max(0, seconds)))
             continue
         for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines()):
@@ -149,7 +150,7 @@ def search_transcripts(query: str, class_code: str | None = None,
                 text=(stamped.group(2) if stamped else line).strip(),
                 line_number=i + 1,
                 timestamp=stamped.group(1) if stamped else "",
-                audio_file=wav.name if wav.exists() else "",
+                audio_file=recording,
             ))
     return hits
 

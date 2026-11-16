@@ -84,6 +84,7 @@ def _atomic_write(path, text, backup=True, expected=None):
         revisions.mkdir(parents=True, exist_ok=True)
         revision = revisions / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".txt")
         atomic_write(revision, previous, backup=False)
+        prune_revisions(revisions)
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
@@ -93,6 +94,49 @@ def _atomic_write(path, text, backup=True, expected=None):
         _replace_with_retry(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+# Every save keeps the previous version of the file. A notes file is saved several times per
+# lecture (autosaves, the final save, condensing), so an uncapped history grew to 126 MB in a
+# semester. Kept: the newest KEEP_RECENT_REVISIONS, plus the newest one of each day for
+# KEEP_DAILY_REVISION_DAYS days. Older than that, the day's last version goes too.
+KEEP_RECENT_REVISIONS = 30
+KEEP_DAILY_REVISION_DAYS = 60
+_REVISION_NAME = re.compile(r"(\d{8})_\d{6}_\d{6}\.txt")
+
+
+def revisions_to_prune(names, today=None):
+    """The revision file names (as written by _atomic_write) that the retention rule drops."""
+    today = today or datetime.now()
+    dated = sorted((n for n in names if _REVISION_NAME.fullmatch(n)), reverse=True)  # newest first
+    keep = set(dated[:KEEP_RECENT_REVISIONS])
+    seen_days = set()
+    for name in dated:
+        day = name[:8]
+        if day in seen_days:
+            continue
+        seen_days.add(day)
+        try:
+            age = (today - datetime.strptime(day, "%Y%m%d")).days
+        except ValueError:
+            continue
+        if age <= KEEP_DAILY_REVISION_DAYS:
+            keep.add(name)
+    return [n for n in dated if n not in keep]
+
+
+def prune_revisions(directory):
+    """Applies the retention rule to one file's revision folder. Never raises: losing a
+    housekeeping pass must not fail the save that triggered it."""
+    try:
+        directory = Path(directory)
+        for name in revisions_to_prune([p.name for p in directory.iterdir()]):
+            try:
+                (directory / name).unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def session_markers(session_id):

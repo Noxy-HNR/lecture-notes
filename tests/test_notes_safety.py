@@ -112,7 +112,6 @@ def test_a_complete_api_reply_is_used_with_room_for_a_long_lecture(monkeypatch):
 @pytest.fixture
 def notes_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(notes, "NOTES_DIR", tmp_path)
-    monkeypatch.setattr(notes.docx_export, "rebuild", lambda *a: None)
     monkeypatch.setattr(notes.gpu_formatter, "format_transcript", lambda *a, **k: None)  # GPU rewrite fails
     path = notes.notes_path("TEST")
     path.write_text(storage.update_session("# Test (TEST)\n", "s1", "## Monday\n\n- Model-written notes"),
@@ -159,7 +158,6 @@ LECTURE = "## Monday, October 20, 2026\n\n" + "\n".join(f"- point {i} about cell
 @pytest.fixture
 def condense_file(tmp_path, monkeypatch):
     monkeypatch.setattr(notes, "NOTES_DIR", tmp_path)
-    monkeypatch.setattr(notes.docx_export, "rebuild", lambda *a: None)
     path = notes.notes_path("TEST")
     path.write_text(storage.update_session("# Test (TEST)\n", "s1", LECTURE), encoding="utf-8")
     return path
@@ -172,7 +170,7 @@ def condense_file(tmp_path, monkeypatch):
 ])
 def test_a_condense_reply_that_lost_content_is_refused(condense_file, monkeypatch, reply):
     before = condense_file.read_text(encoding="utf-8")
-    monkeypatch.setattr(notes, "_try_claude_cli_format", lambda prompt: reply)
+    monkeypatch.setattr(notes, "_try_claude_cli_format", lambda prompt, timeout=None: reply)
     ok, reason = notes.condense_session("TEST", "Test", 0, session_id="s1")
     assert not ok and reason.startswith("kept the notes as they were")
     assert condense_file.read_text(encoding="utf-8") == before
@@ -180,7 +178,7 @@ def test_a_condense_reply_that_lost_content_is_refused(condense_file, monkeypatc
 
 def test_a_condense_reply_that_opens_with_a_message_is_refused(condense_file, monkeypatch):
     reply = "No date appears in the source notes, so I won't invent one.\n\n" + LECTURE
-    monkeypatch.setattr(notes, "_try_claude_cli_format", lambda prompt: reply)
+    monkeypatch.setattr(notes, "_try_claude_cli_format", lambda prompt, timeout=None: reply)
     ok, reason = notes.condense_session("TEST", "Test", 0, session_id="s1")
     assert not ok and "message" in reason
 
@@ -189,7 +187,6 @@ def test_a_condense_reply_that_opens_with_a_message_is_refused(condense_file, mo
 def second_session_same_day(tmp_path, monkeypatch):
     """A later recording on the same day: its repeated date heading was removed by dedupe."""
     monkeypatch.setattr(notes, "NOTES_DIR", tmp_path)
-    monkeypatch.setattr(notes.docx_export, "rebuild", lambda *a: None)
     text = storage.update_session("# Test (TEST)\n", "s1", LECTURE)
     body = "\n".join(f"- afternoon point {i} about enzymes and kinetics" for i in range(30))
     text = storage.update_session(text, "s2", body)
@@ -202,13 +199,13 @@ def test_a_later_same_day_session_gets_the_real_date_and_refuses_an_invented_one
     prompts = []
     body = "\n".join(f"- afternoon point {i} about enzymes and kinetics" for i in range(30))
     monkeypatch.setattr(notes, "_try_claude_cli_format",
-                        lambda prompt: (prompts.append(prompt), "## [Lecture date missing]\n\n" + body)[1])
+                        lambda prompt, timeout=None: (prompts.append(prompt), "## [Lecture date missing]\n\n" + body)[1])
     ok, reason = notes.condense_session("TEST", "Test", 0, session_id="s2")
     assert not ok and "date heading" in reason
     assert '"## Monday, October 20, 2026"' in prompts[0]
 
     monkeypatch.setattr(notes, "_try_claude_cli_format",
-                        lambda prompt: "## Monday, October 20, 2026\n\n" + body)
+                        lambda prompt, timeout=None: "## Monday, October 20, 2026\n\n" + body)
     ok, _ = notes.condense_session("TEST", "Test", 0, session_id="s2")
     assert ok
     assert second_session_same_day.read_text(encoding="utf-8").count("## Monday, October 20, 2026") == 1
@@ -216,20 +213,19 @@ def test_a_later_same_day_session_gets_the_real_date_and_refuses_an_invented_one
 
 def test_condensing_rough_heuristic_bullets_may_shrink_them(tmp_path, monkeypatch):
     monkeypatch.setattr(notes, "NOTES_DIR", tmp_path)
-    monkeypatch.setattr(notes.docx_export, "rebuild", lambda *a: None)
     rough = ("## Monday, October 20, 2026\n\n*(auto-formatted locally — Claude CLI/API unavailable)*\n\n"
              + "\n".join(f"- so um basically the membrane is like a barrier you know number {i}" for i in range(30)))
     path = notes.notes_path("TEST")
     path.write_text(storage.update_session("# Test (TEST)\n", "s1", rough), encoding="utf-8")
     monkeypatch.setattr(notes, "_try_claude_cli_format",
-                        lambda prompt: "## Monday, October 20, 2026\n\n- **Cell membrane**: a selective barrier")
+                        lambda prompt, timeout=None: "## Monday, October 20, 2026\n\n- **Cell membrane**: a selective barrier")
     ok, _ = notes.condense_session("TEST", "Test", 0, session_id="s1")
     assert ok
 
 
 def test_a_good_condense_reply_is_saved(condense_file, monkeypatch):
     reply = "## Monday, October 20, 2026\n\n" + "\n".join(f"- point {i} about membranes and transport" for i in range(28))
-    monkeypatch.setattr(notes, "_try_claude_cli_format", lambda prompt: reply)
+    monkeypatch.setattr(notes, "_try_claude_cli_format", lambda prompt, timeout=None: reply)
     ok, _ = notes.condense_session("TEST", "Test", 0, session_id="s1")
     assert ok
     assert "- point 27 about membranes and transport" in condense_file.read_text(encoding="utf-8")

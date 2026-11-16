@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 import jev
-from transcripts import load_transcript, session_class, session_path
+from transcripts import audio_name, load_transcript, session_class, session_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = PROJECT_ROOT / "state"
@@ -321,7 +321,7 @@ def session_items(session_id: str, kinds=("exam", "not_tested", "announcement"))
     segments = transcript["segments"]
     states = segment_states(session_class(session_id), segments)
     stamps = None if transcript["timed"] else _wall_stamps(session_id)
-    audio = session_id + ".wav" if session_path(STATE_DIR, session_id, ".wav").exists() else ""
+    audio = audio_name(STATE_DIR, session_id)
     for row in stored.get("segments", []):
         i = row.get("index")
         if not isinstance(i, int) or not 0 <= i < len(segments) or row.get("digest") != _digest(states[i]):

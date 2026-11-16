@@ -231,7 +231,7 @@ class TestVocabAutoLearningOff:
         vocab_file.write_text('{"BIOL 1440": ["osmosis"]}\n', encoding="utf-8")
         monkeypatch.setattr(vocab, "VOCAB_PATH", vocab_file)
         monkeypatch.setattr(notes, "_try_claude_cli_format",
-                            lambda prompt: "the mitochondria produce energy")
+                            lambda prompt, timeout=None: "the mitochondria produce energy")
         monkeypatch.setattr(notes, "_try_claude_api_format", lambda prompt: None)
 
         before = vocab_file.read_text(encoding="utf-8")

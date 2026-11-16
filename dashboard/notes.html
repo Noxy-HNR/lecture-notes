@@ -318,6 +318,7 @@ function renderLatestNotes(code, doc, toc) {
 // ---------- class document ----------
 
 async function openClass(code, kind = 'notes', anchor = null) {
+  if (kind === 'cleanup') return openCleanup(code);
   const version = ++viewVersion;
   state.activeClass = code; state.kind = kind; state.view = 'class';
   searchBox.value = ''; state.query = '';
@@ -334,6 +335,7 @@ async function openClass(code, kind = 'notes', anchor = null) {
         ${cls.has_study_guide ? '' : 'disabled'}>Study guide</button>
       <button data-kind="flashcards" class="${kind==='flashcards'?'active':''}"
         ${cls.has_flashcards ? '' : 'disabled'}>Flashcards</button>
+      <button data-kind="cleanup">Cleanup</button>
     </div>`;
 
   let body;
@@ -375,6 +377,130 @@ async function openClass(code, kind = 'notes', anchor = null) {
     };
   });
   if (anchor) document.getElementById(anchor)?.scrollIntoView({ block: 'start' });
+}
+
+// ---------- cleanup ----------
+// Lectures whose notes need fixing: rough formatting from a save Claude missed, uncertain
+// "verify" spots, or a recording that sounds like another class. Fixes run as one background
+// job (repair.py) that keeps going if this page is closed; the page just shows its progress.
+
+async function post(path, body) {
+  const r = await fetch(path, { method: 'POST', body: JSON.stringify(body || {}),
+    headers: { 'Content-Type': 'application/json', 'X-Notes-Dashboard': '1' } });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `Request failed (${r.status})`);
+  return data;
+}
+
+const ITEM_STATE = { queued: ['', 'Waiting'], running: ['warn', 'Working…'], done: ['good', 'Done'],
+                     failed: ['bad', 'Not fixed'], skipped: ['', 'Skipped'] };
+let cleanupTimer = null;
+
+function cleanupJob(job) {
+  if (!job) return '';
+  const running = job.status === 'running';
+  if (!running && Date.now() / 1000 - (job.finished_at || 0) > 3600) return '';
+  const done = job.items.filter(i => i.state === 'done').length;
+  return `<section class="panel" style="margin-bottom:18px" aria-live="polite">
+    <div class="panel-head"><h2 class="label-caps">${running ? 'Cleanup running' : 'Last cleanup'}</h2>
+      <span class="panel-meta">${running ? `${done} of ${job.items.length} done`
+        : esc(job.message || '')}${job.trigger !== 'dashboard' ? ' · started automatically' : ''}</span>
+      ${running ? '<button type="button" class="btn" id="cleanup-cancel">Stop after this lecture</button>' : ''}</div>
+    ${job.items.map(i => { const [tone, label] = ITEM_STATE[i.state] || ['', i.state]; return `
+      <div class="hit-meta" style="margin:6px 0"><span class="chip ${tone}">${label}</span>
+        <span>${esc(i.class_code)} · ${esc(i.label)}</span>
+        ${i.message ? `<span>·</span><span>${esc(i.message)}</span>` : ''}</div>`; }).join('')}
+  </section>`;
+}
+
+async function openCleanup(code, { onlyIssues = true } = {}) {
+  const version = ++viewVersion;
+  clearTimeout(cleanupTimer);
+  state.activeClass = code; state.kind = 'cleanup'; state.view = 'class';
+  if (!main.querySelector('#cleanup-list')) main.innerHTML = '<div class="empty">Loading…</div>';
+  const data = await api(`/api/repair?class=${encodeURIComponent(code)}`);
+  if (version !== viewVersion) return;
+
+  const cls = state.classes.find(c => c.code === code) || {};
+  const job = data.job;
+  const busy = job && job.status === 'running';
+  const blocked = busy ? 'A cleanup is already running.' : data.recording ? 'A lecture is recording; cleanup waits until it ends.'
+    : !data.claude ? "Claude isn't set up on this computer." : '';
+  const needs = u => (u.rough && u.has_transcript) || u.uncertain > 0 || u.suggest;
+  const units = onlyIssues ? data.units.filter(needs) : data.units;
+  const rough = data.units.filter(u => u.rough).length;
+  const spots = data.units.reduce((a, u) => a + u.uncertain, 0);
+  const others = data.classes.filter(c => c !== code);
+
+  const rows = units.map(u => {
+    const when = u.day + (u.time ? ` · ${u.time}` : '');
+    const chips = [
+      u.rough ? '<span class="chip warn">Rough formatting</span>' : '',
+      u.uncertain ? `<span class="chip warn">${plural(u.uncertain, 'uncertain spot')}</span>` : '',
+      u.suggest ? `<span class="chip bad">Sounds like ${esc(u.suggest.code)}</span>` : '',
+      u.kind === 'day' ? '<span class="chip">Before recordings were linked</span>'
+        : !u.has_transcript ? '<span class="chip">No transcript</span>' : '',
+      !needs(u) ? '<span class="chip good">Looks fine</span>' : '',
+    ].join('');
+    const off = blocked ? 'disabled' : '';
+    const move = u.kind === 'session' ? `
+      <select class="search" data-move-target="${esc(u.session_id)}" aria-label="Class to move this lecture to"
+        style="width:auto;min-height:38px">${others.map(c =>
+          `<option ${u.suggest && u.suggest.code === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+      <button type="button" class="btn" data-move="${esc(u.session_id)}" ${busy || data.recording ? 'disabled' : ''}>Move</button>` : '';
+    return `<div class="hit">
+      <div class="hit-meta"><span class="badge notes">${esc(when)}</span><span>${u.words.toLocaleString()} words</span>${chips}</div>
+      <div class="page-actions" style="margin-top:10px;flex-wrap:wrap;gap:8px">
+        ${u.has_transcript ? `<button type="button" class="btn" data-fix="reformat" data-key="${esc(u.key)}" ${off}
+          title="Rebuild this lecture's notes from its transcript with Claude">Re-format with Claude</button>` : ''}
+        ${u.uncertain ? `<button type="button" class="btn" data-fix="resolve" data-key="${esc(u.key)}" ${off}
+          title="Have Claude work out what was meant and remove the verify marks">Resolve uncertain spots</button>` : ''}
+        ${move}
+      </div></div>`;
+  }).join('');
+
+  main.innerHTML = `
+    <button type="button" class="back-link" id="back-link">← All classes</button>
+    <h1 class="page-title">${esc(cls.title || data.title || code)}</h1>
+    <div class="page-sub">${esc(code)} · ${plural(rough, 'lecture')} with rough formatting · ${plural(spots, 'uncertain spot')}</div>
+    <div style="margin-bottom:22px" class="seg" id="kind-tabs">
+      <button data-kind="notes">Notes</button>
+      <button data-kind="study_guide" ${cls.has_study_guide ? '' : 'disabled'}>Study guide</button>
+      <button data-kind="flashcards" ${cls.has_flashcards ? '' : 'disabled'}>Flashcards</button>
+      <button data-kind="cleanup" class="active">Cleanup</button>
+    </div>
+    ${cleanupJob(job)}
+    <div class="page-actions" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+      <button type="button" class="btn primary" id="cleanup-all" ${blocked || !data.units.some(u => (u.rough && u.has_transcript) || u.uncertain) ? 'disabled' : ''}>
+        Fix everything</button>
+      <label class="muted" style="display:inline-flex;gap:6px;align-items:center;font-size:13px">
+        <input type="checkbox" id="cleanup-only" ${onlyIssues ? 'checked' : ''}> Only lectures that need attention</label>
+    </div>
+    <p class="muted" style="font-size:13px;margin:0 0 18px">${blocked ? esc(blocked) + ' ' : ''}Fixes use Claude and run in the background,
+      so this page can be closed. Each one replaces that lecture's notes only if the result passes checks; the previous version is kept.</p>
+    <div id="cleanup-list">${rows || '<div class="empty">Every lecture looks fine.</div>'}</div>`;
+
+  document.getElementById('back-link').onclick = openDashboard;
+  main.querySelectorAll('#kind-tabs button').forEach(b => b.onclick = () => !b.disabled && openClass(code, b.dataset.kind));
+  const only = () => document.getElementById('cleanup-only').checked;
+  document.getElementById('cleanup-only').onchange = () => openCleanup(code, { onlyIssues: only() });
+  const act = async (fn) => {
+    try { await fn(); } catch (e) { alert(e.message); }
+    openCleanup(code, { onlyIssues: only() });
+  };
+  document.getElementById('cleanup-all').onclick = () => act(() => post('/api/repair/start', { class_code: code }));
+  document.getElementById('cleanup-cancel')?.addEventListener('click', () => act(() => post('/api/repair/cancel')));
+  main.querySelectorAll('[data-fix]').forEach(b => b.onclick = () =>
+    act(() => post('/api/repair/start', { class_code: code, keys: [b.dataset.key], action: b.dataset.fix })));
+  main.querySelectorAll('[data-move]').forEach(b => b.onclick = () => {
+    const target = main.querySelector(`[data-move-target="${CSS.escape(b.dataset.move)}"]`).value;
+    if (!confirm(`Move this lecture's notes and recording from ${code} to ${target}?`)) return;
+    act(async () => { const r = await post('/api/repair/move', { class_code: code, session_id: b.dataset.move, target });
+      state.classes = await api('/api/classes').catch(() => state.classes); alert(r.message); });
+  });
+  if (busy) cleanupTimer = setTimeout(() => {
+    if (version === viewVersion && state.kind === 'cleanup') openCleanup(code, { onlyIssues: only() });
+  }, 4000);
 }
 
 // ---------- lecture highlights (Jev) ----------
@@ -476,12 +602,12 @@ async function openSessions() {
           <span class="badge notes">${esc(s.class_code)}</span>
           <span>${esc(s.date)} at ${esc(s.time)}</span>
           <span>·</span><span>${s.minutes} min</span>
-          <span>·</span><span>${s.mb} MB</span>
+          <span>·</span><span>${s.mb} MB${s.compressed ? ' (compressed)' : ''}</span>
           ${s.has_transcript ? `<span>·</span><span>${s.transcript_lines} transcript lines</span>` : ''}
         </div>
         <div class="hit-text mono" style="font-size:12.5px;color:var(--text-dim)">${esc(s.wav)}</div>
         ${player(s.wav)}
-        <a class="btn" href="/corrections?session=${encodeURIComponent(s.wav.replace(/\.wav$/,''))}">Correct this lecture</a>
+        <a class="btn" href="/corrections?session=${encodeURIComponent(s.wav.replace(/\.(wav|ogg)$/,''))}">Correct this lecture</a>
       </div>`).join('') : '<div class="empty">No recordings yet.</div>'}`;
   document.getElementById('back-link').onclick = openDashboard;
 }

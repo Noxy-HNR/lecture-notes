@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 from storage import atomic_write, RevisionConflict, dedupe_day_headings
-from transcripts import digest, load_transcript, session_class, session_path
+from transcripts import audio_name, audio_path, digest, load_transcript, session_class, session_path
 
 ROOT = Path(__file__).resolve().parent.parent
 NOTES_DIR = ROOT / "notes"
@@ -70,7 +70,7 @@ def list_sessions():
         except ValueError:
             continue
         result.append({"id":sid,"class_code":code,"date":sid[-15:-7],"time":sid[-6:],
-                       "audio":session_path(STATE_DIR,sid,".wav").exists()})
+                       "audio":audio_path(STATE_DIR,sid) is not None})
     return result
 
 
@@ -80,7 +80,7 @@ def workspace(session_id):
     path = _note_path(code)
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     return {"session_id":session_id,"class_code":code,
-            "audio_file":session_id+".wav" if session_path(STATE_DIR,session_id,".wav").exists() else "",
+            "audio_file":audio_name(STATE_DIR,session_id),
             "segments":transcript["segments"],"timed":transcript["timed"],
             "transcript_revision":transcript["revision"],"notes_revision":digest(content),
             "sections":note_sections(content)}
@@ -264,10 +264,4 @@ def apply_preview(payload):
         atomic_write(path,updated,expected=before)
         with _jobs_lock:
             _jobs[job["id"]]["status"] = "applied"
-        warning = None
-        try:
-            import docx_export
-            docx_export.rebuild(data["class_code"],data["class_code"],updated)
-        except Exception as error:
-            warning = f"Notes saved; Word mirror could not update: {error}"
-        return {"ok":True,"warning":warning,"workspace":workspace(job["session_id"])}
+        return {"ok":True,"warning":None,"workspace":workspace(job["session_id"])}

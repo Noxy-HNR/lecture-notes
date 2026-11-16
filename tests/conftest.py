@@ -32,4 +32,19 @@ def isolate_live_state_files(tmp_path_factory):
     native_speech.available = lambda: False
     import vocabulary_retry
     vocabulary_retry.available = lambda: False
+    # A recorder test that fails preflight on purpose wrote its reason into the real
+    # state/startup_failures.log, next to genuine failures.
+    import main
+    main.STARTUP_FAILURE_LOG = state / "startup_failures.log"
+    # The end of a recorded session starts a background cleanup (repair.py) and the dashboard
+    # starts one on launch; from a test either would run against the real notes and state.
+    import repair
+    repair.STATE_DIR = state
+    repair.JOB_PATH = state / "repair_job.json"
+    repair.MEMORY_PATH = state / "repair_memory.json"
+    repair._spawn_detached = lambda extra: None
+    import archive
+    archive.STATE_DIR = state
+    import dashboard
+    dashboard.start_auto_repair = lambda: None
     yield
