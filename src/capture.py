@@ -354,6 +354,7 @@ class Preroll:
 
     def __init__(self, sources, make_capture, max_seconds: float = PREROLL_MAX_SECONDS):
         self._lock = threading.Lock()
+        self.started = time.monotonic()
         self._max_frames = int(max_seconds * audio.SAMPLE_RATE)
         self._held = {source: collections.deque() for source in sources}
         self._frames = {source: 0 for source in sources}
@@ -383,6 +384,23 @@ class Preroll:
     def held_seconds(self, source) -> float:
         with self._lock:
             return self._frames.get(source, 0) / audio.SAMPLE_RATE
+
+    def heard(self, source, seconds: float = STARTUP_SAMPLE_SECONDS, minimum: float = 1.0):
+        """Whether the newest `seconds` held for this source contain any sound: True, False,
+        or None when under `minimum` seconds have arrived (too little to say). Judged in
+        half-second windows like the startup audio check, so one spoken word counts."""
+        with self._lock:
+            tail, have = [], 0
+            for block in reversed(self._held.get(source, ())):
+                tail.append(block)
+                have += len(block)
+                if have >= int(seconds * audio.SAMPLE_RATE):
+                    break
+        if have < int(minimum * audio.SAMPLE_RATE):
+            return None
+        samples = np.concatenate(list(reversed(tail)))
+        window = int(0.5 * audio.SAMPLE_RATE)
+        return any(not audio.is_silent(samples[i:i + window]) for i in range(0, len(samples), window))
 
     def adopt(self, source, persist):
         """Returns (the running capture, seconds of audio kept from before now, the last

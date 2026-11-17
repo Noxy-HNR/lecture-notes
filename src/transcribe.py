@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import threading
+import time
 from concurrent.futures import Future
 from pathlib import Path
 
@@ -417,6 +418,70 @@ def unload_model() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+class _Preload:
+    """One background load of the model, started before anyone has chosen Record."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._finished = False
+        self.seconds = None  # how long the load took, once it has succeeded
+        self._started = time.monotonic()
+        threading.Thread(target=self._run, name="transcription-preload", daemon=True).start()
+
+    def _run(self):
+        try:
+            with self._lock:
+                skip = self._cancelled
+            if not skip:
+                get_model()
+                self.seconds = round(time.monotonic() - self._started, 2)
+        except BaseException:
+            pass  # the startup check loads again and reports the real reason
+        with self._lock:
+            self._finished = True
+            unload = self._cancelled
+        if unload:
+            unload_model()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            unload = self._finished
+        if unload:
+            unload_model()
+
+
+_preload = None
+
+
+def start_model_preload() -> None:
+    """Starts loading the model now, in the background, instead of when Record is chosen.
+
+    Used when the schedule says a class is on, so the model is ready (or well on its way) by
+    the time the menu is answered. The startup check then calls get_model() as it always has:
+    it waits on the same load through _model_lock, or loads again if this one failed, so a
+    failure is still reported with its reason and nothing here can block recording.
+    A daemon thread, like the import preparation: quitting never waits for it."""
+    global _preload
+    with _dependency_lock:
+        if _preload is None:
+            _preload = _Preload()
+
+
+def cancel_model_preload() -> None:
+    """Something other than Record was chosen: free the model, without waiting. A load that
+    is still running can't be interrupted, so it is unloaded the moment it finishes."""
+    preload = _preload
+    if preload is not None:
+        preload.cancel()
+
+
+def preload_seconds() -> float | None:
+    """How long the early load took, or None if there wasn't one (or it failed)."""
+    return _preload.seconds if _preload is not None else None
 
 
 def backend_name() -> str:

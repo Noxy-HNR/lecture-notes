@@ -97,6 +97,54 @@ def resolve_chunk_seconds(args) -> float:
 # each lecture, see start_after_lecture_cleanup); transcripts are always kept.
 SAVE_NOW_KEY = b"s"
 
+# The audio source and note formatting last answered at a prompt. With both known, Enter at
+# the menu starts recording with no further questions.
+LAST_CHOICES_PATH = STATE_DIR / "recorder_choices.json"
+SOURCE_LABELS = {"mic": "microphone", "system": "system audio"}
+FORMATTING_LABELS = {"auto": "auto formatting", "local": "local-only formatting",
+                     "heuristic": "heuristic-only formatting"}
+# When the schedule says a class is on, the model starts loading as the menu appears instead
+# of after Record is chosen. Tests turn this off (see tests/conftest.py), including in the
+# recorder processes they launch, through the environment variable.
+PRELOAD_MODEL_AT_MENU = os.environ.get("LECTURE_NOTES_PRELOAD_AT_MENU", "1") != "0"
+# Both sources deliver their first audio about 1 s after the window opens, and judging one
+# needs 1 s of it. A remembered source chosen sooner than this waits (only) until then.
+SOURCE_CHECK_READY_SECONDS = 2.5
+RECORDING_FRESH_SECONDS = 120  # a status.json heartbeat this recent means a recorder is running
+
+
+def load_last_choices() -> dict:
+    """{"source": "mic"|"system", "formatting": "auto"|"local"|"heuristic"}, each key present
+    only when it is known and valid. Before anything has been saved, the last recording's
+    settings (state/status.json) count as "last time". Never raises: an unreadable or
+    hand-edited file just means the prompts are asked again."""
+    try:
+        try:
+            saved = json.loads(LAST_CHOICES_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            status = telemetry_module.read_status()
+            saved = {"source": status.get("source"), "formatting": status.get("formatting_mode")}
+        choices = {}
+        if saved.get("source") in SOURCE_LABELS:
+            choices["source"] = saved["source"]
+        if saved.get("formatting") in notes.FORMATTING_MODES:
+            choices["formatting"] = saved["formatting"]
+        return choices
+    except Exception:
+        return {}
+
+
+def save_last_choices(**changes) -> None:
+    """Remembers an answer typed at a prompt. Command-line flags are never saved: they are
+    one launch's override, not a new habit. Never raises."""
+    try:
+        choices = {**load_last_choices(), **changes}
+        partial = LAST_CHOICES_PATH.with_name(LAST_CHOICES_PATH.name + ".partial")
+        partial.write_text(json.dumps(choices), encoding="utf-8")
+        os.replace(partial, LAST_CHOICES_PATH)
+    except Exception:
+        pass
+
 
 def choose_class(args):
     if args.klass:
@@ -139,18 +187,65 @@ def choose_action(args) -> str:
     """Top-level startup menu, shown whenever no flag already decided what to do (--list,
     --resume, --study-guide, --flashcards, --dashboard etc. all return before this runs).
     Everything here is also reachable by flag; the menu exists so none of it has to be
-    remembered."""
-    print(c.heading("What would you like to do?"))
-    print("  1. Record a lecture (default)")
-    print("  2. Generate a study guide from a class's notes so far")
-    print("  3. Quiz yourself with flashcards")
-    print("  4. Open the dashboard (browse/search notes, live diagnostics)")
-    print("  5. Record a lecture for a class you pick (ignores the schedule)")
-    print(c.dim("  (Already listening, so nothing is missed while you choose. Options 2-4 discard it.)"))
-    transcribe.start_dependency_preparation()
-    choice = input("Choose [1]: ").strip() or "1"
-    return {"2": "study_guide", "3": "flashcards", "4": "dashboard",
-            "5": "record_pick"}.get(choice, "record")
+    remembered.
+
+    Recording uses the audio source and note formatting from last time without asking
+    again, and says which on the first line; option 6 changes them and comes back here."""
+    while True:
+        choices = load_last_choices()
+        source = getattr(args, "source", None) or choices.get("source")
+        formatting = getattr(args, "formatting", None) or choices.get("formatting")
+        settings = ""
+        if source in SOURCE_LABELS and formatting in FORMATTING_LABELS:
+            settings = f" - {SOURCE_LABELS[source]}, {FORMATTING_LABELS[formatting]} (as last time)"
+        print(c.heading("What would you like to do?"))
+        print(f"  1. Record a lecture (default){settings}")
+        print("  2. Generate a study guide from a class's notes so far")
+        print("  3. Quiz yourself with flashcards")
+        print("  4. Open the dashboard (browse/search notes, live diagnostics)")
+        print("  5. Record a lecture for a class you pick (ignores the schedule)")
+        print("  6. Change the audio source or note formatting")
+        print(c.dim("  (Already listening, so nothing is missed while you choose. Options 2-4 discard it.)"))
+        transcribe.start_dependency_preparation()
+        choice = input("Choose [1]: ").strip() or "1"
+        if choice != "6":
+            return {"2": "study_guide", "3": "flashcards", "4": "dashboard",
+                    "5": "record_pick"}.get(choice, "record")
+        change_recording_settings()
+        print()
+
+
+def change_recording_settings() -> None:
+    """Menu option 6: asks both questions again, with the current answers as the defaults."""
+    current = load_last_choices()
+    source = ask_source(current.get("source", "mic"))
+    formatting = ask_formatting_mode(current.get("formatting", "auto"))
+    save_last_choices(source=source, formatting=formatting)
+    print(c.success(f"Saved: {SOURCE_LABELS[source]}, {FORMATTING_LABELS[formatting]}."))
+
+
+def start_model_early_if_class_is_on() -> bool:
+    """Starts loading the transcription model as the menu appears, when the schedule says a
+    class is in session, about to start or only just over - the same detection that picks
+    the class to record. Not while another window is recording: a second copy of the model
+    would take RAM and VRAM from the live lecture. Never raises; without it the model loads
+    when Record is chosen, as before."""
+    if not PRELOAD_MODEL_AT_MENU:
+        return False
+    try:
+        detected = sched.find_current_class()
+        if not detected:
+            return False
+        status = telemetry_module.read_status()
+        if status.get("active") and time.time() - float(status.get("updated_at") or 0) < RECORDING_FRESH_SECONDS:
+            return False
+        transcribe.start_model_preload()
+        when = {"in_session": "is in session", "starting_soon": "starts soon",
+                "just_ended": "has only just ended"}.get(detected.get("status"), "is on")
+        print(c.dim(f"{detected['code']} {when}, so the transcription model is loading already."))
+        return True
+    except Exception:
+        return False
 
 
 def start_preroll(args):
@@ -198,25 +293,81 @@ def choose_notes_class(args) -> str:
         sys.exit(1)
 
 
-def choose_source(args):
-    if args.source in ("mic", "system"):
-        return args.source
+def ask_source(default: str | None = "mic") -> str:
+    """The audio source prompt. With default=None there is no safe default, so only an
+    explicit 1 or 2 is accepted."""
+    numbers = {"1": "mic", "2": "system"}
     print("Audio source:")
     print("  1. Microphone (in-person lecture)")
     print("  2. System audio / loopback (online lecture, e.g. Zoom)")
-    choice = input("Choose [1]: ").strip() or "1"
-    return "mic" if choice == "1" else "system"
+    if default is None:
+        while True:
+            choice = input("Choose 1 or 2: ").strip()
+            if choice in numbers:
+                return numbers[choice]
+    choice = input(f"Choose [{'2' if default == 'system' else '1'}]: ").strip()
+    return numbers.get(choice, default)
+
+
+def remembered_source_doubt(preroll, source: str) -> str | None:
+    """A reason not to reuse last time's audio source without asking, or None.
+
+    Recording the wrong source loses the lecture (system audio in a lecture hall is pure
+    silence), and both sources have been listening since the app opened. So when the one
+    used last time is silent, or has delivered nothing at all, while the other has sound, the
+    question is asked after all. Enter pressed within SOURCE_CHECK_READY_SECONDS of the
+    window opening waits until then, so there is audio to judge (the model is loading
+    meanwhile, so this rarely adds to the wait)."""
+    other = "system" if source == "mic" else "mic"
+    try:
+        if preroll is None or not (preroll.has(source) and preroll.has(other)):
+            return None
+        ready = getattr(preroll, "started", time.monotonic()) + SOURCE_CHECK_READY_SECONDS
+        while time.monotonic() < ready and (preroll.heard(source) is None or preroll.heard(other) is None):
+            time.sleep(0.05)
+        if preroll.heard(other) is True and preroll.heard(source) is not True:
+            return (f"The {SOURCE_LABELS[source]} (used last time) is silent right now, but the "
+                    f"{SOURCE_LABELS[other]} has sound. Which should this lecture record?")
+    except Exception:
+        pass
+    return None
+
+
+def choose_source(args, preroll=None):
+    if args.source in ("mic", "system"):
+        return args.source
+    remembered = load_last_choices().get("source")
+    doubt = remembered_source_doubt(preroll, remembered) if remembered else None
+    if remembered and not doubt:
+        print(c.dim(f"Audio source: {SOURCE_LABELS[remembered]} (as last time; option 6 on the menu changes it)"))
+        return remembered
+    if doubt:
+        print(c.warning(doubt))
+    source = ask_source(None if doubt else "mic")
+    save_last_choices(source=source)
+    return source
+
+
+def ask_formatting_mode(default: str = "auto") -> str:
+    numbers = {"1": "auto", "2": "local", "3": "heuristic"}
+    default_number = next(number for number, mode in numbers.items() if mode == default)
+    print("Note formatting:")
+    print("  1. Auto - Claude CLI/API when available, falls back to local GPU model then heuristic")
+    print("  2. Local only - local GPU model + heuristic only, no network calls at all (CLI/API skipped)")
+    print("  3. Heuristic only - no LLM anywhere, fastest and fully deterministic")
+    choice = input(f"Choose [{default_number}]: ").strip()
+    return numbers.get(choice, default)
 
 
 def choose_formatting_mode(args):
     if args.formatting in notes.FORMATTING_MODES:
         return args.formatting
-    print("Note formatting:")
-    print("  1. Auto - Claude CLI/API when available, falls back to local GPU model then heuristic (default)")
-    print("  2. Local only - local GPU model + heuristic only, no network calls at all (CLI/API skipped)")
-    print("  3. Heuristic only - no LLM anywhere, fastest and fully deterministic")
-    choice = input("Choose [1]: ").strip() or "1"
-    return {"1": "auto", "2": "local", "3": "heuristic"}.get(choice, "auto")
+    remembered = load_last_choices().get("formatting")
+    if remembered:
+        return remembered
+    mode = ask_formatting_mode()
+    save_last_choices(formatting=mode)
+    return mode
 
 
 class RollingTranscriber:
@@ -833,14 +984,14 @@ def _check_transcription_model() -> tuple[bool, str]:
             transcribe.get_model()
             return False, c.success(f"  Transcription model OK ({transcribe.backend_name()}, "
                                     f"{transcribe.device_info()})")
-        except MemoryError as e:
+        except Exception as e:
             # RAM/VRAM headroom checks depend on what else is running this second (another
             # app finishing a load, a model server releasing VRAM); a short wait often clears it.
-            if attempt + 1 < MODEL_LOAD_ATTEMPTS:
+            # get_model() reports every failure as a RuntimeError, so the shortage is its cause.
+            shortage = isinstance(e, MemoryError) or isinstance(e.__cause__, MemoryError)
+            if shortage and attempt + 1 < MODEL_LOAD_ATTEMPTS:
                 time.sleep(MODEL_LOAD_RETRY_SECONDS)
                 continue
-            return True, c.error(f"  Transcription model FAILED to load: {e}")
-        except Exception as e:
             return True, c.error(f"  Transcription model FAILED to load: {e}")
 
 
@@ -1006,11 +1157,16 @@ class PreflightRunner:
 
         waited = time.monotonic() - wait_started
         parts = ", ".join(f"{name.replace('_', ' ')} {seconds:.1f}s" for name, seconds in self._timings.items())
+        early = transcribe.preload_seconds()
+        if early is not None:
+            parts += f"; the model had started loading at the menu and took {early:.1f}s"
         print(c.dim(f"  Checks finished {waited:.1f}s after your last answer ({parts}). "
                      "Audio was being recorded the whole time."))
-        _record_startup_timing({"ok": ok, "waited_after_prompts": round(waited, 2),
-                                "since_record_chosen": round(time.monotonic() - self._created, 2),
-                                **self._timings})
+        entry = {"ok": ok, "waited_after_prompts": round(waited, 2),
+                 "since_record_chosen": round(time.monotonic() - self._created, 2), **self._timings}
+        if early is not None:
+            entry["model_load_at_menu"] = early
+        _record_startup_timing(entry)
         print()
         self._executor.shutdown(wait=False)
         return ok
@@ -1594,9 +1750,12 @@ def run():
     # Listening starts before the first question is asked, so a lecture that is already under
     # way isn't lost while the menu is on screen. Choosing anything but Record drops it.
     preroll = start_preroll(args)
+    start_model_early_if_class_is_on()
     action = choose_action(args)
-    if action != "record" and action != "record_pick" and preroll is not None:
-        preroll.discard(everything=True)
+    if action != "record" and action != "record_pick":
+        if preroll is not None:
+            preroll.discard(everything=True)
+        transcribe.cancel_model_preload()  # nothing to cancel unless a class was on
     if action == "study_guide":
         run_study_guide(choose_notes_class(args))
         return
@@ -1631,7 +1790,7 @@ def run():
         return durable
     try:
         cls = pick_class() if action == "record_pick" else choose_class(args)
-        source = choose_source(args)
+        source = choose_source(args, preroll)
         was_muted = preflight.prepare_source(source)
         use_preroll = preroll is not None and preroll.has(source)
         # The recording's name and clock times count from its first sample, which is now

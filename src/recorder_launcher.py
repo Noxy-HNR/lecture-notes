@@ -52,4 +52,4 @@ def start_recorder():
         if os.name!='nt':raise RuntimeError('Opening the interactive Notes window currently requires Windows.')
         _child=subprocess.Popen([str(python),str(entry)],cwd=str(ROOT),creationflags=subprocess.CREATE_NEW_CONSOLE)
         return {'ok':True,'already_running':False,'pid':_child.pid,
-                'message':'Notes startup opened. Choose your class, audio source, and formatting there; live status will appear here when recording begins.'}
+                'message':'Notes opened and is already listening. Press Enter in its window to record the scheduled class with the same settings as last time; live status will appear here when recording begins.'}

@@ -37,6 +37,13 @@ def isolate_live_state_files(tmp_path_factory):
     import main
     main.STARTUP_FAILURE_LOG = state / "startup_failures.log"
     main.STARTUP_TIMING_LOG = state / "startup_timings.jsonl"
+    # The audio source and formatting remembered between launches: never the real file.
+    main.LAST_CHOICES_PATH = state / "recorder_choices.json"
+    # The recorder loads its model at the menu when schedule.json says a class is on. Left on,
+    # running the tests during class hours would load the real model onto the GPU.
+    main.PRELOAD_MODEL_AT_MENU = False
+    import os
+    os.environ["LECTURE_NOTES_PRELOAD_AT_MENU"] = "0"  # recorders started as subprocesses too
     # The end of a recorded session starts a background cleanup (repair.py) and the dashboard
     # starts one on launch; from a test either would run against the real notes and state.
     import repair
@@ -48,4 +55,12 @@ def isolate_live_state_files(tmp_path_factory):
     archive.STATE_DIR = state
     import dashboard
     dashboard.start_auto_repair = lambda: None
+    yield
+
+
+@pytest.fixture(autouse=True)
+def forget_recorder_choices():
+    """A test that answers the audio-source prompt must not change what the next test is asked."""
+    import main
+    main.LAST_CHOICES_PATH.unlink(missing_ok=True)
     yield

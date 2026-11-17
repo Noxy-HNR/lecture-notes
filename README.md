@@ -13,9 +13,10 @@ Schedule lecture recordings, transcribe speech with local Whisper, and turn the 
 ## Starting Notes from diagnostics
 
 Open the dashboard's **Diagnostics** page and click **Start Notes**. It opens the
-existing recorder startup window, where you choose the action, class, audio source,
-and formatting mode. Recording begins only after that setup and the normal preflight
-checks. Diagnostics shows "Notes window open" during startup, then live session
+existing recorder startup window. Press Enter there to record the scheduled class with the
+same audio source and formatting as last time (see "One key to start" below). Recording
+is kept from the moment the window opens, and transcription begins after the normal
+preflight checks. Diagnostics shows "Notes window open" during startup, then live session
 status once capture starts. Use **Save now** and **Stop recording** there as usual.
 
 The Start button is disabled while a recorder process is open, including a recorder
@@ -41,6 +42,33 @@ its last 3 seconds instead of waiting for 3 more.
 Each launch adds a line to `state/startup_timings.jsonl`: how long the model load and audio
 check took, which transcription runtime loaded, and how much RAM was free. A normal launch is
 ready 3-7 seconds after Record is chosen; when one is slow, that line says which part.
+
+**One key to start.** The menu's first line says what Enter will record with, for example
+`1. Record a lecture (default) - microphone, auto formatting (as last time)`. Pressing Enter
+uses those settings without asking the audio-source and formatting questions again. Option
+6 changes them and returns to the menu. Before anything has been saved, the settings of the
+last recording count as "last time". `--source` and `--formatting` still override them, for
+that launch only. They are kept in `state/recorder_choices.json`; deleting it just brings
+the two questions back once.
+
+The remembered audio source is not reused blindly. Both sources have been listening since the
+window opened, so if the one used last time has been silent for the last 3 seconds (or has
+sent nothing at all) while the other has sound, the recorder asks which to record instead, and
+Enter is not accepted as an answer there. Enter pressed within 2.5 seconds of the window
+opening waits until then, so there is audio to judge.
+
+**The model loads during the menu when a class is on.** When the schedule says a class is
+in session, starts within 10 minutes, or ended under 10 minutes ago, the transcription model
+starts loading as soon as the window opens, and the menu says so. By the time Enter is
+pressed it is ready or nearly ready: in a real launch the load took 10.9 s, and the wait after
+pressing Enter was 4.8 s. Choosing options 2-4 frees the model again (once a load in progress
+finishes); the process keeps about 300 MB of GPU memory for the CUDA context until it exits.
+It doesn't load early while another window is recording, and outside class times nothing
+changes: the model loads after Record is chosen. The timing line and
+`state/startup_timings.jsonl` show `model_load_at_menu` when this happened.
+
+If the model can't load because RAM or GPU memory is short for a moment, the startup check
+tries again twice, 5 seconds apart, before giving up. (Before this, that retry never ran.)
 
 For a model startup measurement without opening the microphone, stop any live recording
 and run `python tools/recorder_startup_benchmark.py --menu-seconds 3`. It reports time to
