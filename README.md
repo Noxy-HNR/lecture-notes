@@ -472,6 +472,20 @@ the next try), and its time limit grows with the transcript's length. A rewrite 
 lecture Claude already formatted never runs the local model at all: its result could
 not replace Claude's notes, and producing it once took 13 minutes.
 
+
+**Why a lecture got basic formatting.** When neither Claude nor the local model could format a
+save, the line under the lecture's heading says why, for example *(auto-formatted locally —
+Claude's usage limit was reached (resets 11:50am); the local model was skipped: only 1.8 GB of
+RAM was free and the local model needs 3.3 GB)*. The recorder window prints the same reason
+next to each save, and the Diagnostics events list shows it.
+
+**Waiting for Claude's usage limit.** When a cleanup stops because Claude's usage limit was
+reached, it reads the reset time from Claude's message ("resets 11:50am"), waits until two
+minutes after it, and does the rest then (not while a lecture is recording). The Cleanup
+page shows it as "Cleanup waiting for Claude", with a "Don't retry" button. It waits at
+most three times per cleanup. A newer cleanup (for example the one after the next lecture)
+replaces a waiting one and takes over what it still had to do.
+
 ## Recording and revision housekeeping
 
 - **Recordings are compressed a day after the lecture.** The recorder writes a float32

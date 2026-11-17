@@ -2328,20 +2328,22 @@ def _save(cls, session: Session, session_date, mode, note="", is_final=False,
                 telemetry.add_event("error", message)
                 telemetry.flush()
             return False
+        fell_back = notes.last_fallback_reason if method in ("gpu", "local") else None
         session.note_saved(method)
         if telemetry is not None:
             telemetry.record_save(method, time.time() - save_started)
             telemetry.add_event("success" if method in ("cli", "api") else "warning",
-                                 f"Saved via {method} in {time.time() - save_started:.1f}s {note}".strip())
+                                 f"Saved via {method} in {time.time() - save_started:.1f}s {note}".strip()
+                                 + (f" - {fell_back}" if fell_back else ""))
             telemetry.flush()
         chose_this_mode = mode != "auto"
         tag, colorize = {
             "cli": (" [formatted with Claude Code CLI]", c.success),
             "api": (" [formatted with Claude API]", c.success),
             "gpu": (" [formatted with local GPU model]" if chose_this_mode
-                    else " [formatted with local GPU model - Claude CLI/API unavailable]", c.warning),
-            "local": (" [heuristic local formatting]" if chose_this_mode
-                      else " [heuristic local formatting - Claude CLI/API/GPU model unavailable]", c.warning),
+                    else f" [formatted with local GPU model - {fell_back or 'Claude CLI/API unavailable'}]", c.warning),
+            "local": (" [heuristic local formatting]" if chose_this_mode and not fell_back
+                      else f" [heuristic local formatting - {fell_back or 'Claude CLI/API/GPU model unavailable'}]", c.warning),
             "none": ("", c.dim),
         }[method]
         note_colored = c.autosave(note) if note else ""

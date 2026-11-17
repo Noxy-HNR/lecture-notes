@@ -286,11 +286,12 @@ def _render_qa_block(items) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def format_transcript(class_title: str, session_date: str, transcript: str,
-                       class_code: str | None = None) -> str:
+                       class_code: str | None = None, reason: str | None = None) -> str:
     transcript = correct_with_glossary(transcript, class_code)
     speaker_entries = _parse_speaker_entries(transcript)
 
-    header = [f"## {session_date}", "", "*(auto-formatted locally — Claude CLI/API unavailable)*", ""]
+    why = (reason or "Claude CLI/API unavailable").replace("*", "").replace("\n", " ").strip()
+    header = [f"## {session_date}", "", f"*(auto-formatted locally — {why})*", ""]
 
     if speaker_entries is None:
         # No diarization data - plain lecture transcript, original behavior.

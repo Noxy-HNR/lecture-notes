@@ -319,8 +319,9 @@ def _ensure_manager(minimum):
     if _port_open() or _llama_process_ids() != []:
         _last_error = "Shared manager unavailable: inference is already occupied; no controller was started"
         return None
-    if _available_physical_bytes() < minimum:
-        _last_error = "Shared manager unavailable: insufficient available physical RAM for safe fallback"
+    available_now = _available_physical_bytes()
+    if available_now < minimum:
+        _last_error = _ram_reason(available_now, minimum)
         return None
     handle = None
     try:
@@ -371,7 +372,8 @@ def _ensure_manager(minimum):
                 return _manager_preflight(timeout=min(1, max(.01, deadline-time.monotonic())))
             except (OSError, ValueError, TypeError, http.client.HTTPException):
                 time.sleep(min(.25, max(0, deadline-time.monotonic())))
-        _last_error = "Shared manager startup exceeded15seconds; no model load was requested; controller left untouched"
+        _last_error = (f"the AI dashboard (port 9090), which starts the local model, took longer than "
+                       f"{MANAGER_STARTUP_TIMEOUT_SECONDS} seconds to start")
         return None
     except (OSError, ValueError, AttributeError, TypeError, http.client.HTTPException) as error:
         _last_error = "Shared manager unavailable: bootstrap failed (" + type(error).__name__ + "); no model load requested"
@@ -455,6 +457,17 @@ def _saved_profile():
     return profile, int(floor * 2**30)
 
 
+def _ram_reason(available_bytes, needed_bytes) -> str:
+    return (f"only {available_bytes / 2**30:.1f} GB of RAM was free and the local model needs "
+            f"{needed_bytes / 2**30:.1f} GB")
+
+
+def last_failure() -> str | None:
+    """Why the last format_transcript() produced nothing, in plain words (None after a success).
+    The notes say this under a lecture that fell back to basic formatting."""
+    return _last_error
+
+
 def available() -> bool:
     """Whether the approved shared profile is installed; does not load it."""
     try:
@@ -503,7 +516,8 @@ def _ensure_server_running() -> bool:
             _, minimum = _saved_profile()
             if _port_open():
                 if _available_physical_bytes() < _RAM_CRITICAL_BYTES or not _selected_server_idle():
-                    _last_error = "Local fallback deferred: selected shared model is busy, unavailable, or critically short of RAM"
+                    _last_error = ("another local model is loaded or busy on port 10000 (or RAM is critically "
+                                   "low), so the notes model wasn't started")
                     return False
                 pids = _llama_process_ids()
                 identity = _process_identity(pids[0]) if isinstance(pids, list) and len(pids) == 1 else None
@@ -513,26 +527,33 @@ def _ensure_server_running() -> bool:
                 _touch()
                 return True
             if _llama_process_ids() != []:
-                _last_error = "Local fallback deferred: an existing or unidentified model process must exit first"
+                _last_error = "another local model process is still running and has to exit first"
                 return False
-            if _available_physical_bytes() < minimum:
-                _last_error = "Local fallback deferred: saved model requires more available physical RAM"
+            available_now = _available_physical_bytes()
+            if available_now < minimum:
+                _last_error = _ram_reason(available_now, minimum)
                 return False
             preflight = _ensure_manager(minimum)
             if preflight is None:
                 return False
             if preflight.get("success") is not True or preflight.get("admission", {}).get("allowed") is not True:
-                _last_error = "Local fallback deferred: shared manager preflight refused model admission"
+                reason = preflight.get("admission", {}).get("reason") or preflight.get("error")
+                _last_error = "the AI dashboard refused to load the local model" + (f" ({reason})" if reason else "")
                 return False
             required = float(preflight["admission"]["requiredGiB"]) * 2**30
-            if not math.isfinite(required) or _available_physical_bytes() < max(minimum, required):
+            available_now = _available_physical_bytes()
+            if not math.isfinite(required) or available_now < max(minimum, required):
+                _last_error = _ram_reason(available_now, max(minimum, required) if math.isfinite(required) else minimum)
                 return False
             if _port_open() or _llama_process_ids() != []:
+                _last_error = "another local model started while the notes model was being prepared"
                 return False
             result = _request_json(MANAGER_URL, "/api/models/load", {
                 "filename": MODEL_FILENAME, "persist": False, "onlyIfIdle": True,
                 "settings": LOAD_OVERRIDES}, timeout=LOAD_TIMEOUT_SECONDS)
             if result.get("success") is not True:
+                reason = result.get("error") or result.get("message")
+                _last_error = "the AI dashboard couldn't load the local model" + (f" ({reason})" if reason else "")
                 return False
             loaded_pid = result.get("pid")
             if type(loaded_pid) is not int or loaded_pid <= 0:
@@ -587,7 +608,7 @@ def _ensure_server_running() -> bool:
                 guard.join(timeout=8)
         except (OSError, ValueError, AttributeError, TypeError, KeyError, http.client.HTTPException) as error:
             if _last_error is None:
-                _last_error='Local fallback admission failed ('+type(error).__name__+')'
+                _last_error = f"starting the local model failed ({type(error).__name__}: {error})"
             return False
 
 
@@ -602,6 +623,7 @@ def stop_server():
 def _chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
     # Serializes this recorder's calls. The server/manager remains responsible for
     # cross-client scheduling; the pre-request slot check is deliberately fail closed.
+    global _last_error
     with _server_lock:
         if not _ensure_server_running():
             return None
@@ -614,22 +636,33 @@ def _chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
         }
         try:
             if not _selected_server_idle():
+                _last_error = "the local model became busy before the notes could be sent"
                 return None
             pids = _llama_process_ids()
             if not isinstance(pids, list) or len(pids) != 1:
+                _last_error = "the local model's process couldn't be identified"
                 return None
             identity = _process_identity(pids[0])
             if not _verified_process(identity):
+                _last_error = "the local model's process couldn't be verified"
                 return None
             result = _request_json(BASE_URL, "/v1/chat/completions", payload,
                                    timeout=REQUEST_TIMEOUT_SECONDS, watch_ram=True,
                                    process_identity=identity)
             choice = result["choices"][0]
             if choice.get("finish_reason") != "stop":
+                _last_error = "the local model's notes were cut off before the end"
                 return None  # Never save a truncated transcript as successful notes.
             text = choice["message"]["content"].strip()
+            if not text:
+                _last_error = "the local model replied with nothing"
             return text or None
-        except (OSError, ValueError, AttributeError, TypeError, KeyError, IndexError, http.client.HTTPException):
+        except TimeoutError:
+            _last_error = (f"the local model didn't finish within {REQUEST_TIMEOUT_SECONDS // 60} minutes "
+                           "(or RAM ran critically low, which stops it)")
+            return None
+        except (OSError, ValueError, AttributeError, TypeError, KeyError, IndexError, http.client.HTTPException) as error:
+            _last_error = f"the request to the local model failed ({type(error).__name__})"
             return None
 
 
@@ -759,6 +792,7 @@ def _scaled_max_tokens(transcript: str, floor: int = 400, ceiling: int = 8000) -
 def format_transcript(class_title: str, session_date: str, transcript: str) -> str | None:
     """Returns clean markdown notes for this transcript, or None if the local LLM
     server isn't available/fails - caller falls back to the heuristic formatter."""
+    global _last_error
     user_prompt = f"Class: {class_title}\n\nTranscript:\n{transcript}"
     text = _chat(_FORMAT_SYSTEM_PROMPT, user_prompt, max_tokens=_scaled_max_tokens(transcript))
     if not text:
@@ -770,7 +804,9 @@ def format_transcript(class_title: str, session_date: str, transcript: str) -> s
     # Unexpected top-level headings can invent a date/title or create a second
     # session boundary. Refuse those instead of silently saving a malformed session.
     if not text or re.search(r'^ {0,3}#{1,2}(?:[ \t]+|$)',text,re.M):
+        _last_error = "the local model's notes had an unexpected layout (extra top-level headings)"
         return None
+    _last_error = None
     return f"{heading}\n\n{text}"
 
 

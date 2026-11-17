@@ -399,13 +399,15 @@ let cleanupTimer = null;
 function cleanupJob(job) {
   if (!job) return '';
   const running = job.status === 'running';
-  if (!running && Date.now() / 1000 - (job.finished_at || 0) > 3600) return '';
+  const waiting = job.status === 'waiting';
+  if (!running && !waiting && Date.now() / 1000 - (job.finished_at || 0) > 3600) return '';
   const done = job.items.filter(i => i.state === 'done').length;
   return `<section class="panel" style="margin-bottom:18px" aria-live="polite">
-    <div class="panel-head"><h2 class="label-caps">${running ? 'Cleanup running' : 'Last cleanup'}</h2>
+    <div class="panel-head"><h2 class="label-caps">${running ? 'Cleanup running' : waiting ? 'Cleanup waiting for Claude' : 'Last cleanup'}</h2>
       <span class="panel-meta">${running ? `${done} of ${job.items.length} done`
         : esc(job.message || '')}${job.trigger !== 'dashboard' ? ' · started automatically' : ''}</span>
-      ${running ? '<button type="button" class="btn" id="cleanup-cancel">Stop after this lecture</button>' : ''}</div>
+      ${running ? '<button type="button" class="btn" id="cleanup-cancel">Stop after this lecture</button>'
+        : waiting ? '<button type="button" class="btn" id="cleanup-cancel">Don\'t retry</button>' : ''}</div>
     ${job.items.map(i => { const [tone, label] = ITEM_STATE[i.state] || ['', i.state]; return `
       <div class="hit-meta" style="margin:6px 0"><span class="chip ${tone}">${label}</span>
         <span>${esc(i.class_code)} · ${esc(i.label)}</span>

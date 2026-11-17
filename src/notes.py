@@ -335,10 +335,27 @@ def _try_claude_api_format(prompt: str, max_tokens: int = API_MAX_TOKENS) -> str
         return None
 
 
-def _local_format(class_title: str, session_date: str, transcript: str, class_code: str) -> str:
+def _local_format(class_title: str, session_date: str, transcript: str, class_code: str,
+                  reason: str | None = None) -> str:
     """Dependency-free fallback: heuristic topic grouping, bullets, key-term bolding,
-    and fuzzy glossary correction (no proofreading pass - that needs an LLM)."""
-    return local_formatter.format_transcript(class_title, session_date, transcript, class_code)
+    and fuzzy glossary correction (no proofreading pass - that needs an LLM). `reason` is
+    written under the heading: why the better formatters weren't used."""
+    return local_formatter.format_transcript(class_title, session_date, transcript, class_code, reason=reason)
+
+
+# Why the last format_and_save() fell back from Claude (and from the local model), in plain
+# words; None when Claude wrote the notes or a fallback was the chosen mode.
+last_fallback_reason = None
+
+
+def claude_failure_summary(failure: str | None) -> str:
+    """The CLI's failure in a few words: the usage-limit message is the common one."""
+    if not failure:
+        return "Claude couldn't be reached"
+    if re.search(r"hit your .*limit", failure, re.I):
+        reset = re.search(r"resets\s+([^()·]+?)\s*(?:\(|$)", failure)
+        return "Claude's usage limit was reached" + (f" (resets {reset.group(1).strip()})" if reset else "")
+    return "Claude couldn't be reached: " + failure.removeprefix("the Claude CLI ").strip()
 
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z\-]+")
@@ -478,8 +495,11 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
     existing notes are left as they are and KEPT_EXISTING is returned. The end-of-lecture
     rewrites pass it; a --resume recovery doesn't, since there the existing notes are the
     incomplete part."""
+    global last_fallback_reason
     if mode not in FORMATTING_MODES:
         raise ValueError(f"Unknown formatting mode {mode!r}, expected one of {FORMATTING_MODES}")
+    last_fallback_reason = None
+    reasons = []
     if not session_date:
         now = datetime.now()
         session_date = f"{now.strftime('%A, %B')} {now.day}, {now.strftime('%Y')}"
@@ -510,6 +530,8 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
             with stage('format_api'):
                 section = _try_claude_api_format(prompt)
             method = "api"
+        if section is None:
+            reasons.append(claude_failure_summary(last_cli_failure))
 
     # Rewriting a session whose notes came from a better formatter: a tier that can't beat
     # them would be thrown away (KEPT_EXISTING below), so it isn't run at all. Running the
@@ -533,14 +555,18 @@ def format_and_save(class_code: str, class_title: str, transcript: str,
             # vocabulary - run the same fuzzy glossary fix-up the heuristic formatter
             # uses, as a safety net.
             section = local_formatter.correct_with_glossary(section, class_code)
+        else:
+            why = gpu_formatter.last_failure() or "it produced no notes"
+            reasons.append("the local model was skipped: " + why)
         method = "gpu"
 
     if (section is None and floor > METHOD_RANK["local"]
             and session_bounds(_read_existing(class_code), session_id)):
         return notes_path(class_code), KEPT_EXISTING  # heuristic bullets would lose to them too
 
+    last_fallback_reason = "; ".join(reasons) or None
     if section is None:
-        section = _local_format(class_title, session_date, transcript, class_code)
+        section = _local_format(class_title, session_date, transcript, class_code, last_fallback_reason)
         method = "local"
 
     path = notes_path(class_code)

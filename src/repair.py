@@ -32,7 +32,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -446,11 +446,40 @@ def _job_alive(job: dict) -> bool:
     return any(part.endswith("repair.py") for part in command) and job.get("id", "") in " ".join(command)
 
 
+# A cleanup stopped by Claude's usage limit waits for the reset time in the message ("resets
+# 11:50am"), plus a margin, and tries the rest again - at most this many times per job.
+LIMIT_RETRY_MARGIN_SECONDS = 120
+LIMIT_MAX_WAITS = 3
+LIMIT_LONGEST_WAIT_SECONDS = 8 * 3600  # a reset further off than this was misread
+WAIT_POLL_SECONDS = 15
+
+
+def limit_reset_at(message: str | None, now: float | None = None) -> float | None:
+    """When a usage-limit failure says Claude is usable again (epoch seconds, margin added),
+    or None for any other failure or a time that can't be read."""
+    if not message or not re.search(r"limit", message, re.I):
+        return None
+    match = re.search(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b", message, re.I)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)) % 12, int(match.group(2) or 0)
+    if match.group(3).lower() == "p":
+        hour += 12
+    if minute > 59:
+        return None
+    current = datetime.fromtimestamp(now if now is not None else time.time())
+    reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset.timestamp() < current.timestamp() - 3600:  # an hour ago or more: it means tomorrow
+        reset += timedelta(days=1)
+    at = reset.timestamp() + LIMIT_RETRY_MARGIN_SECONDS
+    return at if at - current.timestamp() <= LIMIT_LONGEST_WAIT_SECONDS else None
+
+
 def current_job() -> dict | None:
     job = _read_json(JOB_PATH, None)
     if not isinstance(job, dict):
         return None
-    if job.get("status") == "running" and not _job_alive(job):
+    if job.get("status") in ("running", "waiting") and not _job_alive(job):
         job.update(status="failed", finished_at=time.time(),
                    message="The cleanup job stopped unexpectedly. Details: state/repair_job.log")
         for item in job.get("items", []):
@@ -499,6 +528,13 @@ def _spawn(items: list[dict], trigger: str) -> dict:
         job = current_job()
         if job and job.get("status") == "running":
             raise RepairBusy("A cleanup job is already running; wait for it to finish")
+        if job and job.get("status") == "waiting":
+            # A job waiting for Claude's limit to reset is replaced (its process sees the new id
+            # and exits); what it was still going to do is carried into this one.
+            for old in job.get("items", []):
+                if old.get("state") != "done" and not any(
+                        i["class_code"] == old["class_code"] and i["key"] == old["key"] for i in items):
+                    items = items + [{**old, "state": "queued", "message": ""}]
         job = {"id": uuid.uuid4().hex, "status": "running", "trigger": trigger, "created_at": time.time(),
                "pid": None, "items": items, "message": ""}
         _write_json(JOB_PATH, job)
@@ -516,6 +552,14 @@ def _spawn(items: list[dict], trigger: str) -> dict:
 
 def cancel_job(payload: dict | None = None) -> dict:
     job = current_job()
+    if job and job.get("status") == "waiting":
+        job.update(status="cancelled", cancel=True, finished_at=time.time(),
+                   message="Cancelled; it won't try again when Claude's limit resets")
+        for item in job.get("items", []):
+            if item.get("state") == "queued":
+                item.update(state="skipped", message="Cancelled")
+        _write_json(JOB_PATH, job)
+        return {"ok": True, "message": "Cancelled the cleanup that was waiting for Claude"}
     if not job or job.get("status") != "running":
         return {"ok": True, "message": "No cleanup job is running"}
     job["cancel"] = True
@@ -551,6 +595,9 @@ def _run_item(item: dict) -> dict:
     return {"ok": True, "message": "; ".join(messages) or "Nothing needed fixing"}
 
 
+CLAUDE_DOWN_STOP = "Claude isn't reachable right now; the rest waits for the next cleanup"
+
+
 def run_job(job_id: str) -> int:
     job = _read_json(JOB_PATH, {})
     if job.get("id") != job_id:
@@ -560,8 +607,67 @@ def run_job(job_id: str) -> int:
     _write_json(JOB_PATH, job)
     memory = _read_json(MEMORY_PATH, {})
     automatic = job.get("trigger") != "dashboard"
+    for waits in range(LIMIT_MAX_WAITS + 1):
+        stopped, limit_message = _run_items(job, memory, automatic)
+        retry_at = limit_reset_at(limit_message) if stopped == CLAUDE_DOWN_STOP else None
+        if retry_at is None or waits == LIMIT_MAX_WAITS:
+            break
+        outcome = _wait_for_reset(job, retry_at)
+        if outcome != "retry":
+            return 0  # replaced by a newer job, or cancelled: that one owns the file now
+    job["status"] = "cancelled" if stopped == "Cancelled" else "finished"
+    job["finished_at"] = time.time()
+    done = sum(1 for i in job["items"] if i["state"] == "done")
+    job["message"] = stopped or (f"{done} of {len(job['items'])} lecture(s) fixed" if job["items"]
+                                 else "Nothing needed fixing")
+    _write_json(JOB_PATH, job)
+    if automatic:
+        _housekeeping()
+    return 0
+
+
+def _wait_for_reset(job: dict, retry_at: float) -> str:
+    """Sleeps until Claude's limit has reset (and no lecture is recording), then puts the
+    unfinished lectures back in the queue. Returns "retry", or "gone" if this job was cancelled
+    or replaced meanwhile. It only ever writes the job file while that file is still its own
+    job, so a newer cleanup that replaced it is never overwritten."""
+    def still_mine():
+        latest = _read_json(JOB_PATH, {})
+        return latest.get("id") == job["id"] and not latest.get("cancel") and latest.get("status") in ("running", "waiting")
+
+    if not still_mine():
+        return "gone"
+    for item in job["items"]:
+        if item["state"] in ("failed", "skipped") and item.get("claude_down", item["state"] == "skipped"):
+            item.update(state="queued", message="Waiting for Claude's usage limit to reset")
+    job.update(status="waiting", retry_at=retry_at,
+               message=f"Claude's usage limit was reached; the rest is tried again at "
+                       f"{datetime.fromtimestamp(retry_at).strftime('%I:%M %p').lstrip('0')}")
+    _write_json(JOB_PATH, job)
+    print("  " + job["message"], flush=True)
+    while True:
+        time.sleep(WAIT_POLL_SECONDS)
+        latest = _read_json(JOB_PATH, {})
+        if latest.get("id") != job["id"] or latest.get("cancel") or latest.get("status") != "waiting":
+            return "gone"
+        if time.time() >= retry_at and not recording_active():
+            break
+    if not still_mine():
+        return "gone"
+    job.update(status="running", message="")
+    job.pop("retry_at", None)
+    _write_json(JOB_PATH, job)
+    return "retry"
+
+
+def _run_items(job: dict, memory: dict, automatic: bool) -> tuple[str | None, str | None]:
+    """Runs every queued item in order. Returns (why it stopped early or None, the failure
+    message when Claude was unreachable)."""
     stopped = None
+    limit_message = None
     for index, item in enumerate(job["items"]):
+        if item["state"] not in ("queued", "running"):
+            continue
         latest = _read_json(JOB_PATH, {})
         if latest.get("cancel"):
             stopped = "Cancelled"
@@ -569,7 +675,8 @@ def run_job(job_id: str) -> int:
             stopped = "A lecture started recording; the rest waits for the next cleanup"
         if stopped:
             for rest in job["items"][index:]:
-                rest.update(state="skipped", message=stopped)
+                if rest["state"] in ("queued", "running"):
+                    rest.update(state="skipped", message=stopped)
             break
         item["state"] = "running"
         item["started_at"] = time.time()
@@ -586,6 +693,7 @@ def run_job(job_id: str) -> int:
         item["state"] = "done" if result["ok"] else "failed"
         item["message"] = result["message"]
         item["finished_at"] = time.time()
+        item["claude_down"] = bool(result.get("claude_down"))
         print("  " + result["message"], flush=True)
         memory_key = item["class_code"] + "|" + item["key"]
         if result["ok"]:
@@ -598,17 +706,10 @@ def run_job(job_id: str) -> int:
                 pass
         _write_json(MEMORY_PATH, memory)
         if result.get("claude_down"):
-            stopped = "Claude isn't reachable right now; the rest waits for the next cleanup"
+            stopped = CLAUDE_DOWN_STOP
+            limit_message = result["message"]
         _write_json(JOB_PATH, job)
-    job["status"] = "cancelled" if stopped == "Cancelled" else "finished"
-    job["finished_at"] = time.time()
-    done = sum(1 for i in job["items"] if i["state"] == "done")
-    job["message"] = stopped or (f"{done} of {len(job['items'])} lecture(s) fixed" if job["items"]
-                                 else "Nothing needed fixing")
-    _write_json(JOB_PATH, job)
-    if automatic:
-        _housekeeping()
-    return 0
+    return stopped, limit_message
 
 
 def _housekeeping():
@@ -646,7 +747,8 @@ def auto_items(lecture: tuple[str, str] | None = None) -> list[dict]:
 
 
 def start_auto(lecture: tuple[str, str] | None = None) -> dict | None:
-    """Starts an automatic cleanup unless one is running or a lecture is recording. With
+    """Starts an automatic cleanup unless one is running or a lecture is recording (a job
+    waiting for Claude's limit to reset is replaced, keeping what it still had to do). With
     nothing to fix no job is started (the last job's results stay on the Cleanup page) and
     the caller does the recording housekeeping itself."""
     if recording_active():

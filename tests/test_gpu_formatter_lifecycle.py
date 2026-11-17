@@ -502,14 +502,16 @@ def test_manager_bootstrap_refuses_unsafe_start(monkeypatch,tmp_path,cause):
     if cause=="unsafe_path":monkeypatch.setattr(gpu,"_management_paths_verified",lambda:False)
     assert gpu._ensure_manager(3.3*2**30) is None
     assert not launches
-    assert "Shared manager unavailable" in gpu._last_error
+    # Low RAM is said in plain words with the numbers (it ends up in the notes).
+    expected = "only 1.0 GB of RAM was free" if cause=="low_ram" else "Shared manager unavailable"
+    assert expected in gpu._last_error
 
 
 def test_manager_bootstrap_timeout_never_requests_model_load(monkeypatch,tmp_path):
     _,launches=_bootstrap_fixture(monkeypatch,tmp_path,ready=False)
     assert not gpu.warm_up()
     assert len(launches)==1
-    assert "no model load" in gpu._last_error
+    assert "took longer than 0.04 seconds to start" in gpu._last_error  # the timeout this fixture sets
     gpu.stop_server()  # Must not terminate or signal even the controller launched here.
 
 
