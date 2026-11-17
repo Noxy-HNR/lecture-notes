@@ -140,7 +140,7 @@ def test_a_rewrite_at_the_same_tier_replaces_the_session(notes_dir):
     _, method = notes.format_and_save("TEST", "Test", "the whole lecture again", "Monday", mode="local",
                                       session_id="s1", replace_session=True, existing_method="local")
     assert method == "local"
-    assert "the whole lecture again" in notes_dir.read_text(encoding="utf-8")
+    assert "the whole lecture again" in notes_dir.read_text(encoding="utf-8").lower()  # sentences are capitalised
 
 
 def test_a_recovery_still_replaces_the_session(notes_dir):

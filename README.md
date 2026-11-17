@@ -181,7 +181,23 @@ Note formatting is tried in this order, each falling back to the next if unavail
 1. **Claude Code CLI** (`claude -p`) — uses your logged-in Pro/Max subscription, no per-token billing
 2. **Claude API** (`ANTHROPIC_API_KEY`) — only used if the CLI isn't installed/logged in
 3. **Local GPU model** (shared lean Bonsai 27B via dashboard-managed llama.cpp) — real LLM formatting, fully offline, used if neither the CLI nor API is available
-4. **Heuristic local formatter** — regex-based topic/bullet formatting + glossary correction, last resort if the local model isn't set up either
+4. **Heuristic local formatter** — no model at all, last resort if the local model can't run either (see below)
+
+The heuristic formatter can't understand or summarize, but it turns the transcript into
+readable notes in under a second:
+- filler is dropped ("Right?", "So, this is it.", "um", "you know") and sentences a stray
+  period cut in two are joined again; if that would remove most of a save's words, nothing
+  is dropped
+- related sentences are grouped into short bullets (two or three sentences each), and a
+  question the lecturer asks stays with its answer
+- sections start where the vocabulary changes (about one per five minutes of lecture) and
+  are named after their key terms, e.g. "### Mole fraction · Total moles"
+- key terms are bolded once, at their first mention. They come from the terms Claude bolded
+  in that class's earlier notes (single words bolded in other classes too are left out),
+  the class's glossary in `vocab.json`, and phrases repeated in the lecture
+- **Announcements & reminders** (exams, quizzes, due dates, "next week") and **Key terms**
+  (sentences that define one, e.g. "Neuroticism is the tendency to...") are listed first
+- spoken math is written as math: "P equals nRT" becomes "P = nRT"
 
 Also:
 - Notes are written as **direct study content, not a recap of the lecture** —
