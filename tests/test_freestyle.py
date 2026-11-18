@@ -95,7 +95,7 @@ class TestStarting:
         job = json.loads(spawned[0].read_text(encoding="utf-8"))
         assert job["voice_power"] == "light" and job["claude_effort"] == "medium"
         spawned[0].unlink()
-        lessons.start_lesson({"topic": TOPIC, "voice_power": "turbo", "claude_effort": "low"})
+        lessons.start_lesson({"topic": TOPIC, "voice_power": "turbo", "claude_effort": "max"})
         job = json.loads(spawned[1].read_text(encoding="utf-8"))
         assert job["voice_power"] == "max" and job["claude_effort"] == "high"
 

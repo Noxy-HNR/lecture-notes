@@ -545,7 +545,9 @@ class Handler(BaseHTTPRequestHandler):
                     # server doesn't say, and the page keeps that choice switched off.
                     self._json({"classes": lessons.list_classes(), "voices": speech.VOICES,
                                 "default_voice": speech.DEFAULT_VOICE, "freestyle": True,
-                                "narration": narration, "narration_reason": reason})
+                                "narration": narration, "narration_reason": reason,
+                                "models": lessons.model_options(), "default_model": lessons.DEFAULT_LESSON_MODEL,
+                                "efforts": list(lessons.EFFORTS)})
                 elif route == "/api/lessons/lesson":
                     self._json(lessons.get_lesson(one("id", "")))
                 elif route == "/api/lessons/job":

@@ -12,6 +12,7 @@
 .panel{padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);min-width:0}
 .panel h2{font-size:17px;margin:0 0 14px}
 .field{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--text-dim);margin-bottom:14px}
+.field.check{flex-direction:row;align-items:center;gap:8px;cursor:pointer}.field.check input{width:auto;margin:0}
 .mode{display:flex;gap:4px;margin:0 0 16px;padding:3px;border:1px solid var(--border);border-radius:9px;background:var(--bg-inset)}
 .mode button{flex:1;font:inherit;font-size:13px;padding:7px 10px;border:0;border-radius:7px;background:none;color:var(--text-dim);cursor:pointer}
 .mode button[aria-selected="true"]{background:var(--bg-raised);color:var(--text);box-shadow:0 0 0 1px var(--border)}
@@ -115,7 +116,7 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
         </label>
       </div>
       <label class="field">Length in minutes (optional)
-        <input id="minutes" type="number" min="1" step="1" inputmode="numeric" placeholder="Leave blank to let Claude decide">
+        <input id="minutes" type="number" min="1" step="1" inputmode="numeric" placeholder="Leave blank to let the model decide">
         <span class="hint"><span>Aims within about 10% of this. Blank means as long as the material needs.</span></span>
       </label>
       <label class="field">Narrator voice<select id="voice"></select></label>
@@ -129,10 +130,26 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
         <option value="balanced">Balanced (about half the CPU)</option>
         <option value="light">Light (few cores, easy on battery)</option>
       </select></label>
-      <label class="field">Claude effort<select id="claude-effort" title="How much Claude deliberates while writing the lesson">
+      <label class="field">Model<select id="lesson-model" title="Which model writes the lesson">
+        <optgroup label="Claude (Claude subscription)">
+          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
+          <option value="claude-opus-5-5">Claude Opus 5.5</option>
+          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
+        </optgroup>
+        <optgroup label="GPT (Codex · ChatGPT subscription)">
+          <option value="gpt-6.2-sol">GPT-6.2 Sol</option>
+          <option value="gpt-6.2-astra">GPT-6.2 Astra</option>
+          <option value="gpt-6.1-terra">GPT-6.1 Terra</option>
+          <option value="gpt-6-luna">GPT-6 Luna</option>
+        </optgroup>
+      </select></label>
+      <label class="field">Effort<select id="claude-effort" title="How much the model deliberates while writing the lesson">
         <option value="high">High</option>
         <option value="medium">Medium (faster)</option>
+        <option value="low">Low (fastest)</option>
       </select></label>
+      <label class="field check" id="fast-field"><input type="checkbox" id="fast-mode">
+        <span>Fast mode <span class="muted" id="fast-note">(Claude: billed as extra usage beyond your plan)</span></span></label>
       <button class="btn primary" id="build" style="width:100%">Build lesson</button>
       <div class="progress" id="progress" hidden>
         <div class="bar"><div id="bar"></div></div>
@@ -509,10 +526,23 @@ $('voice').onchange = () => store('lessonVoice', $('voice').value);
 $('speed').onchange = () => store('lessonSpeed', $('speed').value);
 $('voice-power').onchange = () => store('lessonVoicePower', $('voice-power').value);
 $('claude-effort').onchange = () => store('lessonClaudeEffort', $('claude-effort').value);
+const FAST_NOTES = { claude: '(Claude: billed as extra usage beyond your plan)',
+                     codex: '(Codex: up to 2x speed, uses your limits faster)' };
+const fastNote = () => {
+  const codex = $('lesson-model').value.startsWith('gpt-');
+  $('fast-note').textContent = FAST_NOTES[codex ? 'codex' : 'claude'];
+};
+$('lesson-model').onchange = () => { store('lessonModel', $('lesson-model').value); fastNote(); };
+$('fast-mode').onchange = () => store('lessonFast', $('fast-mode').checked ? '1' : '');
 // Generation settings for a build; a retry keeps what the failed build used unless it predates them.
-const buildPower = () => ({ voice_power: $('voice-power').value, claude_effort: $('claude-effort').value });
+const buildPower = () => ({ voice_power: $('voice-power').value, model: $('lesson-model').value,
+                            effort: $('claude-effort').value, claude_effort: $('claude-effort').value,
+                            fast: $('fast-mode').checked });
 const retryPower = job => ({ voice_power: job.voice_power || $('voice-power').value,
-                             claude_effort: job.claude_effort || $('claude-effort').value });
+                             model: job.model || $('lesson-model').value,
+                             effort: job.effort || job.claude_effort || $('claude-effort').value,
+                             claude_effort: job.effort || job.claude_effort || $('claude-effort').value,
+                             fast: job.fast === undefined ? $('fast-mode').checked : job.fast === true });
 $('focus').oninput = () => {
   const n = $('focus').value.length;
   $('focus-count').textContent = n > 450 ? `${n}/600` : '';
@@ -555,8 +585,22 @@ $('build').onclick = async () => {
     $('voice').innerHTML = Object.entries(info.voices).map(([id, label]) => `<option value="${id}">${esc(label)}</option>`).join('');
     $('voice').value = info.voices[recall('lessonVoice')] ? recall('lessonVoice') : info.default_voice;
     if ([...$('speed').options].some(o => o.value === recall('lessonSpeed'))) $('speed').value = recall('lessonSpeed');
-    for (const [id, key] of [['voice-power', 'lessonVoicePower'], ['claude-effort', 'lessonClaudeEffort']])
+    for (const [id, key] of [['voice-power', 'lessonVoicePower'], ['claude-effort', 'lessonClaudeEffort'],
+                             ['lesson-model', 'lessonModel']])
       if ([...$(id).options].some(o => o.value === recall(key))) $(id).value = recall(key);
+    $('fast-mode').checked = recall('lessonFast') === '1';
+    // The server says which models can run here; one that can't stays listed but disabled.
+    if (Array.isArray(info.models)) {
+      for (const m of info.models) {
+        const option = [...$('lesson-model').options].find(o => o.value === m.id);
+        if (option && !m.available) { option.disabled = true; option.textContent = `${m.label} (${m.reason})`; }
+      }
+      if ($('lesson-model').selectedOptions[0]?.disabled) $('lesson-model').value = info.default_model;
+    } else {   // a dashboard started before model choice existed builds with Claude Sonnet only
+      $('lesson-model').value = 'claude-sonnet-5-5'; $('lesson-model').disabled = true;
+      $('lesson-model').title = 'Restart the dashboard to choose a model';
+    }
+    fastNote();
     if (!info.narration) notice('Narration is unavailable (' + info.narration_reason + '). Lessons will still be built, without audio.');
     fillDates();
     if (!info.freestyle) {   // a dashboard that was started before this feature existed

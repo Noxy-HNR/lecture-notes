@@ -119,6 +119,22 @@ instantly from **Your lessons**.
   transcription, so where they look garbled or wrong the slide teaches the correct version
   and shows a **Heads up** saying what the notes said. Lessons end with a recap and quick
   check questions (answers hidden until you reveal them).
+- **Model, effort and fast mode**: the Lessons page's **Model** menu chooses who writes the
+  lesson. Your note saves aren't affected; they always use Claude Sonnet 5.5 at high effort.
+  - **Claude**: Sonnet 5.5 (the default), Opus 5.5 or Haiku 5.5, through the Claude CLI on
+    your Claude subscription.
+  - **GPT**: GPT-6.2 Sol, GPT-6.2 Astra, GPT-6.1 Terra or GPT-6 Luna, through the Codex CLI
+    (`npm install -g @openai/codex`, signed in with `codex login`) on your ChatGPT
+    subscription. Each Codex call runs in an empty temporary folder with a read-only sandbox,
+    no saved session and without your Codex `config.toml` (`src/codex_cli.py`).
+  - **Effort** (low, medium or high) works with every model.
+  - **Fast mode** is off unless you tick it:
+    - for Claude it turns on Claude Code's fast mode, which is billed as extra usage beyond your plan
+    - for GPT it uses Codex's Fast tier (about 2x speed on Sol and Astra, 1.5x on Terra and
+      Luna), which uses your limits faster
+  - The video-clip search uses the chosen model's web search too.
+  - A model that can't run here (Codex not installed, for example) is shown greyed out.
+  - `lesson.json` records which model, effort and speed wrote each lesson.
 - **Visuals**: diagrams (processes, cycles, comparisons, timelines) are drawn with Mermaid,
   bundled in `dashboard/vendor/` so the player works offline. Pictures are searched on
   Wikipedia (article images), Wikimedia Commons and Openverse, and Claude picks the best

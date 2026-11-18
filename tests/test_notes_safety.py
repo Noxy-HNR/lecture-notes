@@ -234,9 +234,9 @@ def test_a_good_condense_reply_is_saved(condense_file, monkeypatch):
 # -- generation speed ------------------------------------------------------------------------
 
 @pytest.mark.parametrize("chosen, expected", [
-    ("high", "high"), ("medium", "medium"), ("low", "high"), ("max", "high"), (None, "high"),
+    ("high", "high"), ("medium", "medium"), ("low", "low"), ("max", "high"), (None, "high"),
 ])
-def test_claude_always_runs_sonnet_5_5_at_high_effort_unless_medium_is_chosen(monkeypatch, chosen, expected):
+def test_claude_runs_sonnet_5_5_at_high_effort_unless_a_lesson_chooses_lower(monkeypatch, chosen, expected):
     calls = []
     monkeypatch.setattr(notes, "_find_claude_cli", lambda: "claude")
     monkeypatch.setattr(notes.subprocess, "run",

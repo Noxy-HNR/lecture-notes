@@ -211,13 +211,21 @@ _SEARCH_SYSTEM = (
     "found in search results; never guess or reconstruct a URL. Reply only in the format requested."
 )
 
-# Claude CLI effort. Always high, passed explicitly, unless a lesson build chooses medium (the
-# "Claude effort" choice on the Lessons page; a builder process sets claude_effort once). Note
-# saves in the recorder always use high. Nothing goes lower, and fast mode is never used (it
-# bills to usage credits rather than the subscription's limits).
-CLAUDE_EFFORTS = ("high", "medium")
+# Claude CLI effort. Always high, passed explicitly, for note saves in the recorder. Only a lesson
+# build can choose otherwise (the Lessons page's model, effort and fast-mode choices; a builder
+# process sets claude_model, claude_effort and claude_fast once, for itself). Note saves never use
+# fast mode (it bills as extra usage rather than the subscription's limits).
+CLAUDE_EFFORTS = ("high", "medium", "low")
 DEFAULT_CLAUDE_EFFORT = "high"
 claude_effort = DEFAULT_CLAUDE_EFFORT
+# The models the Lessons page offers. Note saves always use CLAUDE_MODEL; a lesson builder process
+# sets claude_model (and claude_fast) once, for itself only.
+CLAUDE_MODELS = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "claude-opus-5-5": "Claude Opus 5.5",
+                 "claude-haiku-5-5": "Claude Haiku 5.5"}
+claude_model = CLAUDE_MODEL
+# Claude Code's fast mode (the `fastMode` setting): faster output, billed as extra usage beyond the
+# plan. Off unless a lesson build turns it on.
+claude_fast = False
 
 _FORMATTER_SYSTEM = (
     "Transform only the supplied lecture material into the requested artifact. "
@@ -247,8 +255,10 @@ def _try_claude_cli_format(prompt: str, timeout: int = CLI_TIMEOUT_SECONDS,
         # Use it only when explicitly configured for an independently authenticated job.
         bare = ["--bare"] if os.environ.get("NOTE_RECORDER_CLAUDE_BARE") == "1" else ["--safe-mode"]
         effort = claude_effort if claude_effort in CLAUDE_EFFORTS else DEFAULT_CLAUDE_EFFORT
+        model = claude_model if claude_model in CLAUDE_MODELS else CLAUDE_MODEL
+        fast = ["--settings", json.dumps({"fastMode": True})] if claude_fast else []
         result = subprocess.run(
-            [cli, "-p", "--model", CLAUDE_MODEL, "--effort", effort, *bare,
+            [cli, "-p", "--model", model, "--effort", effort, *bare, *fast,
              *(["--tools", "WebSearch", "--allowedTools", "WebSearch"] if web_search else ["--tools", ""]),
              "--system-prompt", _SEARCH_SYSTEM if web_search else _FORMATTER_SYSTEM, "--no-session-persistence",
              "--disallowedTools", " ".join(t for t in _CLI_NO_TOOLS if not (web_search and t == "WebSearch"))],
@@ -320,7 +330,7 @@ def _try_claude_api_format(prompt: str, max_tokens: int = API_MAX_TOKENS) -> str
     try:
         client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(
-            model=CLAUDE_MODEL,
+            model=claude_model if claude_model in CLAUDE_MODELS else CLAUDE_MODEL,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )

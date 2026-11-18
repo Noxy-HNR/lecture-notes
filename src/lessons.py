@@ -43,6 +43,7 @@ from pathlib import Path
 import psutil
 
 import keep_awake
+import codex_cli
 import notes
 import speech
 
@@ -385,13 +386,61 @@ NOTES ({span}):
 """
 
 
-def _ask_claude(prompt: str, timeout: int) -> str | None:
+# The model that writes lessons, chosen on the Lessons page: a Claude model (Claude Code CLI, the
+# Claude subscription) or a GPT model (Codex CLI, the ChatGPT subscription). A builder process sets
+# these once (run_job); they default to what note saves use.
+DEFAULT_LESSON_MODEL = notes.CLAUDE_MODEL
+EFFORTS = ("low", "medium", "high")
+lesson_model = DEFAULT_LESSON_MODEL
+lesson_effort = notes.DEFAULT_CLAUDE_EFFORT
+lesson_fast = False
+
+
+def model_options() -> list[dict]:
+    """What the Lessons page's model menu lists, grouped by subscription, with whether each can run."""
+    claude_ok = notes.cli_available() or bool(os.environ.get("ANTHROPIC_API_KEY"))
+    codex_ok, codex_reason = codex_cli.available()
+    options = [{"id": model, "label": label, "provider": "claude", "available": claude_ok,
+                "reason": "" if claude_ok else "the Claude CLI isn't installed or signed in"}
+               for model, label in notes.CLAUDE_MODELS.items()]
+    options += [{"id": model, "label": label, "provider": "codex", "available": codex_ok, "reason": codex_reason}
+                for model, label in codex_cli.MODELS.items()]
+    return options
+
+
+def model_label(model: str) -> str:
+    return notes.CLAUDE_MODELS.get(model) or codex_cli.MODELS.get(model) or model
+
+
+def configure_model(model: str | None, effort: str | None, fast: bool = False) -> None:
+    """Sets the lesson model for this process (a builder runs one lesson)."""
+    global lesson_model, lesson_effort, lesson_fast
+    lesson_model = model if model in notes.CLAUDE_MODELS or model in codex_cli.MODELS else DEFAULT_LESSON_MODEL
+    lesson_effort = effort if effort in EFFORTS else notes.DEFAULT_CLAUDE_EFFORT
+    lesson_fast = bool(fast)
+    notes.claude_model = lesson_model if lesson_model in notes.CLAUDE_MODELS else notes.CLAUDE_MODEL
+    notes.claude_effort = lesson_effort
+    notes.claude_fast = lesson_fast and lesson_model in notes.CLAUDE_MODELS
+
+
+def _ask_model(prompt: str, timeout: int, web_search: bool = False) -> str | None:
+    """One lesson-writing call to the chosen model. Claude falls back to the API key when the CLI
+    can't be used (not for web search, which needs the CLI's tool)."""
+    if lesson_model in codex_cli.MODELS:
+        return codex_cli.run(prompt, lesson_model, lesson_effort, lesson_fast, timeout, web_search=web_search)
+    if web_search:
+        return notes._try_claude_cli_format(prompt, timeout=timeout, web_search=True)
     return (notes._try_claude_cli_format(prompt, timeout=timeout)
             or notes._try_claude_api_format(prompt, max_tokens=16000))
 
 
+_ask_claude = _ask_model   # older name, kept for callers and tests
+
+
 def _plan_failure_message() -> str:
-    """Says why the lesson couldn't be written, using the CLI's recorded reason when there is one."""
+    """Says why the lesson couldn't be written, using the recorded reason when there is one."""
+    if lesson_model in codex_cli.MODELS:
+        return f"The lesson could not be written: {codex_cli.last_failure or 'Codex returned nothing'}."
     reason = notes.last_cli_failure
     if not reason:
         return "The lesson could not be written: the Claude API fallback failed too (check ANTHROPIC_API_KEY)."
@@ -749,8 +798,7 @@ def find_videos(requests: list[dict]) -> dict[int, dict]:
     each is kept only if YouTube confirms it exists and can be embedded."""
     if not requests:
         return {}
-    reply = notes._try_claude_cli_format(build_video_prompt(requests), timeout=VIDEO_SEARCH_TIMEOUT_SECONDS,
-                                         web_search=True)
+    reply = _ask_model(build_video_prompt(requests), VIDEO_SEARCH_TIMEOUT_SECONDS, web_search=True)
     try:
         proposals = (_json_object(reply or "").get("videos") or {})
     except (ValueError, json.JSONDecodeError, AttributeError):
@@ -902,7 +950,7 @@ def _update(job: dict, **fields):
 
 STEP_READ = "Reading notes"
 STEP_START = "Getting ready"        # the first step of a lesson that has no notes to read
-STEP_PLAN = "Writing the lesson with Claude"
+STEP_PLAN = "Writing the lesson"
 STEP_LENGTH = "Checking the lesson length"
 STEP_FIND = "Finding pictures"
 STEP_PICK = "Choosing the best pictures"
@@ -1279,7 +1327,7 @@ def build_lesson(code: str, start: date, end: date, voice: str, job: dict | None
         _enter(job, STEP_PLAN, 0.3, detail="Reused the saved plan", plan_reused=True,
                stage="Reusing the lesson plan from the last attempt", **_plan_facts(lesson))
     else:
-        _enter(job, STEP_PLAN, 0.08)
+        _enter(job, STEP_PLAN, 0.08, detail=f"with {model_label(lesson_model)}")
         prompt = (build_freestyle_prompt(topic, minutes) if topic else
                   build_lesson_prompt(class_title, code, dates[0], dates[-1], notes_markdown, focus, minutes))
         reply = _ask_claude(prompt, LESSON_TIMEOUT_SECONDS)
@@ -1406,7 +1454,8 @@ def build_lesson(code: str, start: date, end: date, voice: str, job: dict | None
                   "title": lesson["title"], "tldr": lesson["tldr"], "dates": dates,
                   "start": start.isoformat(), "end": end.isoformat(),
                   "created_at": time.time(), "voice": voice, "speed": speed,
-                  "model": notes.CLAUDE_MODEL, "focus": focus,
+                  "model": lesson_model, "model_label": model_label(lesson_model),
+                  "effort": lesson_effort, "fast": lesson_fast, "focus": focus,
                   "minutes": minutes,
                   "duration_seconds": round(total, 1), "warnings": warnings, "slides": slides}
         if topic:
@@ -1440,8 +1489,13 @@ def start_lesson(payload: dict) -> dict:
     speed = clean_speed(payload.get("speed"))
     voice_power = payload.get("voice_power") if payload.get("voice_power") in speech.GENERATION_POWERS \
         else speech.DEFAULT_GENERATION_POWER
-    claude_effort = payload.get("claude_effort") if payload.get("claude_effort") in notes.CLAUDE_EFFORTS \
-        else notes.DEFAULT_CLAUDE_EFFORT
+    model = payload.get("model") if payload.get("model") in notes.CLAUDE_MODELS \
+        or payload.get("model") in codex_cli.MODELS else DEFAULT_LESSON_MODEL
+    chosen_effort = payload.get("effort") or payload.get("claude_effort")   # claude_effort: older pages
+    effort = chosen_effort if chosen_effort in EFFORTS else notes.DEFAULT_CLAUDE_EFFORT
+    fast = payload.get("fast") is True
+    if model in codex_cli.MODELS and not codex_cli.available()[0]:
+        raise ValueError(f"{model_label(model)} needs {codex_cli.available()[1]}")
     if not topic:
         notes_for_range(code, start, end)  # fail fast on a bad class or an empty range
     jobs_dir = LESSONS_DIR / ".jobs"
@@ -1462,7 +1516,8 @@ def start_lesson(payload: dict) -> dict:
         job = {"id": uuid.uuid4().hex, "status": "running", "stage": "Starting", "progress": 0.01,
                "class_code": code, "start": start.isoformat(), "end": end.isoformat(), "voice": voice,
                "focus": focus, "minutes": minutes, "speed": speed,
-               "voice_power": voice_power, "claude_effort": claude_effort,
+               "voice_power": voice_power, "model": model, "effort": effort, "fast": fast,
+               "claude_effort": effort,
                "created_at": time.time(), "lesson_id": None, "pid": None}
         if topic:
             job.update(topic=topic, kind="freestyle")
@@ -1679,7 +1734,7 @@ def run_job(status_path: Path) -> int:
     job.update(status_path=str(status_path))
     _enter(job, STEP_START if job.get("topic") else STEP_READ, 0.02, pid=os.getpid())
     speech.configure(job.get("voice_power") or speech.DEFAULT_GENERATION_POWER)
-    notes.claude_effort = job.get("claude_effort") or notes.DEFAULT_CLAUDE_EFFORT  # this builder process only
+    configure_model(job.get("model"), job.get("effort") or job.get("claude_effort"), job.get("fast") is True)
     try:
         # A build takes many minutes. Its own sleep block (the screen may still turn off) keeps it
         # running with the lid closed, whether or not a recording is going.
