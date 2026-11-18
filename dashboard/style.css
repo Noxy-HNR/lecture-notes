@@ -258,6 +258,8 @@ h1.page-title { font-size: 25px; letter-spacing: -0.02em; margin: 0 0 2px; }
   scroll-margin-top: 74px;
 }
 .doc h3 { font-size: 15.5px; color: var(--accent); margin: 26px 0 8px; letter-spacing: -0.005em; }
+.doc h4 { font-size: 14.5px; color: var(--text); margin: 20px 0 6px; font-weight: 620; }
+.doc h5, .doc h6 { font-size: 14px; color: var(--text-dim); margin: 16px 0 4px; font-weight: 600; }
 .doc ul { margin: 8px 0; padding-left: 22px; }
 .doc li { margin: 5px 0; }
 .doc li::marker { color: var(--text-faint); }
@@ -265,7 +267,9 @@ h1.page-title { font-size: 25px; letter-spacing: -0.02em; margin: 0 0 2px; }
 .doc strong { color: var(--text); font-weight: 640; }
 .doc em { color: var(--text-dim); }
 
-.toc { position: sticky; top: 76px; }
+.toc { position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow-y: auto;
+        overscroll-behavior: contain; scrollbar-width: thin; padding-right: 4px; }
+.toc .section-label { position: sticky; top: 0; background: var(--bg); padding-bottom: 6px; z-index: 1; }
 .toc a {
   display: block;
   color: var(--text-dim);
@@ -401,7 +405,7 @@ input,textarea,select { accent-color:var(--accent); }
 .seg { padding:5px; border-radius:11px; flex-wrap:wrap; }.seg button { padding:8px 15px; }
 .doc { background:var(--bg-raised); border:1px solid var(--border); padding:30px 34px; border-radius:16px; font-size:15px; line-height:1.85; overflow-wrap:anywhere; }
 .doc h2 { margin-top:32px; scroll-margin-top:95px; }.doc h2:first-child { margin-top:0; }
-.with-toc { grid-template-columns:minmax(0,1fr) 170px; gap:24px; }.toc { top:100px; }
+.with-toc { grid-template-columns:minmax(0,1fr) 170px; gap:24px; }.toc { top:100px; max-height:calc(100vh - 120px); }
 .hit { padding:20px; margin-bottom:12px; }.hit .hit-meta { margin-bottom:10px; }
 .flashcard { padding:22px; transition:border-color .15s; }.flashcard:hover { border-color:var(--accent); }
 .empty { border:1px dashed var(--border-strong); border-radius:16px; background:var(--bg-raised); margin:18px 0; }

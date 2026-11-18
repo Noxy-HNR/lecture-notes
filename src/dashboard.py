@@ -108,7 +108,11 @@ def markdown_to_html(markdown: str) -> str:
             continue
 
         close_lists()
-        if line.startswith("### "):
+        sub = re.match(r"^(#{4,6}) (.*)$", line)
+        if sub:  # "####" sub-sections; <h2> stays reserved for lecture dates (anchors, date list)
+            level = len(sub.group(1))
+            lines_out.append(f'<h{level}>{_inline(sub.group(2).strip())}</h{level}>')
+        elif line.startswith("### "):
             lines_out.append(f'<h3>{_inline(line[4:].strip())}</h3>')
         elif line.startswith("## "):
             date = line[3:].strip()

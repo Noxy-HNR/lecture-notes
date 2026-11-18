@@ -285,6 +285,14 @@ class TestMarkdownRendering:
         out = dashboard.markdown_to_html("- a\n  - b\n\n## Heading\n\n- c\n")
         assert out.count("<ul>") == out.count("</ul>")
 
+    def test_level_four_to_six_headings_render_without_hashes(self):
+        """Claude's notes use "####" sub-sections; they showed up as "#### Availability
+        Heuristic" paragraphs."""
+        out = dashboard.markdown_to_html("## Monday\n#### Availability **Heuristic**\n##### Detail\n###### Fine")
+        assert "<h4>Availability <strong>Heuristic</strong></h4>" in out
+        assert "<h5>Detail</h5>" in out and "<h6>Fine</h6>" in out and "#" not in out.replace('id="monday"', "")
+        assert out.count("<h2") == 1, "only dates are lecture headings (anchors and the date list)"
+
 
 # ---------------------------------------------------------------------------
 # Telemetry / command channel
