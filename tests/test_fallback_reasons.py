@@ -291,3 +291,26 @@ def test_a_new_cleanup_replaces_a_waiting_one_and_keeps_its_work(cleanup, monkey
     # The waiting process notices it was replaced and leaves the new job alone.
     assert repair._wait_for_reset({**waiting, "id": "j1"}, at(10, 0)) == "gone"
     assert read_job()["id"] == job["id"] and read_job()["status"] == "running"
+
+
+def test_the_cleanup_keeps_the_laptop_awake_only_while_it_works(cleanup, monkeypatch):
+    """A lecture once took three hours because the laptop slept mid-cleanup. Waiting for Claude's
+    limit to reset must not hold the laptop awake, though: that can be hours."""
+    job_with("a")
+    awake = []
+    monkeypatch.setattr(repair.keep_awake, "prevent_sleep", lambda: awake.append(True) or True)
+    monkeypatch.setattr(repair.keep_awake, "allow_sleep", lambda: awake.append(False))
+    states = []
+    results = iter([{"ok": False, "claude_down": True, "message": LIMIT}, {"ok": True, "message": "done"}])
+    monkeypatch.setattr(repair, "_run_item", lambda item: states.append(awake[-1]) or next(results))
+    monkeypatch.setattr(repair, "limit_reset_at", lambda message, now=None: at(10, 0))
+    waits = []
+
+    def sleep(seconds):
+        waits.append(awake[-1])
+        cleanup["now"] += 60
+    monkeypatch.setattr(repair.time, "sleep", sleep)
+    repair.run_job("j1")
+    assert states == [True, True], "awake while each lecture is being fixed"
+    assert waits and not any(waits), "not held awake while waiting for the reset"
+    assert awake[-1] is False, "released at the end"

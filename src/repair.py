@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import keep_awake  # noqa: E402
 import notes  # noqa: E402
 from storage import atomic_write, session_markers, update_session, dedupe_day_headings  # noqa: E402
 from transcripts import load_transcript, session_class  # noqa: E402
@@ -608,7 +609,11 @@ def run_job(job_id: str) -> int:
     memory = _read_json(MEMORY_PATH, {})
     automatic = job.get("trigger") != "dashboard"
     for waits in range(LIMIT_MAX_WAITS + 1):
-        stopped, limit_message = _run_items(job, memory, automatic)
+        # Asleep, the job just stops (one lecture once took three hours to finish because the
+        # laptop slept in the middle of it). It keeps the system awake while it works - the screen
+        # can still turn off - but not while it waits for Claude's limit to reset.
+        with keep_awake.KeepAwake():
+            stopped, limit_message = _run_items(job, memory, automatic)
         retry_at = limit_reset_at(limit_message) if stopped == CLAUDE_DOWN_STOP else None
         if retry_at is None or waits == LIMIT_MAX_WAITS:
             break
