@@ -128,10 +128,10 @@ instantly from **Your lessons**.
     subscription. Each Codex call runs in an empty temporary folder with a read-only sandbox,
     no saved session and without your Codex `config.toml` (`src/codex_cli.py`).
   - **Effort** (low, medium or high) works with every model.
-  - **Fast mode** is off unless you tick it:
-    - for Claude it turns on Claude Code's fast mode, which is billed as extra usage beyond your plan
-    - for GPT it uses Codex's Fast tier (about 2x speed on Sol and Astra, 1.5x on Terra and
-      Luna), which uses your limits faster
+  - **Fast mode** is for the GPT models only, and off unless you tick it. It uses Codex's Fast
+    tier (about 2x speed on Sol and Astra, 1.5x on Terra and Luna), which uses your limits
+    faster. With a Claude model the box is hidden and fast mode is always off: Claude Code's
+    fast mode bills as extra usage, so lessons never turn it on.
   - The video-clip search uses the chosen model's web search too.
   - A model that can't run here (Codex not installed, for example) is shown greyed out.
   - `lesson.json` records which model, effort and speed wrote each lesson.

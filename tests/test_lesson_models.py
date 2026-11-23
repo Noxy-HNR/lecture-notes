@@ -1,5 +1,6 @@
 """The Lessons page's model choice: Claude Sonnet/Opus/Haiku 5.5 through the Claude CLI, or GPT
-models through the Codex CLI, each with low/medium/high effort and an optional fast mode."""
+models through the Codex CLI, each with low/medium/high effort. Fast mode is offered for the
+Codex models only: a Claude lesson never runs in Claude's fast mode (it bills extra usage)."""
 import json
 import subprocess
 from pathlib import Path
@@ -41,7 +42,8 @@ def job_of(spawned):
 def test_every_model_takes_every_effort(spawned, model, effort):
     lessons.start_lesson({"topic": TOPIC, "model": model, "effort": effort, "fast": True})
     job = job_of(spawned)
-    assert (job["model"], job["effort"], job["fast"]) == (model, effort, True)
+    fast_allowed = model.startswith("gpt-")
+    assert (job["model"], job["effort"], job["fast"]) == (model, effort, fast_allowed)
     spawned[-1].unlink()
 
 
@@ -66,8 +68,8 @@ def test_a_codex_model_without_codex_installed_is_refused_before_any_job(library
 
 # --- where each call goes ------------------------------------------------------------------------------
 
-def test_claude_choice_sets_model_effort_and_fast_for_the_claude_cli(monkeypatch):
-    lessons.configure_model("claude-opus-5-5", "low", True)
+def test_claude_choice_sets_model_and_effort_and_never_fast_mode(monkeypatch):
+    lessons.configure_model("claude-opus-5-5", "low", True)   # an old page could still send fast
     seen = {}
 
     def run(args, **kwargs):
@@ -79,7 +81,8 @@ def test_claude_choice_sets_model_effort_and_fast_for_the_claude_cli(monkeypatch
     args = seen["args"]
     assert args[args.index("--model") + 1] == "claude-opus-5-5"
     assert args[args.index("--effort") + 1] == "low"
-    assert json.loads(args[args.index("--settings") + 1]) == {"fastMode": True}
+    assert "--settings" not in args and "fastMode" not in " ".join(args)
+    assert lessons.lesson_fast is False and notes.claude_fast is False
 
 
 def test_claude_without_fast_mode_passes_no_settings(monkeypatch):

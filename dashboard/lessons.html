@@ -12,7 +12,7 @@
 .panel{padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--bg-raised);min-width:0}
 .panel h2{font-size:17px;margin:0 0 14px}
 .field{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--text-dim);margin-bottom:14px}
-.field.check{flex-direction:row;align-items:center;gap:8px;cursor:pointer}.field.check input{width:auto;margin:0}
+.field.check{flex-direction:row;align-items:center;gap:8px;cursor:pointer}.field.check input{width:auto;margin:0}.field[hidden]{display:none}
 .mode{display:flex;gap:4px;margin:0 0 16px;padding:3px;border:1px solid var(--border);border-radius:9px;background:var(--bg-inset)}
 .mode button{flex:1;font:inherit;font-size:13px;padding:7px 10px;border:0;border-radius:7px;background:none;color:var(--text-dim);cursor:pointer}
 .mode button[aria-selected="true"]{background:var(--bg-raised);color:var(--text);box-shadow:0 0 0 1px var(--border)}
@@ -148,8 +148,8 @@ button:disabled{opacity:.45;cursor:not-allowed}[hidden]{display:none!important}
         <option value="medium">Medium (faster)</option>
         <option value="low">Low (fastest)</option>
       </select></label>
-      <label class="field check" id="fast-field"><input type="checkbox" id="fast-mode">
-        <span>Fast mode <span class="muted" id="fast-note">(Claude: billed as extra usage beyond your plan)</span></span></label>
+      <label class="field check" id="fast-field" hidden><input type="checkbox" id="fast-mode">
+        <span>Fast mode <span class="muted">(Codex: up to 2x speed, uses your limits faster)</span></span></label>
       <button class="btn primary" id="build" style="width:100%">Build lesson</button>
       <div class="progress" id="progress" hidden>
         <div class="bar"><div id="bar"></div></div>
@@ -526,23 +526,25 @@ $('voice').onchange = () => store('lessonVoice', $('voice').value);
 $('speed').onchange = () => store('lessonSpeed', $('speed').value);
 $('voice-power').onchange = () => store('lessonVoicePower', $('voice-power').value);
 $('claude-effort').onchange = () => store('lessonClaudeEffort', $('claude-effort').value);
-const FAST_NOTES = { claude: '(Claude: billed as extra usage beyond your plan)',
-                     codex: '(Codex: up to 2x speed, uses your limits faster)' };
+// Fast mode is offered for the GPT (Codex) models only. With a Claude model the box is hidden and
+// never sent as on; the choice made for Codex is remembered for the next time a GPT model is picked.
+const isCodex = () => $('lesson-model').value.startsWith('gpt-');
 const fastNote = () => {
-  const codex = $('lesson-model').value.startsWith('gpt-');
-  $('fast-note').textContent = FAST_NOTES[codex ? 'codex' : 'claude'];
+  $('fast-field').hidden = !isCodex();
+  $('fast-mode').checked = isCodex() && recall('lessonFast') === '1';
 };
+const fastChosen = () => isCodex() && $('fast-mode').checked;
 $('lesson-model').onchange = () => { store('lessonModel', $('lesson-model').value); fastNote(); };
 $('fast-mode').onchange = () => store('lessonFast', $('fast-mode').checked ? '1' : '');
 // Generation settings for a build; a retry keeps what the failed build used unless it predates them.
 const buildPower = () => ({ voice_power: $('voice-power').value, model: $('lesson-model').value,
                             effort: $('claude-effort').value, claude_effort: $('claude-effort').value,
-                            fast: $('fast-mode').checked });
+                            fast: fastChosen() });
 const retryPower = job => ({ voice_power: job.voice_power || $('voice-power').value,
                              model: job.model || $('lesson-model').value,
                              effort: job.effort || job.claude_effort || $('claude-effort').value,
                              claude_effort: job.effort || job.claude_effort || $('claude-effort').value,
-                             fast: job.fast === undefined ? $('fast-mode').checked : job.fast === true });
+                             fast: String(job.model || '').startsWith('gpt-') && job.fast === true });
 $('focus').oninput = () => {
   const n = $('focus').value.length;
   $('focus-count').textContent = n > 450 ? `${n}/600` : '';
@@ -588,7 +590,6 @@ $('build').onclick = async () => {
     for (const [id, key] of [['voice-power', 'lessonVoicePower'], ['claude-effort', 'lessonClaudeEffort'],
                              ['lesson-model', 'lessonModel']])
       if ([...$(id).options].some(o => o.value === recall(key))) $(id).value = recall(key);
-    $('fast-mode').checked = recall('lessonFast') === '1';
     // The server says which models can run here; one that can't stays listed but disabled.
     if (Array.isArray(info.models)) {
       for (const m of info.models) {

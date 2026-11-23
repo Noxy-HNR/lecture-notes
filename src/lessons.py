@@ -432,10 +432,10 @@ def configure_model(model: str | None, effort: str | None, fast: bool = False) -
     global lesson_model, lesson_effort, lesson_fast
     lesson_model = model if model in notes.CLAUDE_MODELS or model in codex_cli.MODELS else DEFAULT_LESSON_MODEL
     lesson_effort = effort if effort in EFFORTS else notes.DEFAULT_CLAUDE_EFFORT
-    lesson_fast = bool(fast)
+    lesson_fast = bool(fast) and lesson_model in codex_cli.MODELS   # Codex only
     notes.claude_model = lesson_model if lesson_model in notes.CLAUDE_MODELS else notes.CLAUDE_MODEL
     notes.claude_effort = lesson_effort
-    notes.claude_fast = lesson_fast and lesson_model in notes.CLAUDE_MODELS
+    notes.claude_fast = False   # Claude's fast mode bills extra usage; lessons never turn it on
 
 
 def _ask_model(prompt: str, timeout: int, web_search: bool = False) -> str | None:
@@ -1520,7 +1520,7 @@ def start_lesson(payload: dict) -> dict:
         or payload.get("model") in codex_cli.MODELS else DEFAULT_LESSON_MODEL
     chosen_effort = payload.get("effort") or payload.get("claude_effort")   # claude_effort: older pages
     effort = chosen_effort if chosen_effort in EFFORTS else notes.DEFAULT_CLAUDE_EFFORT
-    fast = payload.get("fast") is True
+    fast = payload.get("fast") is True and model in codex_cli.MODELS   # never for Claude
     if model in codex_cli.MODELS and not codex_cli.available()[0]:
         raise ValueError(f"{model_label(model)} needs {codex_cli.available()[1]}")
     if not topic:
