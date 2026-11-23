@@ -585,23 +585,6 @@ class Handler(BaseHTTPRequestHandler):
             if not query.strip():
                 self._json([])
                 return
-            if one('mode') == 'semantic':
-                try:
-                    results = search_module.semantic_search(query, one('class') or None,
-                                                            one('transcripts', '1') == '1')
-                except RuntimeError as exc:
-                    self._json({'error': str(exc)}, 503)
-                    return
-                if one('rank') != '1':
-                    self._json(results)  # the page before Jev ranking asked for a bare list
-                    return
-                import jev
-                if jev.status()['ready']:
-                    ranked, note = search_module.jev_rank(query, results)
-                else:
-                    ranked, note = results, jev.label()
-                self._json({'results': ranked, 'ranked_by': 'meaning' if note else 'jev', 'note': note})
-                return
             hits = search_module.search(
                 query,
                 class_code=one("class") or None,

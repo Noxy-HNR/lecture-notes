@@ -1,9 +1,8 @@
 """TypeSafe's Jev: quick, typed judgments over lecture text.
 
-Used for three things, all optional and all run from the dashboard process, never the recorder:
-  - highlights.py   exam hints, "not on the exam" remarks and announcements in each transcript
-                    segment, plus segments that probably contain a mis-heard word
-  - search.py       re-ranking meaning-search results by whether they answer the question
+Used by highlights.py, optional and run from the dashboard process, never the recorder: exam
+hints, "not on the exam" remarks and announcements in each transcript segment, plus segments
+that probably contain a mis-heard word.
 
 Jev answers questions about a small JSON "state" with probabilities rather than generated
 text, so the code here decides what to do with them. This module is the only place that talks

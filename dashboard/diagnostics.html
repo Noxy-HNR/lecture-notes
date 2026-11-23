@@ -449,8 +449,8 @@ function renderJev(j) {
     : j.status.key === 'missing' ? 'No key yet: add your TypeSafe key in the C:\\AI dashboard’s Settings tab.'
     : `On, using the key from ${j.status.key}.`;
   document.getElementById('jev-summary').textContent =
-    'Reads each finished recording’s transcript for exam hints, announcements and likely mis-hearings, ' +
-    `and ranks meaning search. ${state}${j.status.ready ? reading + spent : ''}` +
+    'Reads each finished recording’s transcript for exam hints, announcements and likely mis-hearings. ' +
+    `${state}${j.status.ready ? reading + spent : ''}` +
     (j.status.ready && scan.last_error ? ` Last problem: ${scan.last_error}` : '');
   document.getElementById('jev-toggle').textContent = j.status.enabled ? 'Turn Jev off' : 'Turn Jev on';
   document.getElementById('jev-panel').hidden = false;

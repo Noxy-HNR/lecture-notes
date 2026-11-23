@@ -8,7 +8,6 @@ Schedule lecture recordings, transcribe speech with local Whisper, and turn the 
 - [Install and run the app](#one-time-setup)
 - [Recover an interrupted session](#recovering-a-crashedinterrupted-session)
 - [Improve transcription accuracy](#improving-accuracy)
-- [Use meaning search](#meaning-search)
 
 ## Starting Notes from diagnostics
 
@@ -573,46 +572,6 @@ Edit `schedule.json`. Each class has a `sessions` list; each session has
 `day` (full weekday name), `start`/`end` (24h `HH:MM`), `location`, and `type`.
 Add/remove classes or sessions as your schedule changes each term.
 
-## Meaning search
-
-The dashboard's search box has two modes. **Keyword search** needs the words you type to appear
-in the line. **Meaning search** matches by meaning, so "why does sweating cool you down" finds
-the evaporative-cooling notes even though they never use those words.
-
-It runs offline on all-MiniLM-L6-v2 through the shared service in `C:\AI\Tools\npu-services`,
-on the **Intel iGPU**. Your notes and transcripts are embedded once and cached, so the first
-search after new lectures takes a while (~50s for a semester's worth) and later ones take a
-second or two.
-
-Measured on 6155 passages of real notes and transcripts (2026-09-18), all four devices returned
-identical answers, so the device choice is only about speed and CPU load:
-
-| | index | CPU time | per passage |
-|---|---|---|---|
-| Intel iGPU, batches of 32 | 35.2s | 11.1s | 5.7 ms |
-| NPU, one at a time | 55.6s | 13.8s | 9.0 ms |
-| CPU, dynamic shapes, batches of 16 | 28.4s | 153.6s | 4.6 ms |
-| CPU, one at a time | 199.5s | 1022.3s | 32.4 ms |
-
-Quality, on 32 paraphrased study questions written before any results were seen
-(`tests/test_semantic_search.py`): the right section came first for 23 of 32, was in the top 5
-for 30, and the top 10 for all 32. Keyword search found none of them, since it needs every word
-to match; a generous word-overlap ranking got 14 first and 23 in the top 10.
-
-```bash
-python tools/semantic_search_benchmark.py --freeze-corpus   # refresh the test copy of your notes
-python tools/semantic_search_benchmark.py                   # re-run the device comparison
-```
-
-The frozen copy of your notes that the test uses is not committed, for the same reason `notes/`
-isn't. The benchmark skips the discrete GPU while a recording is live.
-
-When Jev is on (next section), meaning search also **re-ranks** its 30 results by whether each
-one actually answers the question. On the same 32 questions the right section came first for
-27 (was 23), in the top 3 for 31 (was 29) and in the top 5 for all 32 (was 30). It adds about
-3 seconds to a new question; repeating a question is instant until the dashboard restarts. If
-Jev can't be reached, results come back in meaning order and the page says why.
-
 ## Jev: exam hints, announcements, likely mis-hearings
 
 [Jev](https://docs.typesafe.ai) is TypeSafe's small judgment model: instead of writing text,
@@ -639,9 +598,9 @@ and a button to turn Jev off.
 **What is sent.** Only to TypeSafe, and only this: the course name, the segment, up to 300
 characters before it and 200 after (so sentences cut at the edges make sense), and the class's
 glossary terms from `vocab.json`. Email addresses, phone numbers and 9+ digit numbers are replaced
-first. For search ranking: your question, each result's text, its notes heading and course.
+first.
 Nothing else leaves the machine, and nothing Jev sends back is stored except the probabilities.
-Code: `src/jev.py`, `src/highlights.py`, `jev_rank` in `src/search.py`.
+Code: `src/jev.py`, `src/highlights.py`.
 
 **Key.** It uses the TypeSafe key saved in the `C:\AI` dashboard's **Settings** tab
 (`C:\AI\Switchboard\.env`); `TYPESAFE_API_KEY` in the environment takes precedence. With no key,
@@ -751,6 +710,9 @@ project-private model download or independent inference server.
   least 32768 tokens of context, idle slots, process identity, and required RAM
   safety arguments (`--load-mode none --cache-ram 0`). A different, busy, or
   unverifiable model is left alone and formatting falls back to heuristics.
+  Any `llama-server.exe` build inside `C:\AI\Tools` is accepted, since llama is
+  recompiled often and each build gets its own folder. A server running from
+  anywhere else is refused.
 - When no inference server is present, a new load requires the saved RAM floor
   (at least 3.3 GiB of available physical RAM) and the manager's admission check.
   The recorder requests the saved profile with `persist: false`, `onlyIfIdle: true`,

@@ -18,7 +18,6 @@
     <a href="/diagnostics">Diagnostics</a>
   </nav>
   <div class="search-wrap">
-    <select id="search-mode" aria-label="Search mode"><option value="keyword">Keyword search</option><option value="semantic">Meaning search</option></select>
     <input id="search" aria-label="Search notes and transcripts" class="search" type="search" autocomplete="off"
            placeholder="Search all notes and transcripts…  (/ to focus)">
   </div>
@@ -617,11 +616,9 @@ async function openSessions() {
 // ---------- search ----------
 
 let searchTimer = null;
-document.getElementById("search-mode").onchange = runSearch;
 searchBox.addEventListener('input', () => {
   clearTimeout(searchTimer);
-  if (document.getElementById('search-mode').value === 'semantic') return;
-  searchTimer = setTimeout(runSearch, document.getElementById("search-mode").value === "semantic" ? 900 : 180);  // debounce: search hits disk on every keystroke
+  searchTimer = setTimeout(runSearch, 180);  // debounce: search hits disk on every keystroke
 });
 searchBox.addEventListener('keydown', e => { if(e.key === 'Enter') runSearch(); });
 
@@ -640,14 +637,10 @@ async function runSearch() {
   }
   const version = ++viewVersion;
   state.view = 'search';
-  main.innerHTML = '<p class="muted">Searching… The first meaning search also indexes new passages.</p>';
-  let hits, ranking = null;
-  const mode = document.getElementById('search-mode').value;
-  try { hits = await api(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}${mode === 'semantic' ? '&rank=1' : ''}`); }
+  main.innerHTML = '<p class="muted">Searching…</p>';
+  let hits;
+  try { hits = await api(`/api/search?q=${encodeURIComponent(q)}`); }
   catch (e) { if(version === viewVersion) main.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
-  // Meaning search answers {results, ranked_by, note} when it can re-rank with Jev; an older
-  // dashboard server answers a bare list.
-  if (!Array.isArray(hits)) { ranking = hits; hits = hits.results || []; }
 
   if (version !== viewVersion || q !== searchBox.value.trim()) return;
   const notes = hits.filter(h => h.source === 'notes');
@@ -668,9 +661,7 @@ async function runSearch() {
 
   main.innerHTML = `
     <h1 class="page-title">Search</h1>
-    <div class="page-sub">${hits.length} result${hits.length === 1 ? '' : 's'} for “${esc(q)}”${
-      ranking?.ranked_by === 'jev' ? ' · best answers first, ranked by Jev'
-      : ranking?.note ? ` · closest in meaning first (Jev ranking unavailable: ${esc(ranking.note)})` : ''}</div>
+    <div class="page-sub">${hits.length} result${hits.length === 1 ? '' : 's'} for “${esc(q)}”</div>
     ${hits.length ? group('In your notes', notes) + group('In raw transcripts', transcripts)
                   : '<div class="empty">No matches.</div>'}`;
 }

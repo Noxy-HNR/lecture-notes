@@ -8,9 +8,6 @@ __pycache__/
 notes/
 state/
 lessons/
-# Frozen copy of the notes used by the meaning-search tests. Same reason as notes/ above -
-# it's lecture content. Rebuild with: python tools/semantic_search_benchmark.py --freeze-corpus
-tests/fixtures/semantic_search_corpus.json
 
 # OS cruft
 Thumbs.db

@@ -226,36 +226,3 @@ def test_long_passages_are_clipped():
     states = highlights.segment_states("PSYC 1300", [{"text": "word " * 2000}, {"text": "next"}])
     assert len(states[0]["passage"]) <= highlights.PASSAGE_CHARS
     assert len(states[1]["before"]) <= highlights.BEFORE_CHARS
-
-
-# ---------------------------------------------------------------------------
-# Search ranking
-# ---------------------------------------------------------------------------
-
-ROWS = [{"class_code": "BIOL 1440", "section": "Water", "text": "Hydrogen bonds hold water together."},
-        {"class_code": "BIOL 1440", "section": "Buffers", "text": "Buffers keep blood pH stable."},
-        {"class_code": "BIOL 1440", "section": "Cells", "text": "Cells divide."}]
-
-
-def test_jev_rank_puts_the_answer_first_and_caches(lab, monkeypatch):
-    _, asked = lab
-    search._rank_cache.clear()
-    ranked, note = search.jev_rank("blood pH", ROWS)
-    assert note is None and ranked[0]["section"] == "Buffers" and ranked[0]["jev"] == 0.9
-    assert [r["section"] for r in ranked[1:]] == ["Water", "Cells"]  # ties keep meaning order
-    seen = {state["passage"]: state for state in asked}
-    assert seen[ROWS[0]["text"]]["search"] == "blood pH" and seen[ROWS[0]["text"]]["section"] == "Water"
-    asked.clear()
-    search.jev_rank("blood pH", ROWS)
-    assert asked == []
-
-
-def test_jev_rank_falls_back_to_meaning_order(lab, monkeypatch):
-    search._rank_cache.clear()
-
-    def offline(*a, **k):
-        raise jev.JevError("network", "TypeSafe request failed: URLError")
-
-    monkeypatch.setattr(jev, "ask", offline)
-    ranked, note = search.jev_rank("blood pH", ROWS)
-    assert ranked == ROWS and "URLError" in note

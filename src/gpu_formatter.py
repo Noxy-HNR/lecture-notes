@@ -23,6 +23,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_CONFIG_PATH = Path("C:/AI/Config/models.json")
 MODELS_DIR = Path("C:/AI/models")
+TOOLS_DIR = Path("C:/AI/Tools")  # llama builds live here; any llama-server.exe under it is accepted
 MODEL_FILENAME = "Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf"
 MODEL_PATH = MODELS_DIR / MODEL_FILENAME
 PORT = 10000
@@ -104,13 +105,13 @@ def _verify_process_details(identity):
     if _process_identity(identity[0]) != identity:
         return False
     binary, arguments = _process_details(identity[0])
-    profile, _ = _saved_profile()
-    expected = Path(profile.get("serverBinary") or "C:/AI/Tools/llama-native/bin/llama-server.exe")
-    if not expected.is_absolute():
-        expected = Path("C:/AI") / expected
+    _saved_profile()  # the approved profile (model file, RAM-safety flags) must still be installed
     def normal(path):
         return str(Path(path).resolve()).replace("\\", "/").casefold()
-    if normal(binary) != normal(expected):
+    # Any llama-server build inside C:\AI\Tools is accepted: llama is recompiled often and each
+    # build lands in its own folder, so pinning one exact path broke the local tier after every
+    # rebuild. A llama-server from anywhere else is still refused. What it runs is checked below.
+    if Path(binary).name.casefold() != "llama-server.exe" or not normal(binary).startswith(normal(TOOLS_DIR) + "/"):
         return False
     models = []
     for index, arg in enumerate(arguments):

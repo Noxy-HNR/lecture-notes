@@ -33,7 +33,7 @@ def offline(monkeypatch, tmp_path):
     monkeypatch.setattr(gpu, "_llama_process_ids", lambda: [])
     monkeypatch.setattr(gpu, "_process_identity", lambda pid: (pid, 789))
     monkeypatch.setattr(gpu, "_process_details", lambda pid: (
-        "C:/AI/Tools/llama-native/bin/llama-server.exe",
+        "C:/AI/Tools/llama-prism-native/f4902d9/bin/llama-server.exe",
         ["-m", str(gpu.MODEL_PATH), "--load-mode", "none", "--cache-ram", "0"]))
     monkeypatch.setattr(gpu, "_request_json", lambda *a, **kw: pytest.fail("Unexpected HTTP"))
     yield config
@@ -241,7 +241,7 @@ def test_emergency_stop_refuses_replacement_or_unknown_process(monkeypatch, mism
     monkeypatch.setattr(gpu, "_process_identity", lambda pid: (pid, 999) if mismatch == "creation" else (pid, 789))
     if mismatch == "model":
         monkeypatch.setattr(gpu, "_process_details", lambda pid: (
-            "C:/AI/Tools/llama-native/bin/llama-server.exe", ["-m", "C:/AI/models/another.gguf"]))
+            "C:/AI/Tools/llama-prism-native/f4902d9/bin/llama-server.exe", ["-m", "C:/AI/models/another.gguf"]))
     assert not gpu._emergency_stop(None if mismatch == "missing" else (123, 789))
 
 
@@ -387,7 +387,7 @@ def test_os_identity_proof_refuses_unapproved_process(monkeypatch, case):
     if case == "missing_model": args = args[2:]
     monkeypatch.setattr(gpu, "_process_details", lambda pid: (
         "C:/wrong/llama-server.exe" if case == "wrong_binary" else
-        "C:/AI/Tools/llama-native/bin/llama-server.exe", args))
+        "C:/AI/Tools/llama-prism-native/f4902d9/bin/llama-server.exe", args))
     assert not gpu._verified_process((123,789))
     assert not gpu._emergency_stop((123,789))
 
@@ -574,3 +574,22 @@ def test_output_cap_fits_notes_that_keep_the_source_wording():
     assert gpu._scaled_max_tokens(words(20000)) <= 8000
     huge = gpu._scaled_max_tokens(words(24000))
     assert 256 <= huge <= gpu.CONTEXT_SIZE - 24000 * 1.3
+
+
+@pytest.mark.parametrize("binary, accepted", [
+    ("C:/AI/Tools/llama-prism-native/f4902d9/bin/llama-server.exe", True),
+    ("C:/AI/Tools/llama-prism-native/0a1b2c3/bin/llama-server.exe", True),   # a newer rebuild
+    ("C:/AI/Tools/llama-next-build/bin/llama-server.exe", True),              # any other build folder
+    ("C:/AI/Tools-old/llama-server.exe", False),                             # outside C:\AI\Tools
+    ("D:/elsewhere/llama-server.exe", False),
+    ("C:/AI/Tools/llama-prism-native/f4902d9/bin/some-other-server.exe", False),
+])
+def test_any_llama_build_under_tools_is_accepted(monkeypatch, binary, accepted):
+    """llama is recompiled often, each build in its own folder; the local tier must keep working
+    after a rebuild without anyone updating a pinned path. What it runs is still checked."""
+    monkeypatch.setattr(gpu, "_llama_process_ids", lambda: [123])
+    monkeypatch.setattr(gpu, "_process_identity", lambda pid: (123, 789))
+    monkeypatch.setattr(gpu, "_saved_profile", lambda: ({}, int(3.3 * 2**30)))
+    args = ["-m", str(gpu.MODEL_PATH), "--load-mode", "none", "--cache-ram", "0"]
+    monkeypatch.setattr(gpu, "_process_details", lambda pid: (binary, args))
+    assert gpu._verified_process((123, 789)) is accepted
