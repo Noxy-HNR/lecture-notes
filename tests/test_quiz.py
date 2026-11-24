@@ -286,7 +286,7 @@ def test_a_failed_write_leaves_the_previous_results_intact(library, monkeypatch)
     def broken(src, dst):
         raise OSError("disk full")
     with monkeypatch.context() as patch:
-        patch.setattr(quiz, "os", types.SimpleNamespace(replace=broken))
+        patch.setattr(quiz.storage, "replace_with_retry", broken)
         with pytest.raises(OSError):
             answer(2, "got")
     assert path.read_text(encoding="utf-8") == before            # replace is the only step that touches the real file
@@ -299,7 +299,7 @@ def test_a_failed_write_leaves_no_temp_file_behind(library, monkeypatch):
     def broken(src, dst):
         raise OSError("file in use")
     with monkeypatch.context() as patch:
-        patch.setattr(quiz, "os", types.SimpleNamespace(replace=broken))
+        patch.setattr(quiz.storage, "replace_with_retry", broken)
         with pytest.raises(OSError):
             answer(2, "got")
     assert sorted(p.name for p in (library / ".quiz").iterdir()) == [f"{LESSON_ID}.json"]

@@ -20,6 +20,7 @@ when its text (or its neighbours', or the questions) changes, e.g. after a corre
 Scanning runs in a background thread of the dashboard process (Scanner), newest recording
 first, and never touches a recording that is still in progress.
 """
+import storage
 import hashlib
 import json
 import os
@@ -189,7 +190,7 @@ def _write_result(session_id: str, data: dict):
     path = result_path(session_id)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    storage.replace_with_retry(tmp, path)
 
 
 def transcript_sessions() -> list[str]:

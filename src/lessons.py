@@ -45,6 +45,7 @@ import psutil
 import keep_awake
 import codex_cli
 import notes
+from storage import replace_with_retry
 import speech
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -957,7 +958,10 @@ def _pubchem_depiction(compound: str, path: Path) -> Path:
 def _write_json(path: Path, data: dict):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)  # atomic: the dashboard never reads a half-written status
+    # Atomic, so the dashboard never reads a half-written status. The dashboard re-reads the
+    # status every 1.5 s, and a swap that lands while it has the file open is refused for a
+    # moment; one such refusal once stopped a whole build. replace_with_retry waits it out.
+    replace_with_retry(tmp, path)
 
 
 _update_lock = threading.Lock()   # narration workers report progress while the main thread updates steps
@@ -968,7 +972,12 @@ def _update(job: dict, **fields):
     with _update_lock:
         job.update(fields)
         if job.get("status_path"):
-            _write_json(Path(job["status_path"]), {k: v for k, v in job.items() if k != "status_path"})
+            try:
+                _write_json(Path(job["status_path"]), {k: v for k, v in job.items() if k != "status_path"})
+            except OSError as error:
+                # Progress is only a report: the next update rewrites the whole file, so a write
+                # that still fails after the retries must not stop the build.
+                print(f"Couldn't save build progress ({error}); continuing", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------

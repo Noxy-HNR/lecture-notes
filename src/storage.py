@@ -18,7 +18,10 @@ REPLACE_ATTEMPTS = 10
 REPLACE_RETRY_SECONDS = 0.1
 
 
-def _replace_with_retry(source, destination):
+def replace_with_retry(source, destination):
+    """os.replace that waits out a brief "Access is denied": Windows refuses to swap a file
+    while another process has it open (the dashboard polling a status file, antivirus, an
+    editor). Used for every temp-file-then-swap write in the app."""
     for attempt in range(REPLACE_ATTEMPTS):
         try:
             os.replace(source, destination)
@@ -91,7 +94,7 @@ def _atomic_write(path, text, backup=True, expected=None):
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        _replace_with_retry(temporary, path)
+        replace_with_retry(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -189,3 +192,6 @@ def dedupe_day_headings(content):
             previous = heading
         out.append(line)
     return "\n".join(out)
+
+
+_replace_with_retry = replace_with_retry   # older name

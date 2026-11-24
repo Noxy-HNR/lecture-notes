@@ -14,6 +14,7 @@ The API key is the one saved in the C:\\AI dashboard's Settings tab (Switchboard
 there is one place to paste it; TYPESAFE_API_KEY in the environment takes precedence. Jev can
 be switched off from the Diagnostics page (state/jev_settings.json).
 """
+import storage
 import json
 import os
 import re
@@ -89,7 +90,7 @@ def save_settings(enabled: bool) -> dict:
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = SETTINGS_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps({"enabled": enabled}) + "\n", encoding="utf-8")
-    os.replace(tmp, SETTINGS_PATH)
+    storage.replace_with_retry(tmp, SETTINGS_PATH)
     return status()
 
 

@@ -9,6 +9,7 @@ and it only runs when the student presses "Test Claude".
 
 Memory is read the way C:/AI/AGENTS.md asks: available physical RAM (ullAvailPhys), not "free" RAM.
 """
+import storage
 import ctypes
 import json
 import os
@@ -372,7 +373,7 @@ def _save_test(result: dict):
         STATE_DIR.mkdir(exist_ok=True)
         tmp = _test_file().with_suffix(".json.tmp")
         tmp.write_text(json.dumps(result), encoding="utf-8")
-        os.replace(tmp, _test_file())      # atomic: a poll never reads half a file
+        storage.replace_with_retry(tmp, _test_file())      # atomic: a poll never reads half a file
     except OSError:
         pass                               # the result is still in memory and in the reply
 

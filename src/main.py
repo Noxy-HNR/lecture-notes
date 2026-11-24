@@ -25,6 +25,7 @@ Usage:
 Stop recording any time with Ctrl+C. Notes are saved (with a safety autosave
 every few minutes) even if you stop abruptly.
 """
+import storage
 import argparse
 import json
 import os
@@ -141,7 +142,7 @@ def save_last_choices(**changes) -> None:
         choices = {**load_last_choices(), **changes}
         partial = LAST_CHOICES_PATH.with_name(LAST_CHOICES_PATH.name + ".partial")
         partial.write_text(json.dumps(choices), encoding="utf-8")
-        os.replace(partial, LAST_CHOICES_PATH)
+        storage.replace_with_retry(partial, LAST_CHOICES_PATH)
     except Exception:
         pass
 

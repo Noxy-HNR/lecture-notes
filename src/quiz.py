@@ -4,6 +4,7 @@ Nothing here calls a model and no questions are generated: the questions and ans
 ones already in lesson.json. What a student did is kept per lesson in lessons/.quiz/<id>.json,
 so a missed question can come back later in the review queue until it is answered correctly.
 """
+import storage
 import json
 import os
 import re
@@ -73,7 +74,7 @@ def _save(lesson_id: str, answers: dict):
     tmp = path.with_suffix(".json.tmp")
     try:
         tmp.write_text(json.dumps({"lesson_id": lesson_id, "answers": answers}, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)  # atomic: a reader never sees half an answer file
+        storage.replace_with_retry(tmp, path)  # atomic: a reader never sees half an answer file
     finally:
         tmp.unlink(missing_ok=True)   # only left behind when the write or the replace failed
 

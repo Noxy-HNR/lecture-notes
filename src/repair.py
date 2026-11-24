@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import keep_awake  # noqa: E402
 import notes  # noqa: E402
-from storage import atomic_write, session_markers, update_session, dedupe_day_headings  # noqa: E402
+from storage import (atomic_write, session_markers, update_session, dedupe_day_headings,  # noqa: E402
+                     replace_with_retry)
 from transcripts import load_transcript, session_class  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -433,7 +434,7 @@ def _write_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(temporary, path)
+    replace_with_retry(temporary, path)   # the dashboard polls the job file
 
 
 def _job_alive(job: dict) -> bool:
